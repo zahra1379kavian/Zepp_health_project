@@ -27,6 +27,13 @@ class CounterConfig:
             raise ValueError("Invalid counter buffer/confirmation")
 
 
+@dataclass
+class PCAState:
+    """Observed counting direction and its calibration anchor within one bout."""
+    axis: np.ndarray | None = None
+    polarity_axis: int | None = None
+
+
 def bandpass(x, valid):
     """Causal 0.15--11 Hz accelerometer bandpass, initialized per valid run."""
     from strength_training.temporal_segmentation.data import runs
@@ -51,8 +58,12 @@ def select_peaks(values, periods, minimum_distance):
     return sorted(accepted, key=lambda i: values[i][0])
 
 
-def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=CounterConfig()):
-    """Return peaks with sample index, local period, amplitude and PCA sign axis."""
+def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=CounterConfig(), *, state=None):
+    """Return peaks with sample index, local period, amplitude and PCA sign anchor.
+
+    A per-bout state aligns successive observed PCA axes and retains the initial
+    calibration anchor. Without state, use the largest loading's positive sign.
+    """
     if not (0 < min_period_s < max_period_s):
         raise ValueError("Expected 0 < min_period < max_period")
     x = np.asarray(filtered_acceleration, np.float64)
@@ -63,9 +74,16 @@ def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=Counte
     if len(x) <= minimum+2:
         return []
     signal, axis = pc1(x, return_axis=True)
-    polarity_axis = int(np.argmax(np.abs(axis)))
     if np.ptp(signal) < 1e-8:
         return []
+    polarity_axis = int(np.argmax(np.abs(axis)))
+    if state is not None:
+        if state.axis is not None and np.dot(axis, state.axis) < 0:
+            axis, signal = -axis, -signal
+        if state.polarity_axis is None:
+            state.polarity_axis = polarity_axis
+        state.axis = axis
+        polarity_axis = state.polarity_axis
     candidates = [(int(p), float(signal[p])) for p in find_peaks(signal)[0]]
     initial = select_peaks(candidates, None, minimum)
     candidates = [candidates[i] for i in initial]
@@ -90,6 +108,8 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
     """Counter consumes predicted labels only. Causal events are never retracted.
 
     Labels are stabilized by classify; a committed station change ends the set.
+    Causal PCA signs follow the previous observed axis within the bout, retaining
+    its initial calibration anchor. Rest, station changes and gaps reset it.
     Boundary adaptation: training-fitted start/end offsets from the peak, scaled
     by the local period and rounded to 40 ms. Offsets are for this sensor wrist,
     indexed by station and the PCA axis used to choose polarity. Uncalibrated
@@ -110,15 +130,21 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
             continue
         name = CLASSES[int(labels[a])]
         if name == "plank":
+            # A recording prefix cannot establish that an active hold has ended.
+            if mode == "causal" and b == len(t):
+                continue
+            report = int(t[b]) if mode == "causal" else int(t[-1])
             holds.append({"station": name, "start_ms": int(t[a]), "end_ms": int(t[b-1]+DT_MS),
-                          "duration_ms": int(t[b-1]+DT_MS-t[a])})
+                          "duration_ms": int(t[b-1]+DT_MS-t[a]), "reported_at_ms": report,
+                          "complete": bool(b < len(t))})
             continue
         minimum, maximum = period_bounds[name]["min_s"], period_bounds[name]["max_s"]
         last_peak, last_period = -np.inf, 0
+        state = PCAState() if mode == "causal" else None
         ticks = [b-1] if mode == "offline" else range(a+step-1, b, step)
         for tick in ticks:
             left = a if mode == "offline" else max(a, tick+1-int(config.buffer_seconds*FS))
-            candidates = count_peaks(filtered[left:tick+1], minimum, maximum, config)
+            candidates = count_peaks(filtered[left:tick+1], minimum, maximum, config, state=state)
             for row in candidates:
                 peak, period = left+row["index"], row["period_samples"]
                 if mode == "causal" and peak-last_peak < config.spacing_fraction*max(2, min(period, last_period)):

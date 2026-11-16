@@ -100,8 +100,13 @@ Explicit adaptations and assumptions:
    first sample's steady state to avoid a gravity startup transient. Excluded
    or unavailable samples reset the state.
 2. Device X replaces anatomical arm X. Wrist orientation is not guaranteed to
-   match the original armband. PCA signs use the largest loading's positive
-   direction. Autocorrelations are mean-centered and normalized at lag zero.
+   match the original armband. Feature PCA signs use the largest loading's
+   positive direction. Causal counting initializes the same way, then aligns
+   each new PCA direction with the previous observed direction by their dot
+   product. The initial loading axis remains the calibration anchor, even if
+   another loading later becomes largest. Rest, station changes and sensor gaps
+   reset this state. Offline counting uses one PCA projection per bout.
+   Autocorrelations are mean-centered and normalized at lag zero.
    The unspecified feature-peak thresholds are fixed at 0.1 prominence and
    0.5 seconds separation. Counter AC context extends two maximum periods
    on either side of a peak, clipped to observations available so far.
@@ -129,16 +134,18 @@ Explicit adaptations and assumptions:
    between repetitions. Pairs must belong to the same exercise bout and wrist
    stream, with continuous valid, reference-covered samples between starts;
    rest, another exercise, exclusions and sensor gaps break the pairing. Classes
-   without usable pairs use pooled training start gaps, then fixed 0.5–8 second
-   defaults (also expanded) if no training pairs exist. `training_start_gaps`
-   and `source` in `training.json` record the evidence behind each limit.
+   without usable pairs use pooled training start gaps, then fixed **0.4–10 second
+   bounds** if no training pairs exist (0.5–8 seconds expanded by 0.8/1.25).
+   `training_start_gaps` and `source` in `training.json` record the evidence
+   behind each limit.
 5. The paper counts peaks; it does not define individual repetition start/end
    times. Here **start and end offsets from the peak are calibrated separately
    on training references**, as fractions of the local period, then rounded to
-   the 40 ms grid. Calibration is separate for each exercise, wrist and dominant
-   PCA loading axis, whose positive sign chooses the peak phase. Opposite wrist
-   phases are therefore not averaged together, and active duration need not equal
-   start-to-start spacing. Training uses overlapping buffers of at most 30 seconds;
+   the 40 ms grid. Calibration is separate for each exercise, wrist and initial
+   dominant PCA loading axis, whose positive sign anchors the peak phase. Opposite
+   wrist phases are therefore not averaged together, and active duration need not equal
+   start-to-start spacing. Training aligns successive PCA directions within each
+   bout too, using overlapping buffers of at most 30 seconds;
    each reference contributes at most once per axis, and cycles containing
    multiple retained peaks are excluded from calibration. Median offsets and
    calibration counts are saved in `training.json` and the model. A missing
@@ -163,7 +170,12 @@ observed, waits until a full estimated interval plus 200 ms has been observed,
 and freezes emitted events. Nearby subsequent candidates cannot revise a
 committed peak. Confirmed rest or station changes, missing samples, and exclusions
 end a bout; incomplete tails do not generate artificial repetitions. Plank
-produces holds.
+produces holds only after an observed label change or gap closes the set.
+Each hold includes `reported_at_ms`, the timestamp of that closing observation,
+and `complete: true`. An active hold at the end of a causal prefix is not
+reported. Offline holds summarize observed plank stretches, use the final
+session timestamp as `reported_at_ms`, and mark a recording-truncated tail with
+`complete: false`. Holds are stored separately from repetitions and are not scored.
 
 `reported_at_ms` records when the event became available in sample-time replay.
 The method has a five-second classifier cold start after a reset and needs
@@ -254,7 +266,8 @@ python -m baseline.RecoFit demo --output baseline/RecoFit/runs/demo
 ```
 
 The tests check start-gap limits with pauses and bout/gap/coverage resets,
-wrist/axis-specific boundary calibration, separate active durations, missing
+wrist/axis-specific boundary calibration, PCA sign continuity and bout resets,
+causal hold closure and prefix equivalence, separate active durations, missing
 calibration, legacy-model rejection, regular/double peaks, local tempo changes,
 constant inputs,
 future independence, station-vote stability under brief/alternating errors,

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 
-from baseline.RecoFit.counter import bandpass, count_peaks, decode
+from baseline.RecoFit.counter import CounterConfig, bandpass, count_peaks, decode
 from baseline.RecoFit.features import extract, filtered_inputs, pc1, window_ends
 from baseline.RecoFit.pipeline import (check_split, classify, evaluate, fit, fit_period_bounds,
                                       fit_boundary_offsets, infer, load_model, predict)
@@ -227,6 +227,79 @@ class SignalTests(unittest.TestCase):
         cut = decode(t, x, labels, valid, periods, boundary_offsets=SINE_OFFSETS)
         self.assertTrue(all(r["end_ms"] <= t[300] or r["start_ms"] >= t[330] for r in cut["repetitions"]))
 
+    def test_causal_pca_loading_crossover_preserves_every_repetition(self):
+        length = 1500
+        values = np.sin(np.arange(length)*2*np.pi/50)
+        # Opposite-signed loadings trade dominance, flipping the stateless PCA.
+        weight = np.linspace(.25, 2., length)
+        x = np.column_stack(((2.25-weight)*values, -weight*values, values*0))
+        self.assertGreater(pc1(x[:200], return_axis=True)[1][0], 0)
+        self.assertGreater(pc1(x[-200:], return_axis=True)[1][1], 0)
+        t, valid = np.arange(length)*DT_MS, np.ones(length, bool)
+        labels = np.full(length, CLASSES.index("squat"))
+        periods = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        for buffer_seconds in (4., 30.):
+            with self.subTest(buffer_seconds=buffer_seconds), patch("baseline.RecoFit.counter.bandpass",
+                                                                    side_effect=lambda x, valid: x):
+                config = CounterConfig(buffer_seconds=buffer_seconds)
+                result = decode(t, x, labels, valid, periods, config=config, boundary_offsets=SINE_OFFSETS)
+                clean = decode(t, sine_signal(seconds=60), labels, valid, periods,
+                               config=config, boundary_offsets=SINE_OFFSETS)
+                self.assertEqual(len(result["repetitions"]), len(clean["repetitions"]))
+                np.testing.assert_allclose([r["peak_ms"] for r in result["repetitions"]],
+                                           [r["peak_ms"] for r in clean["repetitions"]], atol=DT_MS, rtol=0)
+                self.assertGreater(len(result["repetitions"]), 25)
+                for end in (660, 799, 1100):
+                    prefix = decode(t[:end], x[:end], labels[:end], valid[:end], periods,
+                                    config=config, boundary_offsets=SINE_OFFSETS)
+                    self.assertEqual([r for r in result["repetitions"] if r["reported_at_ms"] <= t[end-1]],
+                                     prefix["repetitions"])
+
+    def test_causal_pca_anchor_resets_at_rest_station_changes_and_gaps(self):
+        length, split = 600, 300
+        x = np.zeros((length, 3))
+        x[:split, 0] = np.sin(np.arange(split)*2*np.pi/50)
+        x[split:, 1] = np.sin(np.arange(length-split)*2*np.pi/50)
+        t = np.arange(length)*DT_MS
+        periods = {name: {"min_s": 1.5, "max_s": 2.5} for name in ("squat", "push-up")}
+        offsets = {name: {str(axis): SINE_OFFSETS["squat"]["0"] for axis in (0, 1)}
+                   for name in periods}
+        for reset in ("rest", "station", "gap"):
+            labels = np.full(length, CLASSES.index("squat"))
+            valid = np.ones(length, bool)
+            if reset == "rest":
+                labels[split-5:split] = 0
+            elif reset == "station":
+                labels[split:] = CLASSES.index("push-up")
+            else:
+                valid[split-5:split] = False
+            with self.subTest(reset=reset), patch("baseline.RecoFit.counter.bandpass",
+                                                 side_effect=lambda x, valid: x):
+                full = decode(t, x, labels, valid, periods, boundary_offsets=offsets)
+                fresh = decode(t[split:], x[split:], labels[split:], valid[split:], periods,
+                               boundary_offsets=offsets)
+                self.assertGreater(len(fresh["repetitions"]), 3)
+                self.assertEqual([r for r in full["repetitions"] if r["start_ms"] >= t[split]],
+                                 fresh["repetitions"])
+
+    def test_causal_holds_only_report_observed_closures_and_match_prefixes(self):
+        length = 80
+        t, x, labels = np.arange(length)*DT_MS, np.zeros((length, 3)), np.zeros(length, int)
+        valid = np.ones(length, bool)
+        for a, b in ((5, 25), (30, 60), (65, length)):
+            labels[a:b] = CLASSES.index("plank")
+        valid[40:43] = False
+        full = decode(t, x, labels, valid, {})
+        self.assertEqual([r["end_ms"] for r in full["holds"]], t[[25, 40, 60]].tolist())
+        self.assertTrue(all(r["reported_at_ms"] == r["end_ms"] and r["complete"] for r in full["holds"]))
+        for end in range(1, length+1):
+            prefix = decode(t[:end], x[:end], labels[:end], valid[:end], {})
+            self.assertEqual([r for r in full["holds"] if r["reported_at_ms"] <= t[end-1]], prefix["holds"])
+        offline = decode(t, x, labels, valid, {}, mode="offline")
+        self.assertEqual(len(offline["holds"]), 4)
+        self.assertFalse(offline["holds"][-1]["complete"])
+        self.assertTrue(all(r["reported_at_ms"] == t[-1] for r in offline["holds"]))
+
     def test_plank_is_hold_and_tail_does_not_become_rep(self):
         x = sine_signal(seconds=1)
         t = np.arange(len(x))*40
@@ -234,7 +307,10 @@ class SignalTests(unittest.TestCase):
         labels = np.full(len(t), CLASSES.index("plank"))
         result = decode(t, x, labels, valid, {})
         self.assertEqual(result["repetitions"], [])
+        self.assertEqual(result["holds"], [])
+        result = decode(t, x, labels, valid, {}, mode="offline")
         self.assertEqual(result["holds"][0]["duration_ms"], 1000)
+        self.assertFalse(result["holds"][0]["complete"])
         labels[:] = CLASSES.index("squat")
         result = decode(t, x, labels, valid, {"squat": {"min_s": 1.5, "max_s": 2.5}},
                         boundary_offsets=SINE_OFFSETS)
@@ -288,6 +364,8 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(bounds["push-up"]["max_s"], bounds["squat"]["max_s"])
         fallback = fit_period_bounds(self.root, ["singleton"])
         self.assertEqual(fallback["push-up"]["source"], "fixed_fallback")
+        self.assertEqual(fallback["push-up"]["min_s"], .4)
+        self.assertEqual(fallback["push-up"]["max_s"], 10.)
 
     def test_period_pairs_never_cross_bouts_gaps_or_uncertified_samples(self):
         arrays = self.stream("train", [50, 100, 150, 200, 250, 300], 40)
