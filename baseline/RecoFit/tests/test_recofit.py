@@ -413,6 +413,72 @@ class CalibrationTests(unittest.TestCase):
         offsets = fit_boundary_offsets(self.root, ["train"], bounds)["left_wrist"]["squat"]["0"]
         self.assertAlmostEqual(offsets["end_periods"]-offsets["start_periods"], .7, delta=.03)
 
+    def test_boundary_calibration_matches_inference_pca_history_and_cadence(self):
+        arrays = self.stream("train", range(50, 950, 50), 35, length=1003)
+        values = arrays["x"][:, 0].copy()
+        weight = np.minimum(np.arange(len(values))/250, 1.)
+        # Startup is +X; a full 30-second buffer chooses +Y and the opposite phase.
+        arrays["x"][:, 0] = (2.-1.75*weight)*values
+        arrays["x"][:, 1] = -(.25+1.75*weight)*values
+        np.save(self.root/"train"/"x.npy", arrays["x"])
+        bounds = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        filtered = bandpass(arrays["x"], arrays["valid"])
+        self.assertEqual(np.argmax(np.abs(pc1(filtered[:50], return_axis=True)[1])), 0)
+        self.assertEqual(np.argmax(np.abs(pc1(filtered[:750], return_axis=True)[1])), 1)
+
+        for step, buffer_seconds in ((5, 30.), (7, 4.)):
+            config = CounterConfig(buffer_seconds=buffer_seconds)
+            history = []
+
+            def trace(samples, minimum, maximum, config, *, state=None):
+                rows = count_peaks(samples, minimum, maximum, config, state=state)
+                axis = None if state.axis is None else tuple(state.axis)
+                history.append((len(samples), tuple(samples[0]), state.polarity_axis, axis, rows))
+                return rows
+
+            with self.subTest(step=step, buffer_seconds=buffer_seconds), patch(
+                    "baseline.RecoFit.counter.count_peaks", side_effect=trace):
+                offsets = fit_boundary_offsets(self.root, ["train"], bounds, config, step=step)
+                calibrated = history.copy()
+                history.clear()
+                result = decode(arrays["t"], arrays["x"], arrays["y"], arrays["valid"], bounds,
+                                step=step, config=config, boundary_offsets=offsets["left_wrist"])
+                self.assertEqual(calibrated, history)
+                self.assertEqual(len(history), len(values)//step)
+                self.assertEqual(history[0][0], step)
+                self.assertEqual(set(offsets["left_wrist"]["squat"]), {"0"})
+                self.assertLess(history[-1][3][1], 0)
+                self.assertGreater(len(result["repetitions"]), 12)
+                for row in result["repetitions"]:
+                    expected = round(row["start_ms"]/2000)*2000
+                    self.assertLessEqual(abs(row["start_ms"]-expected), 200)
+                    self.assertLessEqual(abs(row["end_ms"]-(expected+1400)), 200)
+
+    def test_calibration_replay_resets_at_rest_and_gaps_without_extra_tail_calls(self):
+        arrays = self.stream("train", range(50, 950, 50), 35, length=1003)
+        arrays["y"][303:311] = 0
+        arrays["valid"][703:711] = False
+        for key in ("y", "valid"):
+            np.save(self.root/"train"/f"{key}.npy", arrays[key])
+        bounds = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        histories = []
+
+        def trace(samples, minimum, maximum, config, *, state=None):
+            histories.append((state, len(samples), tuple(samples[0])))
+            return count_peaks(samples, minimum, maximum, config, state=state)
+
+        with patch("baseline.RecoFit.counter.count_peaks", side_effect=trace):
+            fit_boundary_offsets(self.root, ["train"], bounds, step=7)
+            calibrated = histories.copy()
+            histories.clear()
+            decode(arrays["t"], arrays["x"], arrays["y"], arrays["valid"], bounds, step=7)
+        self.assertEqual([row[1:] for row in calibrated], [row[1:] for row in histories])
+        for rows in (calibrated, histories):
+            states = {id(row[0]) for row in rows}
+            self.assertEqual(len(states), 3)
+            self.assertEqual(sum(row[1] == 7 for row in rows), 3)
+            self.assertEqual(len(rows), 303//7+(703-311)//7+(1003-711)//7)
+
     def test_uncalibrated_polarity_has_no_symmetric_interval_fallback(self):
         x = sine_signal()
         t, valid = np.arange(len(x))*DT_MS, np.ones(len(x), bool)
@@ -433,7 +499,7 @@ class IntegrationTests(unittest.TestCase):
         alignment = synthetic_source(cls.root/"source", subjects=6)
         cls.manifest = prepare(cls.root/"source", cls.root/"data", alignment)
         cls.path = fit(cls.root/"data", cls.root/"model", window_seconds=1., train_step_ms=200,
-                       max_windows_per_class=64, c_values=(.1, 1.))
+                       prediction_step_ms=280, max_windows_per_class=64, c_values=(.1, 1.))
         cls.model = load_model(cls.path)
 
     @classmethod
@@ -462,6 +528,15 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(offsets, fit_boundary_offsets(self.root/"data", self.model["split"]["train"], original))
         finally:
             file.write_text(before)
+
+    def test_fitted_offsets_follow_the_model_prediction_step(self):
+        self.assertEqual(self.model["prediction_step"], 7)
+        offsets = fit_boundary_offsets(self.root/"data", self.model["split"]["train"],
+                                       self.model["period_bounds"], step=self.model["prediction_step"])
+        self.assertEqual(self.model["boundary_offsets"], offsets)
+        training = json.loads((self.path.parent/"training.json").read_text())
+        self.assertEqual(training["prediction_step_ms"], 280)
+        self.assertEqual(training["boundary_offsets"], offsets)
 
     def test_old_models_require_retraining_and_wrist_identity_is_explicit(self):
         import joblib

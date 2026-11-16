@@ -144,12 +144,16 @@ Explicit adaptations and assumptions:
    the 40 ms grid. Calibration is separate for each exercise, wrist and initial
    dominant PCA loading axis, whose positive sign anchors the peak phase. Opposite
    wrist phases are therefore not averaged together, and active duration need not equal
-   start-to-start spacing. Training aligns successive PCA directions within each
-   bout too, using overlapping buffers of at most 30 seconds;
-   each reference contributes at most once per axis, and cycles containing
+   start-to-start spacing. Calibration replays each labelled training bout with
+   the same prediction cadence as causal inference (200 ms by default), starting
+   with short prefixes and growing to buffers of at most 30 seconds. Both paths
+   share the replay code, so their initial axis anchor and subsequent PCA sign
+   alignment use the same observed samples; there is no extra call at bout end.
+   Each reference contributes at most once per axis, and cycles containing
    multiple retained peaks are excluded from calibration. Median offsets and
-   calibration counts are saved in `training.json` and the model. A missing
-   calibration has no symmetric-period fallback: its peaks have no estimated
+   calibration counts are saved in `training.json` and the model. Refit existing
+   models to replace offsets learned with the previous full-buffer schedule.
+   A missing calibration has no symmetric-period fallback: its peaks have no estimated
    interval, and the station appears in `uncalibrated_stations`. These learned
    offsets correct systematic phase shifts, but cannot track every change in
    wrist orientation, cadence or pause duration. Timing still needs held-out
@@ -266,7 +270,8 @@ python -m baseline.RecoFit demo --output baseline/RecoFit/runs/demo
 ```
 
 The tests check start-gap limits with pauses and bout/gap/coverage resets,
-wrist/axis-specific boundary calibration, PCA sign continuity and bout resets,
+wrist/axis-specific boundary calibration, matching calibration/inference replay
+at default and custom cadences, PCA sign continuity and bout resets,
 causal hold closure and prefix equivalence, separate active durations, missing
 calibration, legacy-model rejection, regular/double peaks, local tempo changes,
 constant inputs,

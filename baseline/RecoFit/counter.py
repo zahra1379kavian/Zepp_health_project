@@ -103,6 +103,24 @@ def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=Counte
             if candidates[i][1] > 0 and candidates[i][1] >= threshold]
 
 
+def peak_windows(filtered, a, b, min_period_s, max_period_s, mode="causal", step=5,
+                 config=CounterConfig()):
+    """Replay one bout with the same PCA state, cadence and buffers for fit/decode.
+
+    Causal replay starts with short prefixes and never adds an off-cadence EOF
+    call. Offline replay uses a single full-bout projection without PCA state.
+    """
+    if mode not in ("causal", "offline") or step < 1:
+        raise ValueError("Invalid peak replay mode or step")
+    state = PCAState() if mode == "causal" else None
+    ticks = [b-1] if mode == "offline" else range(a+step-1, b, step)
+    buffer = int(config.buffer_seconds*FS)
+    for tick in ticks:
+        left = a if mode == "offline" else max(a, tick+1-buffer)
+        yield tick, left, count_peaks(filtered[left:tick+1], min_period_s, max_period_s,
+                                      config, state=state)
+
+
 def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
            config=CounterConfig(), *, boundary_offsets=None):
     """Counter consumes predicted labels only. Causal events are never retracted.
@@ -140,11 +158,7 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
             continue
         minimum, maximum = period_bounds[name]["min_s"], period_bounds[name]["max_s"]
         last_peak, last_period = -np.inf, 0
-        state = PCAState() if mode == "causal" else None
-        ticks = [b-1] if mode == "offline" else range(a+step-1, b, step)
-        for tick in ticks:
-            left = a if mode == "offline" else max(a, tick+1-int(config.buffer_seconds*FS))
-            candidates = count_peaks(filtered[left:tick+1], minimum, maximum, config, state=state)
+        for tick, left, candidates in peak_windows(filtered, a, b, minimum, maximum, mode, step, config):
             for row in candidates:
                 peak, period = left+row["index"], row["period_samples"]
                 if mode == "causal" and peak-last_peak < config.spacing_fraction*max(2, min(period, last_period)):

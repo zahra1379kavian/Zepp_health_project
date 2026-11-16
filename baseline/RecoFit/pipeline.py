@@ -21,7 +21,7 @@ from strength_training.temporal_segmentation.metrics import (
     confusion_matrix, count_rows, false_exercise_events, grouped_stream_report, score_stream,
     reporting_tolerances,
 )
-from .counter import CounterConfig, PCAState, bandpass, count_peaks, decode
+from .counter import CounterConfig, bandpass, decode, peak_windows
 from .features import FS, feature_batches, filtered_inputs, window_ends
 
 
@@ -134,17 +134,21 @@ def fit_period_bounds(root, names):
     return result
 
 
-def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig()):
+def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig(), *, step=5):
     """Calibrate peak phase and active duration using training references only.
 
     Separate wrist/axis groups avoid averaging peaks at opposite motion phases.
     Both endpoint offsets are learned independently as fractions of local period,
     so a pause between cycles is not automatically included in the active interval.
-    Bounded overlapping buffers mirror the inference PCA context and align signs
-    within each bout, retaining its initial calibration anchor. Each reference
-    contributes at most once per polarity axis; ambiguous multi-peak cycles are
-    excluded. No cross-exercise or cross-wrist fallback can supply a missing phase.
+    Replay the inference cadence from each labelled bout's first short prefix,
+    with identical bounded buffers, sign alignment and initial axis anchor. The
+    step is the model's prediction step in samples (200 ms by default). Each
+    reference contributes at most once per polarity axis; ambiguous multi-peak
+    cycles are excluded. No cross-exercise or cross-wrist fallback can supply a
+    missing phase.
     """
+    if step < 1:
+        raise ValueError("Invalid calibration step")
     root = Path(root)
     sides = {s["session"]: s["side"] for s in manifest_at(root)["sessions"]}
     samples = {}
@@ -152,18 +156,13 @@ def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig()):
         arrays = load_arrays(root/stream)
         references = json.loads((root/stream/"references.json").read_text())
         filtered = bandpass(arrays["x"], arrays["valid"])
-        buffer = int(config.buffer_seconds*FS)
         seen = set()
         for name in sorted({r["station"] for r in references} & period_bounds.keys()):
             limits = period_bounds[name]
             station_references = [r for r in references if r["station"] == name]
             for a, b in runs(arrays["valid"] & (arrays["y"] == CLASSES.index(name))):
-                state = PCAState()
-                ticks = sorted(set(range(a+buffer-1, b, max(1, buffer//2))) | {b-1})
-                for tick in ticks:
-                    left = max(a, tick+1-buffer)
-                    peaks = count_peaks(filtered[left:tick+1], limits["min_s"], limits["max_s"], config,
-                                        state=state)
+                for tick, left, peaks in peak_windows(filtered, a, b, limits["min_s"], limits["max_s"],
+                                                      step=step, config=config):
                     for i, reference in enumerate(station_references):
                         start, end = np.searchsorted(arrays["t"],
                                                      [reference["start_ms"], reference["end_ms"]])
@@ -244,7 +243,8 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
     binary, recognition, c = best
     periods = fit_period_bounds(root, split["train"])
     print("Calibrating repetition boundaries on training subjects", flush=True)
-    offsets = fit_boundary_offsets(root, split["train"], periods, counter_config)
+    offsets = fit_boundary_offsets(root, split["train"], periods, counter_config,
+                                   step=prediction_step_ms//DT_MS)
     model = {"format": "recofit_wrist_v2", "binary": binary, "recognition": recognition,
              "window_samples": window, "prediction_step": prediction_step_ms//DT_MS,
              "confirm_steps": confirm_steps, "period_bounds": periods, "boundary_offsets": offsets,
