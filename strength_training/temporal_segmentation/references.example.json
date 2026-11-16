@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "sessions": {},
+  "instructions": "Populate sessions using independently validated full-repetition references. See README for the schema. An empty file does not enable repetition training."
+}

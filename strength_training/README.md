@@ -1,5 +1,10 @@
 # Clock-aligned sensor data
 
+For causal MS-TCN station/NULL classification and individual-repetition
+segmentation, see the [implementation and run instructions](temporal_segmentation/README.md).
+That pipeline includes exclusions, subject splits, both prediction heads,
+streaming decoding, evaluation, and a synthetic end-to-end demo.
+
 Run from the repository root (Python 3.10+, no additional dependencies):
 
 ```bash

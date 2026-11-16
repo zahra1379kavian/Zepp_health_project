@@ -8,7 +8,18 @@ __pycache__/
 .ipynb_checkpoints/
 *.png
 *.csv
+*.txt
 
 # macOS metadata
 .DS_Store
+
+# Generated temporal segmentation datasets, checkpoints, and run outputs
+/strength_training/tas_data*/
+/strength_training/tas_runs/
+/.venv/
+
+# Method workflow is a maintained documentation asset
+!/strength_training/temporal_segmentation/figures/*.png
+!/strength_training/temporal_segmentation/requirements.txt
+!/strength_training/temporal_segmentation/figures/workflow.prompt.txt
 

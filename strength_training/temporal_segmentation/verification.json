@@ -1,0 +1,88 @@
+{
+  "verified_date": "2026-11-16",
+  "user_clarification": {
+    "architecture_confirmed": "station/NULL classification plus repetition start/end boundaries",
+    "repetition_reference_status": "not currently available; user may provide labeling later"
+  },
+  "python": "3.12.3",
+  "packages": {
+    "torch": "2.15.0+cpu",
+    "numpy": "2.5.5",
+    "pandas": "3.1.1",
+    "scipy": "1.18.1",
+    "matplotlib": "3.11.2"
+  },
+  "unit_tests": {
+    "passed": 35,
+    "new_temporal_tests": 25,
+    "existing_alignment_tests": 10,
+    "command": "python -m unittest discover -s strength_training -p 'test_*.py' -v"
+  },
+  "synthetic_end_to_end": {
+    "status": "passed",
+    "output": "strength_training/tas_runs/demo",
+    "scope": "prepare, train, tune, test evaluation, sensor-only per-sample inference"
+  },
+  "real_preparation": {
+    "sessions": 43,
+    "split_sizes": {
+      "test": 6,
+      "validation": 6,
+      "train": 31
+    },
+    "eligible_hours": 71.3921,
+    "probe_minutes": 57.233333333333334,
+    "excluded": [
+      {
+        "session": "20260602_SSCDLRFV",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260603_MGTNMGTNOWZB",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260604_JCLQJCLQ",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_JCLQVGFFNHJI",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_SSCDDQTQHOPK",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_WTTANHJIOBWA",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260605_DQTQVVZPOGPA",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260617_WTTALRFVDQTQ",
+        "reason": "invalid affected log interval; review needed"
+      }
+    ],
+    "reference_repetitions": 0
+  },
+  "real_station_smoke": {
+    "training_batches": 2,
+    "validation_batches": 2,
+    "output": "strength_training/tas_runs/real_data_smoke",
+    "evaluation_output": "strength_training/tas_runs/real_data_smoke_evaluation",
+    "purpose": "execution verification only; not a trained performance baseline"
+  },
+  "not_established": [
+    "validated real repetition targets",
+    "real repetition performance",
+    "less than one second true reporting delay"
+  ],
+  "workflow_image": {
+    "method": "built-in imagegen",
+    "final": "figures/workflow-v2.png",
+    "prompt": "figures/workflow.prompt.txt"
+  }
+}
