@@ -8,10 +8,12 @@ It uses wrist signals only. The authoritative targets are the matching wrist
 column of each reliable `label.csv` in `strength_training_data_clean`.
 No separate repetition-reference file is required for the default run.
 
-The default uses **one wrist per session: left when present, otherwise right**.
-It does not fuse both wrists or switch sensors inside a session. No waist signal
-or waist label is used. Explicit `--location left_wrist` and `--location
-right_wrist` runs are also supported; sessions missing that wrist are excluded.
+The default uses **every available wrist as its own stream**. Both wrists from
+the same subject always stay in the same training, validation, or test fold.
+Each stream uses its own wrist labels and sensor-availability mask, preserving
+side-specific annotation differences. Inputs remain nine channels from one wrist;
+either wrist can be used at inference. No waist signal or waist label is used.
+Explicit `--location left_wrist` and `--location right_wrist` runs remain available.
 
 ## Exactly what to run
 
@@ -25,60 +27,71 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r strength_training/temporal_segmentation/requirements.txt
 ```
 
-Prepare a new version-3 dataset, then run the experiment:
+The version-4 dataset is prepared at `strength_training/tas_data_both_wrists` in
+this workspace. To prepare it on a fresh checkout, run:
 
 ```bash
 python -m strength_training.temporal_segmentation prepare \
-  --output strength_training/tas_data_wrist_phases
-
-python -m strength_training.temporal_segmentation run \
-  --data strength_training/tas_data_wrist_phases \
-  --output strength_training/tas_runs/wrist_full \
-  --epochs 30 --device cpu
+  --output strength_training/tas_data_both_wrists
 ```
 
-The existing `tas_data_wrist` is version 2 and must be prepared again: it lacks
-dense phase targets and records the former phase-order convention. Existing
-outputs are preserved. Old wrist boundary checkpoints can still be loaded for
-replay; the phase architecture requires retraining.
+Run the full five-fold experiment:
 
-This trains **both heads**, selects the best checkpoint by validation repetition
-F1 (independent of station labels), breaking ties with session count MAE. It uses
-a fixed decoder and the declared tolerance during checkpoint selection. It then
-tunes thresholds on validation subjects and evaluates held-out test subjects.
+```bash
+python -m strength_training.temporal_segmentation run \
+  --data strength_training/tas_data_both_wrists \
+  --output strength_training/tas_runs/wrist_cv \
+  --folds 5 --epochs 30 --device cpu \
+  --tolerance-ms 400 --report-tolerances-ms 200 400
+```
+
+Version-2 and version-3 datasets must be prepared again for the main experiment:
+they retained one wrist per session. Version 4 records stream IDs as
+`<source_session>__<side>`, with the original session, subject, and wrist side
+stored separately in the manifest. Old checkpoints remain usable for replay;
+learning from both wrists requires retraining.
+
+`run` now calls **cross-validate**, training both heads separately in each fold.
+It selects checkpoints by validation repetition F1 (independent of station labels),
+breaking ties with wrist-stream count MAE. It uses a fixed decoder and the declared
+selection tolerance during checkpoint selection, then tunes thresholds on
+validation subjects. All held-out test predictions are pooled for the main report.
 There is no station-only fallback. Training prints progress every
 100 batches. CPU training can take substantial time; the command runs up to
 30 epochs with early stopping. Use `--device cuda` only if your environment has
 compatible GPU PyTorch installed. `--max-steps` caps loss batches only; checkpoint
 selection always decodes the complete validation sessions.
 
-For the recommended subject-wise evaluation, use:
+To invoke cross-validation directly on prepared data, use:
 
 ```bash
 python -m strength_training.temporal_segmentation cross-validate \
-  --data strength_training/tas_data_wrist_phases \
-  --output strength_training/tas_runs/wrist_cv \
-  --folds 5 --epochs 30 --tolerance-ms 400
+  --data strength_training/tas_data_both_wrists \
+  --output strength_training/tas_runs/wrist_cv_direct \
+  --folds 5 --epochs 30 --tolerance-ms 400 --report-tolerances-ms 200 400
 ```
 
 Each subject appears in exactly one test fold. The next fold supplies validation
 subjects; the remaining folds train. Normalization and loss weights are refitted
 for every fold. Checkpoints and decoder thresholds use only that fold's validation
 subjects. `report.json` pools held-out predictions and reports fold F1 mean and
-standard deviation; `fold_*/` retains individual models, splits, and reports.
+standard deviation, per-side scores, and subject-macro F1 at every reporting
+tolerance. `fold_*/` retains individual models, splits, and reports.
 Five folds with 43 subjects gives 8–9 test subjects per fold and tests all 43.
 
 On a fresh checkout without prepared data, omit `--data`:
 
 ```bash
 python -m strength_training.temporal_segmentation run \
-  --output strength_training/tas_runs/wrist_full \
+  --output strength_training/tas_runs/wrist_cv_fresh \
   --epochs 30 --device cpu
 ```
 
 That also prepares the wrist inputs and targets automatically, under the run's
 `data/` directory. Output directories are never overwritten. To repeat an
-experiment, use a new name such as `--output strength_training/tas_runs/wrist_full_v2`.
+experiment, use a new output directory. `run` writes its main report under
+`cross_validation/report.json`; direct `cross-validate` writes `report.json` in
+its output directory. Use these cross-validation results for headline numbers.
 
 The entry point is `__main__.py`; run it as the module above so its imports work.
 You do not need to run `prepare_data.py`, the demographics analysis, or the
@@ -86,19 +99,24 @@ synthetic demo before this experiment.
 
 ## Outputs
 
-| File under `strength_training/tas_runs/wrist_full/` | Contents |
+| File under `strength_training/tas_runs/wrist_cv/cross_validation/` | Contents |
 | --- | --- |
-| `model/best.pt` | Best two-head checkpoint |
-| `model/history.json` | Losses and validation repetition/count metrics |
-| `decoder.json` | Validation-selected thresholds and declared timing tolerance |
-| `test/report.json` | Held-out classification, count, detection and timing metrics |
-| `test/<session>.json` | Predicted repetitions, counts, plank holds, sets and session metrics |
+| `report.json` | Main pooled cross-validation report, per side and at 200/400 ms |
+| `folds.json` | Fold membership and fold metrics |
+| `fold_*/model/best.pt` | Each fold's best two-head checkpoint |
+| `fold_*/model/history.json` | Losses and validation repetition/count metrics |
+| `fold_*/decoder.json` | Validation-selected thresholds and selection tolerance |
+| `fold_*/test/report.json` | That fold's held-out classification, count and timing metrics |
+| `fold_*/test/<stream>.json` | Predicted repetitions, holds, sets, and scores at each tolerance |
 
 Every predicted repetition contains its station, `start_ms`, `end_ms`, confidence,
 and sample-time `reported_at_ms`. A session's counts are aggregated by predicted
 station, including `unknown` when station evidence is weak. Station uncertainty
 does not discard a completed cycle. Reference count scores cover eligible intervals with complete phase
 cycles; excluded or incomplete reference regions are reported separately.
+Pooled counts and hours are **wrist-stream observations**, not distinct workout
+totals: paired wrists observe the same physical repetitions. Reports count unique
+subjects separately and include per-side results plus subject-macro F1.
 
 ## How label.csv becomes repetition targets
 
@@ -148,19 +166,21 @@ to the original labels without changing the source files.
 
 ## Verified wrist data and checks
 
-An audit of all 43 existing wrist-label arrays using the confirmed phase order found:
+Version-4 preparation retained **77 streams from 43 subjects/source sessions**,
+including **34 sessions with both wrists**, after the existing exclusions:
 
-- **43 sessions:** 39 using left wrist, 4 using right wrist.
-- The original single split has **31 training / 6 validation / 6 test subjects**;
-  subject-wise folds are now available.
-- **21,277 complete phase-derived repetition references** and 12 unpaired phases
-  excluded from boundary supervision/scoring.
-- **74.1357 eligible wrist-sensor hours**, including ordinary inter-set rest.
-- **60.65 minutes** of available sled-pull data kept separately as an unscored probe.
+| Side | Streams | Eligible stream-hours | Repetition-reference observations |
+| --- | ---: | ---: | ---: |
+| Left | 39 | 67.1624 | 19,849 |
+| Right | 38 | 65.6840 | 18,637 |
 
-The phase-order audit leaves the total of 21,277 accepted references unchanged.
-The regression suite and dense-phase synthetic prepare/train/tune/evaluate/predict
-pipeline passed, as did a three-fold synthetic cross-validation run. The synthetic
+The five test folds contain **9, 9, 9, 8, and 8 subjects**. Every subject's
+available wrists stay together. The previous 21,277-reference preparation used
+only one wrist per source session and is a historical artifact.
+
+The 72-test regression suite passed. A three-fold synthetic experiment with
+16 streams from eight subjects verified training, tuning, pooled evaluation,
+per-side metrics, both timing tolerances, and sensor-only prediction. Synthetic
 training was deliberately short and does not establish model accuracy. Prior real
 training checks in `verification.json` describe the historical boundary model.
 Full held-out repetition performance and the <1 second true reporting-delay goal
@@ -176,8 +196,9 @@ All eight exclusions and their reasons are in `manifest.json`.
 
 ## Individual commands, if needed
 
-The `run` command already performs these steps. Use them separately only when
-working on one stage:
+These commands operate on the diagnostic single split. Use them for development;
+publish numbers from `run` or `cross-validate` above. A standalone `evaluate`
+report is explicitly marked `single_split_diagnostic`:
 
 ```bash
 python -m strength_training.temporal_segmentation prepare \
@@ -201,9 +222,15 @@ python -m strength_training.temporal_segmentation evaluate \
   --split test --output strength_training/tas_runs/wrist_manual/test
 ```
 
-The default matching tolerance is 400 ms at **each** endpoint. Declare it before
+The default **selection tolerance** is 400 ms at each endpoint. Declare it before
 examining test results; `tune` stores it and selects thresholds only on validation
-subjects. The `segmentation` report matches boundaries independently of station;
+subjects. Reporting defaults to **200 and 400 ms**, using the exact same decoded
+predictions and thresholds for both. No extra inference or tolerance-specific
+tuning is performed. `--report-tolerances-ms` accepts additional tolerances; the
+selection tolerance is always included. Read `by_tolerance["200"]` and
+`by_tolerance["400"]`, and the corresponding entries under `per_side`. Top-level
+`segmentation` and `repetitions` retain the selection-tolerance results for
+compatibility. The `segmentation` report matches boundaries independently of station;
 the `repetitions` report additionally requires station agreement. Matching is
 one-to-one, maximizing match count before minimizing timing error. Predictions
 are matched against all retained references **before** coverage filtering; only
@@ -217,7 +244,10 @@ per-class precision/recall, confusion matrix and false exercise events per rest 
 diagnostics. They are not used by the full wrist experiment. Independently
 specified reference JSONs can still override automatic conversion using
 `prepare --references FILE`; entries must identify the actual selected
-`left_wrist` or `right_wrist` location. External references default to the boundary
+`left_wrist` or `right_wrist` location. A session can provide both using
+`{"wrists": {"left_wrist": <entry>, "right_wrist": <entry>}}`. A legacy single-side
+entry certifies only that side; the other side gets no repetition supervision or
+coverage. External references default to the boundary
 head because they need not certify phase labels. Their schema is implemented in
 `data.reference_targets()` and shown by the synthetic demo's `references.json`.
 
@@ -227,14 +257,14 @@ After the full run, replay a wrist CSV without supplying any labels:
 
 ```bash
 python -m strength_training.temporal_segmentation predict \
-  --checkpoint strength_training/tas_runs/wrist_full/model/best.pt \
-  --decoder strength_training/tas_runs/wrist_full/decoder.json \
+  --checkpoint strength_training/tas_runs/wrist_cv/cross_validation/fold_1/model/best.pt \
+  --decoder strength_training/tas_runs/wrist_cv/cross_validation/fold_1/decoder.json \
   --input strength_training/strength_training_data_clean/20260602_LRFVFZEIVGAM/left_wrist.csv \
   --chunk 1 --output strength_training/tas_runs/wrist_prediction
 ```
 
 This writes `events.jsonl`, `frames.csv`, and `predictions.json`. The example
-shows the input format; use `evaluate --split test` for held-out scoring.
+shows the input format; headline held-out scores come from cross-validation.
 Prediction reads only `sync_timestamp` and the nine wrist sensor channels.
 Embedded label columns are ignored. The timestamp is alignment metadata, not a
 model feature. Raw prediction is unscored and does not read workout-log exclusions.
@@ -280,7 +310,7 @@ weighted phase cross-entropy. Phase logits are not temporally smoothed. The
 boundary baseline uses masked BCE instead. All weights come from training subjects.
 
 Sensors join exactly to `label.csv` on `sync_timestamp`. No interpolation or
-forward fill occurs. Only the matching selected wrist label column supplies
+forward fill occurs. Only each stream's matching wrist label column supplies
 targets. The nine features are `acc_x/y/z`, `gyro_x/y/z`, and `mag_x/y/z`.
 Normalization is fitted only on eligible training samples. Windows include
 causal context but do not cross exclusion or sensor gaps. Cached streaming is

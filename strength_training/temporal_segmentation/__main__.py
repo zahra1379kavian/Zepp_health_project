@@ -55,16 +55,20 @@ def main(argv=None):
     predict.add_argument("--chunk", type=int, default=1, help="1..20 samples; default is one sample (40 ms)")
     demo = sub.add_parser("demo", help="Run the whole pipeline with generated, validated synthetic boundaries")
     demo.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/demo"))
-    run = sub.add_parser("run", help="Wrist-only prepare → train both heads → tune → held-out evaluation")
-    run.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/wrist_full"))
+    run = sub.add_parser("run", help="Prepare every wrist stream → subject-wise cross-validation")
+    run.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/wrist_cv"))
     run.add_argument("--data", type=Path, help="Reuse a prepared wrist dataset instead of preparing it again")
     run.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     run.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
     run.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
     run.add_argument("--epochs", type=int, default=30)
+    run.add_argument("--folds", type=int, default=5)
     run.add_argument("--batch-size", type=int, default=8)
     run.add_argument("--seed", type=int, default=42)
     run.add_argument("--tolerance-ms", type=int, default=400)
+    for command in (cv, sub.choices["evaluate"], run):
+        command.add_argument("--report-tolerances-ms", type=int, nargs="+", default=[200, 400],
+                             help="Score the same decoded predictions at each tolerance; selection tolerance is always included")
     for command in (train, cv, sub.choices["evaluate"], sub.choices["tune"], predict, demo, run):
         command.add_argument("--device", default="cpu")
         command.add_argument("--threads", type=int, default=2)
@@ -76,7 +80,8 @@ def main(argv=None):
         from .data import prepare as prepare_dataset
         result = prepare_dataset(args.source, args.output, args.alignment, args.location,
                                  args.references, args.seed, args.reference_mode)
-        print(f"Saved {len(result['sessions'])} eligible sessions; excluded {len(result['excluded'])}: {args.output}")
+        print(f"Saved {len(result['sessions'])} wrist streams from {result['subjects']} subjects; "
+              f"excluded {len(result['excluded'])} source sessions: {args.output}")
     elif args.command == "demo":
         from .demo import run_demo
         run_demo(args.output, args.device)

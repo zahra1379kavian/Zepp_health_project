@@ -18,7 +18,8 @@ from .data import (WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json,
                    subject_folds, training_statistics)
 from .decode import DecoderConfig, RepDecoder, decode_sequence, group_sets
 from .metrics import (aggregate_repetitions, classification_metrics, confusion_matrix,
-                      count_rows, covered_repetitions, false_exercise_events, repetition_metrics)
+                      count_rows, covered_repetitions, false_exercise_events, repetition_metrics,
+                      reporting_tolerances, score_stream, aggregate_streams, grouped_stream_report)
 from .model import DenseMSTCN, ModelConfig, configuration, dense_loss
 
 
@@ -170,6 +171,9 @@ def train(args):
             checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
                           "normalization": manifest["normalization"], "classes": CLASSES, "features": FEATURES,
                           "location": manifest["location"], "station_only": args.station_only,
+                          "sensor_policy": manifest.get("wrist_selection"),
+                          "training_streams": [{key: row.get(key) for key in ("session", "source_session", "subject", "side")}
+                                               for row in manifest["sessions"] if row["session"] in manifest["split"]["train"]],
                           "reference_mode": manifest.get("reference_mode"),
                           "reference_convention": manifest.get("reference_convention"),
                           "data_manifest_sha256": digest(root / "manifest.json"), "split": manifest["split"],
@@ -263,11 +267,11 @@ def evaluate(args):
         raise FileExistsError(f"Refusing to overwrite {out}")
     model, ckpt = load_checkpoint(args.checkpoint, args.device, root)
     config, tolerance, selection = decoder_config(args.decoder, args.checkpoint, args.tolerance_ms)
+    tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), tolerance)
     manifest = json.loads((root / "manifest.json").read_text())
+    metadata = {s["session"]: s for s in manifest["sessions"]}
     out.mkdir(parents=True)
-    pooled_cm = np.zeros((len(CLASSES), len(CLASSES)), np.int64)
-    sessions, rep_results, counts, exercise_results = [], [], [], {name: [] for name in CLASSES[1:] if name != "plank"}
-    segmentation_results, session_counts = [], []
+    records, sessions = [], []
     for name in manifest["split"][args.split]:
         arrays = load_arrays(root / name)
         p, q = probabilities(model, arrays["x"], arrays["valid"], ckpt["normalization"], args.device)
@@ -276,9 +280,10 @@ def evaluate(args):
         decoded = decode_sequence(arrays["t"], p, q, arrays["valid"], config)
         predicted = p.argmax(1)
         cm = confusion_matrix(arrays["y"], predicted, arrays["valid"])
-        pooled_cm += cm
-        result = {"session": name, "subject": name.split("_", 1)[1],
-                  "classification": classification_metrics(cm),
+        info = metadata[name]
+        record = {"session": name, "source_session": info.get("source_session", name),
+                  "subject": info["subject"], "side": info.get("side", info["label_column"]),
+                  "confusion_matrix": cm.tolist(), "repetition_scores": {},
                   **false_exercise_events(arrays["y"], predicted, arrays["valid"]),
                   "eligible_samples": int(arrays["valid"].sum()),
                   "reference_samples": int(arrays["coverage"].sum())}
@@ -286,44 +291,29 @@ def evaluate(args):
         scored, unscored = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"],
                                                references, tolerance)
         if arrays["coverage"].any() and not ckpt["station_only"]:
-            metric = repetition_metrics(scored, references, tolerance)
-            rows = count_rows(scored, references, name)
-            result["repetitions"] = aggregate_repetitions([metric], rows)
-            rep_results.append(metric)
-            counts.extend(rows)
-            detected, _ = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"],
-                                               references, tolerance, require_station=False)
-            detection = repetition_metrics(detected, references, tolerance, require_station=False)
-            detection_rows = count_rows(detected, references, name, require_station=False)
-            result["segmentation"] = aggregate_repetitions([detection], detection_rows)
-            segmentation_results.append(detection)
-            session_counts.extend(detection_rows)
-            for station in exercise_results:
-                metric = repetition_metrics([r for r in scored if r["station"] == station],
-                                            [r for r in references if r["station"] == station], tolerance)
-                exercise_results[station].append(metric)
-        else:
-            result["repetitions"] = {"status": "station_only" if ckpt["station_only"] else "no_validated_references"}
+            record["repetition_scores"] = score_stream(decoded["repetitions"], references,
+                                                        arrays["t"], arrays["coverage"], record, tolerances)
+        result = {key: record[key] for key in ("session", "source_session", "subject", "side",
+                                              "eligible_samples", "reference_samples")}
+        result.update(aggregate_streams([record], tolerances, tolerance))
+        if ckpt["station_only"]:
+            result["repetitions"] = {"status": "station_only"}
         decoded["scored_repetitions"], decoded["unscored_repetitions"] = scored, unscored
-        write_json(out / f"{name}.json", {**decoded, "metrics": result})
+        write_json(out / f"{name}.json", {**decoded, "metrics": result, "scoring": record})
+        records.append(record)
         sessions.append(result)
         print(f"Evaluated {name}", flush=True)
-    hours = sum(r["rest_hours"] for r in sessions)
-    events = sum(r["false_exercise_events"] for r in sessions)
-    report = {"split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
+    report = {**grouped_stream_report(records, tolerances, tolerance),
+              "split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
+              "report_tolerances_ms": tolerances,
+              "report_scope": "fold_test" if "cross_validation" in manifest else "single_split_diagnostic",
               "reference_mode": manifest.get("reference_mode"),
               "reference_convention": manifest.get("reference_convention"),
               "phase_order_validated": manifest.get("phase_order_validated", False),
               "sensor_policy": manifest.get("wrist_selection"),
-              "classification": classification_metrics(pooled_cm),
-              "false_exercise_events": events, "rest_hours": hours,
-              "false_exercise_events_per_rest_hour": events / hours if hours else None,
-              "repetitions": aggregate_repetitions(rep_results, counts), "per_subject_session": sessions,
-              "segmentation": aggregate_repetitions(segmentation_results, session_counts),
-              "per_exercise": {s: aggregate_repetitions(r, [c for c in counts if c["station"] == s])
-                               for s, r in exercise_results.items()},
+              "per_subject_session": sessions,
               "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
-              "coverage_note": "Repetition counts refer only to certified, available intervals, not unannotated whole sessions.",
+              "coverage_note": "Counts cover certified, available wrist streams. Paired wrists observe the same workout; pooled repetitions and stream-hours are not distinct workout totals. Both wrists stay in the same subject fold.",
               "limitations": "One session per subject; uneven exercise and demographic coverage. NULL is category-relative rest, not a learned unknown-exercise class.",
               "excluded_sessions": manifest["excluded"]}
     write_json(out / "report.json", report)
@@ -440,7 +430,7 @@ def predict(args):
 
 
 def run_pipeline(args):
-    """One command for the real wrist experiment; no station-only fallback."""
+    """Prepare all requested wrist streams and report subject-wise cross-validation."""
     from .__main__ import main
     out = Path(args.output)
     if out.exists():
@@ -450,8 +440,8 @@ def run_pipeline(args):
     root = Path(args.data) if args.data else out / "data"
     if args.data:
         manifest = json.loads((root / "manifest.json").read_text())
-        if manifest.get("version", 0) < 3 or manifest["location"] != args.location:
-            raise ValueError("Reprepare --data with dense phase targets and the validated phase1 -> phase2 convention")
+        if manifest.get("version", 0) < 4 or manifest["location"] != args.location:
+            raise ValueError("Reprepare --data as version 4 with every requested wrist stream")
         if manifest.get("reference_mode") != "labels":
             raise ValueError("The run command expects references derived from label.csv")
     else:
@@ -459,16 +449,12 @@ def run_pipeline(args):
               "--location", args.location, "--reference-mode", "labels",
               "--seed", str(args.seed), "--output", str(root)])
     common = ["--device", args.device, "--threads", str(args.threads)]
-    main(["train", "--data", str(root), "--output", str(out / "model"),
+    main(["cross-validate", "--data", str(root), "--output", str(out / "cross_validation"),
+          "--folds", str(args.folds),
           "--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
-          "--seed", str(args.seed), "--tolerance-ms", str(args.tolerance_ms), *common])
-    checkpoint = str(out / "model" / "best.pt")
-    main(["tune", "--data", str(root), "--checkpoint", checkpoint,
-          "--tolerance-ms", str(args.tolerance_ms), "--output", str(out / "decoder.json"), *common])
-    main(["evaluate", "--data", str(root), "--checkpoint", checkpoint,
-          "--decoder", str(out / "decoder.json"), "--split", "test",
-          "--output", str(out / "test"), *common])
-    print(f"Wrist experiment complete. Report: {out / 'test' / 'report.json'}", flush=True)
+          "--seed", str(args.seed), "--tolerance-ms", str(args.tolerance_ms),
+          "--report-tolerances-ms", *map(str, args.report_tolerances_ms), *common])
+    print(f"Wrist cross-validation complete. Report: {out / 'cross_validation' / 'report.json'}", flush=True)
 
 
 def cross_validate(args):
@@ -481,11 +467,11 @@ def cross_validate(args):
     if args.station_only:
         raise ValueError("Repetition cross-validation requires a repetition head")
     manifest = json.loads((root / "manifest.json").read_text())
-    if manifest.get("version", 0) < 3:
-        raise ValueError("Reprepare the dataset with the validated phase convention before cross-validation")
+    if manifest.get("version", 0) < 4:
+        raise ValueError("Reprepare as version 4 so cross-validation includes every requested wrist stream")
+    tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), args.tolerance_ms)
     splits = subject_folds(manifest["sessions"], args.folds, args.seed)
-    reports, metrics, counts, detection_metrics, detection_counts = [], [], [], [], []
-    cm = np.zeros((len(CLASSES), len(CLASSES)), np.int64)
+    reports, records = [], []
     for index, split in enumerate(splits):
         fold = out / f"fold_{index + 1}"
         data = fold / "data"
@@ -504,29 +490,29 @@ def cross_validate(args):
         tune(Namespace(**params))
         params.update(decoder=fold / "decoder.json", split="test", output=fold / "test")
         report = evaluate(Namespace(**params))
-        reports.append({"fold": index + 1, "split": split, "repetitions": report["repetitions"],
-                        "segmentation": report["segmentation"]})
-        cm += np.array(report["classification"]["confusion_matrix"])
+        reports.append({"fold": index + 1, "split": split,
+                        **{key: report[key] for key in ("repetitions", "segmentation", "by_tolerance", "per_side",
+                                                       "streams", "subjects", "source_sessions")}})
         for name in split["test"]:
-            a = load_arrays(root / name)
-            if not a["coverage"].any():
-                continue
-            refs = json.loads((root / name / "references.json").read_text())
-            predicted = json.loads((fold / "test" / f"{name}.json").read_text())["repetitions"]
-            for require_station, scores, rows in ((True, metrics, counts),
-                                                   (False, detection_metrics, detection_counts)):
-                scored, _ = covered_repetitions(predicted, a["t"], a["coverage"], refs,
-                                                 args.tolerance_ms, require_station)
-                scores.append(repetition_metrics(scored, refs, args.tolerance_ms, require_station))
-                rows.extend(count_rows(scored, refs, name, require_station))
+            # Reuse scores from the same once-decoded test predictions at every
+            # tolerance. Never rerun inference or tune thresholds on test data.
+            records.append(json.loads((fold / "test" / f"{name}.json").read_text())["scoring"])
         write_json(out / "folds.json", reports)
-    f1 = [r["segmentation"]["f1"] for r in reports if r["segmentation"]["status"] == "scored"]
-    result = {"folds": reports, "classification": classification_metrics(cm),
-              "repetitions": aggregate_repetitions(metrics, counts),
-              "segmentation": aggregate_repetitions(detection_metrics, detection_counts),
-              "fold_segmentation_f1_mean": float(np.mean(f1)) if f1 else None,
-              "fold_segmentation_f1_std": float(np.std(f1, ddof=1)) if len(f1) > 1 else None,
+    result = {**grouped_stream_report(records, tolerances, args.tolerance_ms), "folds": reports,
+              "report_scope": "subject_wise_cross_validation", "report_tolerances_ms": tolerances,
               "seed": args.seed, "timing_tolerance_ms": args.tolerance_ms,
-              "protocol": "Subject-disjoint outer test folds; next fold validates; remaining folds train. Each subject tested exactly once. Normalization and loss weights refit on training subjects. Checkpoint and decoder selected only on validation."}
+              "protocol": "Subject-disjoint outer test folds; next fold validates; remaining folds train. Both wrists of a subject always stay together. Each subject tested exactly once. Normalization and loss weights refit on training subjects. Checkpoint and decoder selected only on validation at the primary tolerance; the same test predictions are scored at every reporting tolerance.",
+              "coverage_note": "Pooled counts and hours are wrist-stream observations, not distinct workout totals. Report per-side metrics and subject-macro F1 alongside pooled metrics.",
+              "sensor_policy": manifest["wrist_selection"], "reference_convention": manifest["reference_convention"]}
+    for target, fold_groups in [(result, reports), *[(result["per_side"][side], [r["per_side"][side] for r in reports])
+                                                     for side in ("left_wrist", "right_wrist")]]:
+        for tolerance in tolerances:
+            f1 = [r["by_tolerance"][str(tolerance)]["segmentation"]["f1"] for r in fold_groups
+                  if r["by_tolerance"][str(tolerance)]["segmentation"]["status"] == "scored"]
+            stats = {"fold_segmentation_f1_mean": float(np.mean(f1)) if f1 else None,
+                     "fold_segmentation_f1_std": float(np.std(f1, ddof=1)) if len(f1) > 1 else None}
+            target["by_tolerance"][str(tolerance)].update(stats)
+            if tolerance == args.tolerance_ms:
+                target.update(stats)
     write_json(out / "report.json", result)
     return result

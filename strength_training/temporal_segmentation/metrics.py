@@ -134,3 +134,74 @@ def aggregate_repetitions(results, counts):
             "count_mae_active_station_sessions": float(np.mean([r["absolute_error"] for r in active])) if active else None,
             "exact_count_accuracy_active_station_sessions": float(np.mean([r["exact"] for r in active])) if active else None,
             "count_rows": counts}
+
+
+def reporting_tolerances(values=None, primary=400):
+    """Keep the selection tolerance and all declared reporting tolerances."""
+    values = [200, 400] if values is None else values
+    if primary <= 0 or not values or any(value <= 0 for value in values):
+        raise ValueError("Reporting tolerances must be positive and nonempty")
+    return sorted(set([primary, *values]))
+
+
+def score_stream(predictions, references, t, coverage, metadata, tolerances):
+    """Score an unchanged decoded stream at several endpoint tolerances."""
+    scores = {}
+    for tolerance in tolerances:
+        result = {}
+        for require_station, key in ((True, "repetitions"), (False, "segmentation")):
+            scored, _ = covered_repetitions(predictions, t, coverage, references, tolerance, require_station)
+            rows = count_rows(scored, references, metadata["session"], require_station)
+            for row in rows:
+                row.update({k: metadata[k] for k in ("source_session", "subject", "side")})
+            result[key] = {"metrics": repetition_metrics(scored, references, tolerance, require_station),
+                           "counts": rows}
+            if require_station:
+                result["per_exercise"] = {
+                    name: repetition_metrics([r for r in scored if r["station"] == name],
+                                             [r for r in references if r["station"] == name], tolerance)
+                    for name in CLASSES[1:] if name != "plank"}
+        scores[str(tolerance)] = result
+    return scores
+
+
+def aggregate_streams(records, tolerances, primary=400):
+    """Pool stream observations without treating paired wrists as extra subjects."""
+    by_tolerance = {}
+    for tolerance in tolerances:
+        scores = [r["repetition_scores"][str(tolerance)] for r in records
+                  if str(tolerance) in r["repetition_scores"]]
+        summary = {key: aggregate_repetitions([s[key]["metrics"] for s in scores],
+                                               [row for s in scores for row in s[key]["counts"]])
+                   for key in ("repetitions", "segmentation")}
+        summary["per_exercise"] = {
+            name: aggregate_repetitions([s["per_exercise"][name] for s in scores],
+                                         [row for s in scores for row in s["repetitions"]["counts"]
+                                          if row["station"] == name])
+            for name in CLASSES[1:] if name != "plank"}
+        by_tolerance[str(tolerance)] = summary
+    cm = sum((np.array(r["confusion_matrix"], dtype=np.int64) for r in records),
+             np.zeros((len(CLASSES), len(CLASSES)), np.int64))
+    hours = sum(r["rest_hours"] for r in records)
+    events = sum(r["false_exercise_events"] for r in records)
+    return {"streams": len(records), "subjects": len({r["subject"] for r in records}),
+            "source_sessions": len({r["source_session"] for r in records}),
+            "classification": classification_metrics(cm),
+            "false_exercise_events": events, "rest_hours": hours,
+            "false_exercise_events_per_rest_hour": events / hours if hours else None,
+            "by_tolerance": by_tolerance, **by_tolerance[str(primary)]}
+
+
+def grouped_stream_report(records, tolerances, primary=400):
+    result = aggregate_streams(records, tolerances, primary)
+    result["per_side"] = {side: aggregate_streams([r for r in records if r["side"] == side], tolerances, primary)
+                          for side in ("left_wrist", "right_wrist")}
+    result["per_subject"] = {subject: aggregate_streams([r for r in records if r["subject"] == subject],
+                                                         tolerances, primary)
+                             for subject in sorted({r["subject"] for r in records})}
+    for tolerance in tolerances:
+        f1 = [r["by_tolerance"][str(tolerance)]["segmentation"]["f1"]
+              for r in result["per_subject"].values()
+              if r["by_tolerance"][str(tolerance)]["segmentation"]["status"] == "scored"]
+        result["by_tolerance"][str(tolerance)]["subject_macro_segmentation_f1"] = float(np.mean(f1)) if f1 else None
+    return result

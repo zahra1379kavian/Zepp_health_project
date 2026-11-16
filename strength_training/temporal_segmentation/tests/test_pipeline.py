@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from argparse import Namespace
 
 import numpy as np
 import pandas as pd
@@ -11,14 +13,15 @@ import torch
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, EXCLUDED_SESSIONS, FEATURES
 from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, log_masks,
                                                          phase_label_targets, prepare, reference_targets,
-                                                         select_wrist, subject_split, subject_folds,
+                                                         select_wrists, subject_split, subject_folds,
                                                          dense_phase_targets, training_statistics)
 from strength_training.temporal_segmentation.decode import DecoderConfig, RepDecoder, decode_sequence
 from strength_training.temporal_segmentation.demo import synthetic_source
 from strength_training.temporal_segmentation.metrics import (covered_repetitions, match_repetitions,
-                                                            repetition_metrics)
+                                                            repetition_metrics, score_stream,
+                                                            grouped_stream_report, reporting_tolerances)
 from strength_training.temporal_segmentation.model import DenseMSTCN, ModelConfig, dense_loss
-from strength_training.temporal_segmentation.runner import Windows, checkpoint_key, score_cache
+from strength_training.temporal_segmentation.runner import Windows, checkpoint_key, score_cache, run_pipeline, evaluate
 
 
 class ModelTests(unittest.TestCase):
@@ -223,17 +226,18 @@ class DataTests(unittest.TestCase):
             np.testing.assert_array_equal(x, x2)
             np.testing.assert_array_equal(t, t2)
 
-    def test_wrist_selection_ignores_waist_and_prefers_left(self):
+    def test_wrist_selection_keeps_every_available_wrist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "S1_waist.csv").touch()
-            self.assertEqual(select_wrist(root), (None, None))
+            self.assertEqual(select_wrists(root), [])
             (root / "right_wrist.csv").touch()
-            self.assertEqual(select_wrist(root)[0], "right_wrist")
+            self.assertEqual(select_wrists(root), [("right_wrist", root / "right_wrist.csv")])
             (root / "left_wrist.csv").touch()
-            self.assertEqual(select_wrist(root)[0], "left_wrist")
+            self.assertEqual([s for s, _ in select_wrists(root)], ["left_wrist", "right_wrist"])
+            self.assertEqual([s for s, _ in select_wrists(root, "right_wrist")], ["right_wrist"])
             with self.assertRaisesRegex(ValueError, "wrist signals only"):
-                select_wrist(root, "waist")
+                select_wrists(root, "waist")
             with self.assertRaisesRegex(ValueError, "waist file"):
                 load_sensor(root / "S1_waist.csv")
 
@@ -254,10 +258,70 @@ class DataTests(unittest.TestCase):
                 a = load_arrays(root / "prepared" / session["session"])
                 reps = json.loads((root / "prepared" / session["session"] / "references.json").read_text())
                 got = [{k: r[k] for k in ("station", "start_ms", "end_ms")} for r in reps]
-                self.assertEqual(got, expected[session["session"]]["repetitions"])
+                self.assertEqual(got, expected[session["source_session"]]["repetitions"])
                 self.assertEqual(a["boundary"].sum(), 8)
                 self.assertTrue(session["sensor"].endswith("wrist.csv"))
             self.assertEqual(manifest["sessions"][0]["label_column"], "right_wrist")
+
+    def test_both_wrist_streams_keep_own_labels_gaps_and_subject_folds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, _ = synthetic_source(root / "source", subjects=6, both_wrists=True)
+            first = root / "source" / "20260101_DEMO000"
+            labels = pd.read_csv(first / "label.csv")
+            labels["right_wrist"] = labels.right_wrist.str.replace("squat", "biceps_curls")
+            labels.to_csv(first / "label.csv", index=False)
+            right = pd.read_csv(first / "right_wrist.csv").drop(index=120)
+            right.to_csv(first / "right_wrist.csv", index=False)
+            (root / "source" / "20260101_DEMO001" / "left_wrist.csv").unlink()
+            (root / "source" / "20260101_DEMO002" / "right_wrist.csv").unlink()
+            manifest = prepare(root / "source", root / "data", alignment)
+            self.assertEqual(manifest["version"], 4)
+            self.assertEqual((manifest["subjects"], manifest["source_sessions"]), (6, 6))
+            self.assertEqual(manifest["streams_per_side"], {"left_wrist": 5, "right_wrist": 5})
+            records = {r["session"]: r for r in manifest["sessions"]}
+            left_name, right_name = [f"20260101_DEMO000__{side}_wrist" for side in ("left", "right")]
+            left, right_arrays = [load_arrays(root / "data" / n) for n in (left_name, right_name)]
+            self.assertTrue(left["valid"][120])
+            self.assertFalse(right_arrays["valid"][120])
+            self.assertEqual(left["y"][100], CLASSES.index("squat"))
+            self.assertEqual(right_arrays["y"][100], CLASSES.index("biceps_curls"))
+            self.assertEqual(records[left_name]["reference_repetitions"], 4)
+            self.assertEqual(records[right_name]["reference_repetitions"], 3)
+            for split in [manifest["split"], *subject_folds(manifest["sessions"], 3)]:
+                ownership = {}
+                for partition, names in split.items():
+                    for name in names:
+                        subject = records[name]["subject"]
+                        self.assertEqual(ownership.setdefault(subject, partition), partition)
+                self.assertEqual(len(ownership), 6)
+            train_arrays = [load_arrays(root / "data" / n) for n in manifest["split"]["train"]]
+            expected = np.concatenate([a["x"][a["valid"]] for a in train_arrays]).astype(float)
+            np.testing.assert_allclose(manifest["normalization"]["mean"], expected.mean(0))
+
+    def test_external_references_are_not_copied_to_other_wrist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, refs_path = synthetic_source(root / "source", subjects=3, both_wrists=True)
+            refs = json.loads(refs_path.read_text())
+            name = "20260101_DEMO000"
+            refs["sessions"][name] = refs["sessions"][name]["wrists"]["left_wrist"]
+            refs_path.write_text(json.dumps(refs))
+            prepare(root / "source", root / "data", alignment, references_path=refs_path)
+            left = load_arrays(root / "data" / f"{name}__left_wrist")
+            right = load_arrays(root / "data" / f"{name}__right_wrist")
+            self.assertTrue(left["coverage"].any())
+            self.assertFalse(right["coverage"].any())
+            self.assertTrue(load_arrays(root / "data" / "20260101_DEMO001__right_wrist")["coverage"].any())
+
+    def test_missing_right_wrist_labels_fail_instead_of_using_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, _ = synthetic_source(root / "source", subjects=3, both_wrists=True)
+            path = root / "source" / "20260101_DEMO000" / "label.csv"
+            pd.read_csv(path).drop(columns="right_wrist").to_csv(path, index=False)
+            with self.assertRaisesRegex(ValueError, "missing authoritative right_wrist"):
+                prepare(root / "source", root / "data", alignment)
 
 
 class PhaseReferenceTests(unittest.TestCase):
@@ -523,6 +587,101 @@ class MetricsTests(unittest.TestCase):
         arrays = {"t": t, "coverage": coverage, "valid": np.ones(50, bool)}
         cache = [("subject", arrays, p, q, [self.rep(400, 1200)])]
         self.assertEqual(score_cache(cache, DecoderConfig(), 400)["f1"], 1)
+
+    def test_multiple_tolerances_score_identical_predictions(self):
+        predictions, refs = [self.rep(680, 1680)], [self.rep(400, 1400)]
+        original = json.dumps(predictions)
+        metadata = {"session": "date_subject__left_wrist", "source_session": "date_subject",
+                    "subject": "subject", "side": "left_wrist"}
+        scores = score_stream(predictions, refs, np.arange(60)*40, np.ones(60, bool), metadata, [200, 400])
+        self.assertEqual(scores["200"]["segmentation"]["metrics"]["f1"], 0)
+        self.assertEqual(scores["400"]["segmentation"]["metrics"]["f1"], 1)
+        self.assertEqual(scores["200"]["segmentation"]["counts"], scores["400"]["segmentation"]["counts"])
+        self.assertEqual(json.dumps(predictions), original)
+
+    def test_reporting_tolerances_keep_primary_and_reject_invalid_values(self):
+        self.assertEqual(reporting_tolerances([400, 200, 400], 300), [200, 300, 400])
+        for values in ([], [0], [-200]):
+            with self.assertRaises(ValueError):
+                reporting_tolerances(values)
+
+    def test_subject_macro_does_not_give_paired_subject_twice_the_weight(self):
+        records = []
+        for subject, side in (("paired", "left_wrist"), ("paired", "right_wrist"), ("single", "left_wrist")):
+            metadata = {"session": f"date_{subject}__{side}", "source_session": f"date_{subject}",
+                        "subject": subject, "side": side}
+            predicted = self.rep(1000, 2000) if subject == "paired" else self.rep(400, 1400)
+            record = {**metadata, "rest_hours": 0, "false_exercise_events": 0,
+                      "confusion_matrix": np.zeros((len(CLASSES), len(CLASSES)), int).tolist()}
+            record["repetition_scores"] = score_stream([predicted], [self.rep(400, 1400)],
+                                                        np.arange(75)*40, np.ones(75, bool), metadata, [200, 400])
+            records.append(record)
+        report = grouped_stream_report(records, [200, 400])
+        self.assertEqual((report["subjects"], report["streams"]), (2, 3))
+        self.assertAlmostEqual(report["segmentation"]["f1"], 1/3)
+        self.assertEqual(report["by_tolerance"]["400"]["subject_macro_segmentation_f1"], .5)
+
+
+class ReportingTests(unittest.TestCase):
+    def test_evaluation_decodes_once_and_reports_sides_at_each_tolerance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, _ = synthetic_source(root / "source", subjects=3, both_wrists=True)
+            manifest = prepare(root / "source", root / "data", alignment)
+            calls = []
+
+            def predicted_probabilities(*args):
+                offset = 7 if not calls else 0
+                calls.append(offset)
+                p, q = np.zeros((600, len(CLASSES))), np.zeros((600, 2))
+                p[:300, CLASSES.index("squat")] = 1
+                p[300:, CLASSES.index("push-up")] = 1
+                q[np.array([100, 175, 300, 400]) + offset, 0] = 1
+                q[np.array([150, 225, 375, 475]) + offset, 1] = 1
+                return p, q
+
+            args = Namespace(data=root / "data", output=root / "evaluation", checkpoint="unused", device="cpu",
+                             decoder=None, tolerance_ms=400, report_tolerances_ms=[200, 400], split="test")
+            ckpt = {"normalization": manifest["normalization"], "station_only": False}
+            with patch("strength_training.temporal_segmentation.runner.load_checkpoint", return_value=(None, ckpt)), \
+                    patch("strength_training.temporal_segmentation.runner.probabilities", side_effect=predicted_probabilities), \
+                    patch("strength_training.temporal_segmentation.runner.decode_sequence", wraps=decode_sequence) as decode:
+                report = evaluate(args)
+            self.assertEqual(decode.call_count, 2)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual((report["streams"], report["subjects"], report["source_sessions"]), (2, 1, 1))
+            self.assertEqual(report["by_tolerance"]["200"]["segmentation"]["f1"], .5)
+            self.assertEqual(report["by_tolerance"]["400"]["segmentation"]["f1"], 1)
+            self.assertEqual(report["per_side"]["left_wrist"]["by_tolerance"]["200"]["segmentation"]["f1"], 0)
+            self.assertEqual(report["per_side"]["right_wrist"]["by_tolerance"]["200"]["segmentation"]["f1"], 1)
+            self.assertEqual(len(report["per_subject"]), 1)
+            self.assertEqual(report["report_scope"], "single_split_diagnostic")
+            self.assertTrue(all(r["subject"] == next(iter(report["per_subject"])) for r in report["per_subject_session"]))
+
+    def test_run_routes_to_cross_validation_with_declared_tolerances(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "data"
+            data.mkdir()
+            (data / "manifest.json").write_text(json.dumps({"version": 4, "location": "wrist", "reference_mode": "labels"}))
+            args = Namespace(data=data, output=root / "run", location="wrist", epochs=1, batch_size=4,
+                             tolerance_ms=400, report_tolerances_ms=[200, 400], folds=5, device="cpu", threads=1, seed=42)
+            with patch("strength_training.temporal_segmentation.__main__.main") as main:
+                run_pipeline(args)
+            self.assertEqual(main.call_count, 1)
+            command = main.call_args.args[0]
+            self.assertEqual(command[0], "cross-validate")
+            self.assertEqual(command[command.index("--folds") + 1], "5")
+            i = command.index("--report-tolerances-ms")
+            self.assertEqual(command[i+1:i+3], ["200", "400"])
+
+    def test_old_single_wrist_dataset_cannot_be_headline_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "manifest.json").write_text(json.dumps({"version": 3, "location": "wrist"}))
+            args = Namespace(data=root, output=root / "run", location="wrist", epochs=1, batch_size=4, tolerance_ms=400)
+            with self.assertRaisesRegex(ValueError, "version 4"):
+                run_pipeline(args)
 
 
 if __name__ == "__main__":

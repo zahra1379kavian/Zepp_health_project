@@ -9,7 +9,7 @@ from .constants import DT_MS, FEATURES
 from .data import write_json
 
 
-def synthetic_source(root, subjects=8):
+def synthetic_source(root, subjects=8, both_wrists=False):
     root = Path(root)
     root.mkdir(parents=True)
     rng, log, align, sessions = np.random.default_rng(7), [], [], {}
@@ -32,12 +32,19 @@ def synthetic_source(root, subjects=8):
             repetitions.append({"station": station, "start_ms": int(t[a]), "end_ms": int(t[b])})
         raw[500:550] = "plank"
         x[500:550, 3] += 2
-        pd.DataFrame({"sync_timestamp": t, "left_wrist": raw}).to_csv(folder / "label.csv", index=False)
+        labels = {"sync_timestamp": t, "left_wrist": raw}
+        if both_wrists:
+            labels["right_wrist"] = raw.copy()
+        pd.DataFrame(labels).to_csv(folder / "label.csv", index=False)
         frame = pd.DataFrame(x, columns=FEATURES)
         frame.insert(0, "sync_timestamp", t)
         frame["timestamp"] = t + 1234
         frame["labels"] = raw  # Deliberate leakage trap: loader must ignore it.
         frame.to_csv(folder / "left_wrist.csv", index=False)
+        if both_wrists:
+            right = frame.copy()
+            right[FEATURES] = x + rng.normal(0, .02, x.shape)
+            right.to_csv(folder / "right_wrist.csv", index=False)
         log.append({"collect_date": "2026/01/01", "masked_id": f"DEMO{subject:03d}",
                     "scene_id": "action", "device_start_time": "08:00:00", "device_end_time": "08:00:00.4"})
         align.append({"session": name, "offset_hours": 8,
@@ -46,6 +53,9 @@ def synthetic_source(root, subjects=8):
                           "convention": "Known generated cycles; end is exclusive",
                           "coverage": [{"start_ms": int(t[10]), "end_ms": int(t[-1]+DT_MS)}],
                           "repetitions": repetitions}
+        if both_wrists:
+            entry = sessions[name]
+            sessions[name] = {"wrists": {"left_wrist": entry, "right_wrist": {**entry, "location": "right_wrist"}}}
     pd.DataFrame(log).to_csv(root / "demo-Sheet1.csv", index=False)
     pd.DataFrame(align).to_csv(root.parent / "alignment.csv", index=False)
     write_json(root.parent / "references.json", {"version": 1, "sessions": sessions})
@@ -57,19 +67,17 @@ def run_demo(output, device="cpu"):
     output = Path(output)
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
-    alignment, references = synthetic_source(output / "source")
+    alignment, references = synthetic_source(output / "source", both_wrists=True)
     main(["prepare", "--source", str(output / "source"), "--alignment", str(alignment),
           "--reference-mode", "labels", "--output", str(output / "prepared")])
-    main(["train", "--data", str(output / "prepared"), "--output", str(output / "model"),
+    main(["cross-validate", "--data", str(output / "prepared"), "--output", str(output / "cross_validation"),
+          "--folds", "3",
           "--epochs", "2", "--max-steps", "4", "--stages", "2", "--layers", "3", "--channels", "16",
           "--batch-size", "4", "--window", "128", "--device", device])
-    checkpoint = str(output / "model" / "best.pt")
-    main(["tune", "--data", str(output / "prepared"), "--checkpoint", checkpoint,
-          "--output", str(output / "decoder.json"), "--device", device])
-    main(["evaluate", "--data", str(output / "prepared"), "--checkpoint", checkpoint,
-          "--decoder", str(output / "decoder.json"), "--output", str(output / "evaluation"), "--device", device])
+    fold = output / "cross_validation" / "fold_1"
+    checkpoint = str(fold / "model" / "best.pt")
     main(["predict", "--input", str(output / "source" / "20260101_DEMO000" / "left_wrist.csv"),
-          "--checkpoint", checkpoint, "--decoder", str(output / "decoder.json"),
+          "--checkpoint", checkpoint, "--decoder", str(fold / "decoder.json"),
           "--output", str(output / "prediction"), "--device", device])
     write_json(output / "SYNTHETIC_ONLY.json", {"purpose": "Pipeline smoke test, not evidence of real-world accuracy"})
     print(f"Synthetic smoke test finished: {output}")

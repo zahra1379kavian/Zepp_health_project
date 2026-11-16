@@ -4,10 +4,11 @@ For **wrist-only** causal MS-TCN station/NULL classification and individual-repe
 segmentation, see the [exact run commands](temporal_segmentation/README.md).
 That pipeline now derives repetition targets directly from the matching wrist
 column of the reliable `label.csv` files, using the validated phase1 → phase2
-convention and a dense phase head. Its `run` command prepares the data, selects
-checkpoints by repetition F1/count error, tunes on validation subjects, and
-evaluates held-out subjects. `cross-validate` runs subject-wise folds. Version-2
-wrist datasets need to be prepared again for dense phase training.
+convention and a dense phase head. Both wrists are separate streams grouped by
+subject. Its `run` command prepares the data and runs five-fold cross-validation,
+selecting checkpoints and decoder settings only on validation subjects. Reports
+include each wrist side at 200 and 400 ms tolerance. Version-2/3 datasets need to
+be prepared again; the current dataset is `strength_training/tas_data_both_wrists`.
 
 Run from the repository root (Python 3.10+, no additional dependencies):
 

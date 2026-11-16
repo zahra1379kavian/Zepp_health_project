@@ -26,16 +26,26 @@ PHASE_CONVENTION = (
 )
 
 
-def select_wrist(folder, location="wrist"):
-    """One fixed wrist per session, chosen without inspecting labels."""
+def select_wrists(folder, location="wrist"):
+    """Return every requested wrist as a separate stream, without reading labels."""
     if location not in WRIST_LOCATIONS:
         raise ValueError("This method uses wrist signals only; waist input is not supported")
     choices = ("left_wrist", "right_wrist") if location == "wrist" else (location,)
-    for side in choices:
-        path = Path(folder) / f"{side}.csv"
-        if path.is_file():
-            return side, path
-    return None, None
+    return [(side, Path(folder) / f"{side}.csv") for side in choices
+            if (Path(folder) / f"{side}.csv").is_file()]
+
+
+def wrist_reference(entry, side):
+    """External references are side-specific; never copy labels across wrists."""
+    if entry is None:
+        return None
+    if "wrists" in entry:
+        if set(entry["wrists"]) - {"left_wrist", "right_wrist"}:
+            raise ValueError("External reference wrists must be left_wrist or right_wrist")
+        return entry["wrists"].get(side)
+    if entry.get("location") not in ("left_wrist", "right_wrist"):
+        raise ValueError("External wrist references need an explicit left_wrist or right_wrist location")
+    return entry if entry["location"] == side else None
 
 
 def write_json(path, value):
@@ -285,7 +295,7 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
     refs = json.loads(Path(references_path).read_text()) if references_path else {"version": 1, "sessions": {}}
     if refs.get("version") != 1:
         raise ValueError("Unsupported references schema")
-    manifest = {"version": 3, "source": str(source), "location": location,
+    manifest = {"version": 4, "source": str(source), "location": location,
                 "classes": CLASSES, "features": FEATURES, "sample_period_ms": DT_MS,
                 "alignment_source": str(Path(alignment_path).resolve()),
                 "references_source": str(Path(references_path).resolve()) if references_path else
@@ -297,7 +307,8 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
                 "phase_order_validated": reference_mode == "labels" and not references_path,
                 "phase_validation_source": "User confirmed phase1 then phase2 in code review",
                 "seed": seed, "sessions": [], "excluded": [],
-                "wrist_selection": "left wrist when present, otherwise right; fixed per session" if location == "wrist" else location}
+                "wrist_selection": "every available wrist as a separate stream; split by subject" if location == "wrist" else location,
+                "stream_id_format": "<source_session>__<wrist_side>"}
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".tas-prepare-", dir=output.parent) as temp:
         dest = Path(temp) / "dataset"
@@ -307,13 +318,11 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
             if name in EXCLUDED_SESSIONS:
                 manifest["excluded"].append({"session": name, "reason": "plan whole-session exclusion"})
                 continue
-            selected_location, sensor_path = select_wrist(folder, location)
-            if sensor_path is None:
+            wrists = select_wrists(folder, location)
+            if not wrists:
                 manifest["excluded"].append({"session": name, "reason": f"no {location} sensor"})
                 continue
             labels = pd.read_csv(folder / "label.csv")
-            if selected_location not in labels:
-                raise ValueError(f"{folder}: missing authoritative {selected_location} labels")
             t = labels.sync_timestamp.to_numpy(np.int64)
             if not len(t) or np.any(np.diff(t) != DT_MS):
                 raise ValueError(f"{folder}: label clock must be a complete 25 Hz grid")
@@ -322,46 +331,53 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
             except ValueError as error:
                 manifest["excluded"].append({"session": name, "reason": str(error)})
                 continue
-            sensor_t, sensor_x = load_sensor(sensor_path)
-            idx = np.searchsorted(t, sensor_t)
-            if np.any(idx >= len(t)) or not np.array_equal(t[idx], sensor_t):
-                raise ValueError(f"{sensor_path}: sensor clock does not match label grid exactly")
-            x, available = np.zeros((len(t), len(FEATURES)), np.float32), np.zeros(len(t), bool)
-            x[idx], available[idx] = sensor_x, True
-            raw = labels[selected_location].to_numpy(dtype=str)
-            mapping = {value: CLASSES.index(station(str(value))) for value in np.unique(raw)}
-            y = np.array([mapping[value] for value in raw], dtype=np.int64)
-            valid = eligible & available
-            if references_path or reference_mode == "none":
-                boundary, coverage, reps, cut = reference_targets(t, valid, refs["sessions"].get(name), selected_location)
-            else:
-                boundary, coverage, reps, cut = phase_label_targets(t, raw, valid)
-            phase, phase_mask = dense_phase_targets(t, raw, valid, coverage, reps)
-            path = dest / name
-            path.mkdir()
-            for key, array in dict(x=x, t=t, y=y, raw=raw, valid=valid, available=available,
-                                   eligible=eligible, probe=probe & available,
-                                   boundary=boundary, coverage=coverage,
-                                   phase=phase, phase_mask=phase_mask).items():
-                np.save(path / f"{key}.npy", array, allow_pickle=False)
-            write_json(path / "references.json", reps)
-            write_json(path / "reference_audit.json", {"source": manifest["references_source"],
-                       "convention": manifest["reference_convention"], "label_column": selected_location,
-                       "accepted_repetitions": len(reps), "rejected": cut})
-            record = {"session": name, "subject": name.split("_", 1)[1], "sensor": sensor_path.name,
-                      "label_column": selected_location,
-                      "samples": len(t), "available_samples": int(available.sum()),
-                      "valid_samples": int(valid.sum()), "masked_log_samples": int((~eligible).sum()),
-                      "probe_samples": int((probe & available).sum()), "exclusions": exclusions,
-                      "reference_samples": int(coverage.sum()), "reference_repetitions": len(reps),
-                      "removed_references": cut,
-                      "raw_label_counts": dict(Counter(map(str, raw)))}
-            manifest["sessions"].append(record)
-            print(f"Prepared {name} ({selected_location}): {valid.sum():,} eligible samples; {len(reps)} reference reps", flush=True)
+            for selected_location, sensor_path in wrists:
+                if selected_location not in labels:
+                    raise ValueError(f"{folder}: missing authoritative {selected_location} labels")
+                sensor_t, sensor_x = load_sensor(sensor_path)
+                idx = np.searchsorted(t, sensor_t)
+                if np.any(idx >= len(t)) or not np.array_equal(t[idx], sensor_t):
+                    raise ValueError(f"{sensor_path}: sensor clock does not match label grid exactly")
+                x, available = np.zeros((len(t), len(FEATURES)), np.float32), np.zeros(len(t), bool)
+                x[idx], available[idx] = sensor_x, True
+                raw = labels[selected_location].to_numpy(dtype=str)
+                mapping = {value: CLASSES.index(station(str(value))) for value in np.unique(raw)}
+                y = np.array([mapping[value] for value in raw], dtype=np.int64)
+                valid = eligible & available
+                if references_path or reference_mode == "none":
+                    entry = wrist_reference(refs["sessions"].get(name), selected_location)
+                    boundary, coverage, reps, cut = reference_targets(t, valid, entry, selected_location)
+                else:
+                    boundary, coverage, reps, cut = phase_label_targets(t, raw, valid)
+                phase, phase_mask = dense_phase_targets(t, raw, valid, coverage, reps)
+                stream = f"{name}__{selected_location}"
+                path = dest / stream
+                path.mkdir()
+                for key, array in dict(x=x, t=t, y=y, raw=raw, valid=valid, available=available,
+                                       eligible=eligible, probe=probe & available,
+                                       boundary=boundary, coverage=coverage,
+                                       phase=phase, phase_mask=phase_mask).items():
+                    np.save(path / f"{key}.npy", array, allow_pickle=False)
+                write_json(path / "references.json", reps)
+                write_json(path / "reference_audit.json", {"source": manifest["references_source"],
+                           "convention": manifest["reference_convention"], "label_column": selected_location,
+                           "accepted_repetitions": len(reps), "rejected": cut})
+                record = {"session": stream, "source_session": name, "subject": name.split("_", 1)[1],
+                          "side": selected_location, "sensor": sensor_path.name, "label_column": selected_location,
+                          "samples": len(t), "available_samples": int(available.sum()),
+                          "valid_samples": int(valid.sum()), "masked_log_samples": int((~eligible).sum()),
+                          "probe_samples": int((probe & available).sum()), "exclusions": exclusions,
+                          "reference_samples": int(coverage.sum()), "reference_repetitions": len(reps),
+                          "removed_references": cut, "raw_label_counts": dict(Counter(map(str, raw)))}
+                manifest["sessions"].append(record)
+                print(f"Prepared {stream}: {valid.sum():,} eligible samples; {len(reps)} reference reps", flush=True)
         unknown = set(refs["sessions"]) - {p.name for p in source.iterdir() if p.is_dir()}
         if unknown:
             raise ValueError(f"References name unknown sessions: {sorted(unknown)}")
         manifest["split"] = subject_split(manifest["sessions"], seed)
+        manifest["subjects"] = len({s["subject"] for s in manifest["sessions"]})
+        manifest["source_sessions"] = len({s["source_session"] for s in manifest["sessions"]})
+        manifest["streams_per_side"] = dict(Counter(s["side"] for s in manifest["sessions"]))
         manifest.update(training_statistics(dest, manifest["split"]["train"]))
         write_json(dest / "manifest.json", manifest)
         dest.rename(output)

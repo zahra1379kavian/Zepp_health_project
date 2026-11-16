@@ -149,5 +149,148 @@
       }
     ],
     "reference_repetitions": 0
+  },
+  "phase_model_review": {
+    "phase_order": "User validated phase1 then phase2 as a complete repetition",
+    "default_architecture": "station/NULL plus dense NULL/phase1/phase2",
+    "unit_tests": {
+      "passed": 63,
+      "temporal_tests": 53,
+      "alignment_tests": 10,
+      "command": "python -m unittest discover -s strength_training -p 'test_*.py' -q"
+    },
+    "synthetic_phase_pipeline": {
+      "status": "passed",
+      "output": "/tmp/zahra-review-phase-demo",
+      "scope": "prepare, short dense-phase training, metric-based checkpoint selection, tune, evaluate, sensor-only predict"
+    },
+    "synthetic_cross_validation": {
+      "status": "passed",
+      "folds": 3,
+      "subjects": 8,
+      "output": "/tmp/zahra-review-phase-cv",
+      "scope": "subject-disjoint splits, per-fold training statistics, training, tuning, evaluation and pooled report"
+    },
+    "real_phase_order_audit": {
+      "sessions": 43,
+      "reference_repetitions": 21277,
+      "unpaired_phases": 12,
+      "sessions_with_changed_rep_count": 0,
+      "supervised_null_phase1_phase2_frames": [
+        5697183,
+        485409,
+        489457
+      ],
+      "source": "read-only audit of existing wrist raw-label arrays"
+    },
+    "compatibility": "Version-2 prepared wrist datasets need rebuilding; phase models need retraining",
+    "not_established": [
+      "full real-data dense-phase training or cross-validation performance",
+      "unseen-exercise segmentation accuracy",
+      "live end-to-end reporting delay below one second"
+    ],
+    "historical_note": "The earlier execution records below describe the boundary-head implementation. Their prepared datasets and performance checks are not evidence for the new dense phase model."
+  },
+  "latest_review": {
+    "scope": "Both wrist streams, subject-wise headline evaluation, and multiple timing tolerances",
+    "unit_tests": {
+      "passed": 72,
+      "temporal_tests": 62,
+      "alignment_tests": 10,
+      "command": "python -m unittest discover -s strength_training -p 'test_*.py' -q"
+    },
+    "real_preparation": {
+      "output": "strength_training/tas_data_both_wrists",
+      "version": 4,
+      "subjects": 43,
+      "source_sessions": 43,
+      "streams_per_side": {
+        "left_wrist": 39,
+        "right_wrist": 38
+      },
+      "streams": 77,
+      "paired_sessions": 34,
+      "stream_references": 38486,
+      "per_side": {
+        "left_wrist": {
+          "streams": 39,
+          "eligible_stream_hours": 67.16235555555556,
+          "references": 19849,
+          "probe_stream_minutes": 44.7
+        },
+        "right_wrist": {
+          "streams": 38,
+          "eligible_stream_hours": 65.68402222222223,
+          "references": 18637,
+          "probe_stream_minutes": 52.083333333333336
+        }
+      },
+      "excluded_source_sessions": 8,
+      "test_folds": [
+        {
+          "subjects": 9,
+          "streams": 15,
+          "sides": {
+            "left_wrist": 9,
+            "right_wrist": 6
+          }
+        },
+        {
+          "subjects": 9,
+          "streams": 16,
+          "sides": {
+            "left_wrist": 8,
+            "right_wrist": 8
+          }
+        },
+        {
+          "subjects": 9,
+          "streams": 16,
+          "sides": {
+            "right_wrist": 9,
+            "left_wrist": 7
+          }
+        },
+        {
+          "subjects": 8,
+          "streams": 15,
+          "sides": {
+            "right_wrist": 8,
+            "left_wrist": 7
+          }
+        },
+        {
+          "subjects": 8,
+          "streams": 15,
+          "sides": {
+            "left_wrist": 8,
+            "right_wrist": 7
+          }
+        }
+      ]
+    },
+    "synthetic_cross_validation": {
+      "status": "passed",
+      "output": "/tmp/zahra-both-wrists-demo/cross_validation",
+      "subjects": 8,
+      "streams": 16,
+      "folds": 3,
+      "report_tolerances_ms": [
+        200,
+        400
+      ],
+      "scope": "dense-phase training, validation-only selection, pooled and per-side reports, and sensor-only prediction"
+    },
+    "run_command": {
+      "status": "passed",
+      "output": "/tmp/zahra-both-wrists-run/cross_validation",
+      "scope": "public run entry point, three synthetic folds, full-size architecture, one epoch per fold"
+    },
+    "not_established": [
+      "full real-data cross-validation accuracy",
+      "unseen-exercise performance",
+      "live reporting latency below one second"
+    ],
+    "note": "Synthetic runs verify execution, not model quality. Paired wrist reference counts are observations of the same workout, not unique physical repetitions."
   }
 }
