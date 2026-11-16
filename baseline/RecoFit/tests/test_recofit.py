@@ -2,15 +2,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
 
-from baseline.ReoFit.counter import bandpass, count_peaks, decode
-from baseline.ReoFit.features import extract, pc1, window_ends
-from baseline.ReoFit.pipeline import (check_split, evaluate, fit, fit_period_bounds,
-                               infer, load_model, predict)
-from baseline.ReoFit.demo import synthetic_source
+from baseline.RecoFit.counter import bandpass, count_peaks, decode
+from baseline.RecoFit.features import extract, pc1, window_ends
+from baseline.RecoFit.pipeline import (check_split, classify, evaluate, fit, fit_period_bounds,
+                                      infer, load_model, predict)
+from baseline.RecoFit.demo import synthetic_source
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
 from strength_training.temporal_segmentation.data import prepare, subject_folds
 
@@ -19,6 +20,100 @@ def sine_signal(seconds=24, period=2., harmonic=0.):
     time = np.arange(int(seconds*25))/25
     values = np.sin(2*np.pi*time/period)+harmonic*np.sin(4*np.pi*time/period)
     return np.column_stack((values, values*.1, np.zeros(len(values))))
+
+
+def classify_trace(exercise, stations, *, valid=None, window=5, step=5,
+                   confirm_steps=3, length=None):
+    """Inject deterministic SVM decisions while retaining real window/gap handling."""
+    exercise, stations = np.repeat(exercise, step), np.repeat(stations, step)
+    length = len(exercise) if length is None else length
+    valid = np.ones(length, bool) if valid is None else valid[:length]
+    model = {"window_samples": window, "prediction_step": step, "confirm_steps": confirm_steps,
+             "binary": Mock(), "recognition": Mock()}
+    model["binary"].predict.side_effect = lambda rows: exercise[rows[:, 0]]
+    model["recognition"].predict.side_effect = lambda rows: stations[rows[:, 0]]
+
+    def endpoint_features(filtered, ends, window):
+        # Encode endpoints as features so both classifiers replay the same trace.
+        yield ends, ends[:, None], ends[:, None]
+
+    with patch("baseline.RecoFit.pipeline.feature_batches", side_effect=endpoint_features):
+        return classify(model, np.zeros((length, 9)), valid)
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_activation_uses_majority_of_exercise_decisions(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        exercise = [0]*10+[1]*10
+        stations = [other]*10+[squat, squat, other]+[squat]*7
+        labels = classify_trace(exercise, stations)
+        np.testing.assert_array_equal(labels, classify_trace(exercise, [squat]*20))
+        self.assertEqual(labels[64], squat)
+
+    def test_brief_and_alternating_errors_preserve_repetition_buffer(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("plank")
+        stations = [squat]*150
+        stations[20] = other
+        stations[40:80] = [other, squat]*20
+        stations[100:102] = [other]*2
+        labels = classify_trace([1]*150, stations)
+        clean = classify_trace([1]*150, [squat]*150)
+        np.testing.assert_array_equal(labels, clean)
+        x = sine_signal(seconds=30)
+        t, valid = np.arange(len(x))*DT_MS, np.ones(len(x), bool)
+        periods = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        for mode in ("causal", "offline"):
+            with self.subTest(mode=mode):
+                expected = decode(t, x, clean, valid, periods, mode)
+                self.assertGreater(len(expected["repetitions"]), 8)
+                self.assertEqual(decode(t, x, labels, valid, periods, mode), expected)
+
+    def test_vote_ties_keep_committed_station(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        labels = classify_trace([1]*20, [squat, other]*10, confirm_steps=1)
+        self.assertTrue(np.all(labels[4:] == squat))
+
+    def test_new_majority_must_persist_and_tie_interrupts_confirmation(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        stations = [squat]*3+[other]*4+[squat]+[other]*3
+        labels = classify_trace([1]*len(stations), stations)
+        np.testing.assert_array_equal(labels[4::5], [0, 0]+[squat]*8+[other])
+
+    def test_rest_decision_interrupts_station_confirmation_without_voting(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        stations = [squat]*3+[other]*4+[squat]+[other]*3
+        labels = classify_trace([1]*7+[0]+[1]*3, stations)
+        np.testing.assert_array_equal(labels[4::5], [0, 0]+[squat]*8+[other])
+
+    def test_confirmed_rest_clears_vote_for_next_set(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        labels = classify_trace([1]*15+[0]*3+[1]*5, [squat]*18+[other]*5)
+        np.testing.assert_array_equal(labels[4::5], [0]*2+[squat]*15+[0]*3+[other]*3)
+
+    def test_gap_resets_vote_and_requires_fresh_activation(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        valid = np.ones(150, bool)
+        valid[75:80] = False
+        labels = classify_trace([1]*30, [squat]*16+[other]*14, valid=valid)
+        self.assertTrue(np.all(labels[74:94] == 0))
+        self.assertTrue(np.all(labels[94:] == other))
+
+    def test_gap_resets_even_when_window_end_cadence_is_unchanged(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        valid = np.ones(25, bool)
+        valid[3:5] = False
+        labels = classify_trace([1]*5, [squat]+[other]*4, valid=valid, window=2, confirm_steps=2)
+        self.assertTrue(np.all(labels[:11] == 0))
+        self.assertTrue(np.all(labels[11:] == other))
+
+    def test_station_smoothing_never_revises_prefix(self):
+        squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
+        stations = [squat]*3+[other]*4+[squat]+[other]*20
+        exercise = [1]*len(stations)
+        labels = classify_trace(exercise, stations)
+        for length in (3, 14, 18, 38, 51, 58, 91):
+            with self.subTest(length=length):
+                np.testing.assert_array_equal(labels[:length], classify_trace(exercise, stations, length=length))
 
 
 class SignalTests(unittest.TestCase):

@@ -207,10 +207,14 @@ def load_model(path):
 
 
 def classify(model, x, valid):
-    """Trailing-window SVMs + causal saturating binary accumulator.
+    """Trailing-window SVMs + causal binary and station smoothing.
 
     The accumulator's default is 3 decisions (600 ms), rather than the paper's
-    six seconds. Recognition is updated every decision, allowing station changes.
+    six seconds. Exercise-positive decisions vote for one station per active
+    segment, including its activation history. Ties keep the committed station;
+    a new vote leader must persist for confirm_steps exercise decisions before
+    switching. Rest decisions interrupt confirmation without adding station votes.
+    Rest and gaps clear the vote; past predictions are never revised.
     Initial windows after gaps remain NULL until a complete history is available.
     """
     prediction = np.zeros(len(x), np.int64)
@@ -222,19 +226,43 @@ def classify(model, x, valid):
         decisions.extend(model["binary"].predict(seg).tolist())
         stations.extend(model["recognition"].predict(rec).tolist())
     accumulator, active, previous = 0, False, None
+    station_votes = Counter()
+    active_station, pending_station, pending_steps = 0, 0, 0
     run_index, valid_runs = 0, runs(valid)
     for end, exercise, station_id in zip(ends, decisions, stations):
         while valid_runs[run_index][1] <= end:
             run_index += 1
         a, b = valid_runs[run_index]
-        if previous is None or end-previous != step:
+        if previous is None or previous < a or end-previous != step:
             accumulator, active = 0, False
+            station_votes.clear()
+            active_station, pending_station, pending_steps = 0, 0, 0
         accumulator = int(np.clip(accumulator+(1 if exercise else -1), 0, model["confirm_steps"]))
+        if exercise:
+            station_votes[station_id] += 1
         if accumulator == model["confirm_steps"]:
             active = True
         elif accumulator == 0:
             active = False
-        prediction[end:min(end+step, b)] = station_id if active else 0
+            station_votes.clear()
+            active_station, pending_station, pending_steps = 0, 0, 0
+        if active and exercise:
+            # Prefer the committed station on ties, so alternating raw labels
+            # cannot split a set or discard the counter's accumulated history.
+            leader = max(station_votes, key=lambda label: (station_votes[label], label == active_station))
+            if active_station == 0:
+                active_station = leader
+            if leader != active_station:
+                pending_steps = pending_steps+1 if leader == pending_station else 1
+                pending_station = leader
+                if pending_steps >= model["confirm_steps"]:
+                    active_station = leader
+                    pending_station, pending_steps = 0, 0
+            else:
+                pending_station, pending_steps = 0, 0
+        else:
+            pending_station, pending_steps = 0, 0
+        prediction[end:min(end+step, b)] = active_station if active else 0
         previous = end
     return prediction
 
