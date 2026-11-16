@@ -1,8 +1,9 @@
 {
   "verified_date": "2026-11-16",
   "user_clarification": {
-    "architecture_confirmed": "station/NULL classification plus repetition start/end boundaries",
-    "repetition_reference_status": "not currently available; user may provide labeling later"
+    "architecture_confirmed": "station/NULL plus repetition start/end boundaries",
+    "sensor_policy": "wrist signals only, no waist",
+    "label_reliability": "user confirmed all source label.csv files are reliable references"
   },
   "python": "3.12.3",
   "packages": {
@@ -13,17 +14,98 @@
     "matplotlib": "3.11.2"
   },
   "unit_tests": {
-    "passed": 35,
-    "new_temporal_tests": 25,
+    "passed": 43,
+    "new_temporal_tests": 33,
     "existing_alignment_tests": 10,
     "command": "python -m unittest discover -s strength_training -p 'test_*.py' -v"
   },
   "synthetic_end_to_end": {
     "status": "passed",
-    "output": "strength_training/tas_runs/demo",
-    "scope": "prepare, train, tune, test evaluation, sensor-only per-sample inference"
+    "output": "strength_training/tas_runs/demo_wrist",
+    "scope": "wrist prepare from label.csv, train, tune, evaluation, sensor-only prediction"
+  },
+  "single_run_command": {
+    "status": "passed",
+    "output": "strength_training/tas_runs/wrist_command_check",
+    "scope": "default full architecture, one synthetic epoch, validation tuning, test evaluation"
   },
   "real_preparation": {
+    "output": "strength_training/tas_data_wrist",
+    "sessions": 43,
+    "selected_wrists": {
+      "left_wrist": 39,
+      "right_wrist": 4
+    },
+    "split_sizes": {
+      "test": 6,
+      "validation": 6,
+      "train": 31
+    },
+    "eligible_hours": 74.13574444444444,
+    "probe_minutes": 60.65,
+    "reference_repetitions": 21277,
+    "rejected_phase_groups": {
+      "unpaired phase": 12
+    },
+    "reference_convention": "Within each continuous same-exercise bout, pair opposite phases starting from the first observed phase (phase1 or phase2). Same-exercise transitions between phases are inside the repetition; transitions after the second phase are outside it. Repeated same-phase runs separated by transitions are a paused phase. Never pair across rest, another exercise, exclusions, or gaps. Discard unpaired and recording-edge-truncated cycles. Plank is a hold. Boundaries are first-phase start and exclusive second-phase end.",
+    "excluded": [
+      {
+        "session": "20260602_SSCDLRFV",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260603_MGTNMGTNOWZB",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260604_JCLQJCLQ",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_JCLQVGFFNHJI",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_SSCDDQTQHOPK",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260604_WTTANHJIOBWA",
+        "reason": "plan whole-session exclusion"
+      },
+      {
+        "session": "20260605_DQTQVVZPOGPA",
+        "reason": "unresolved log-to-sensor offset"
+      },
+      {
+        "session": "20260617_WTTALRFVDQTQ",
+        "reason": "invalid affected log interval; review needed"
+      }
+    ]
+  },
+  "real_two_head_smoke": {
+    "output": "strength_training/tas_runs/real_wrist_smoke",
+    "history": [
+      {
+        "epoch": 1,
+        "train_loss": 1.4893856048583984,
+        "train_batches": 2,
+        "validation_loss": 0.831682413816452,
+        "validation_batches": 2
+      }
+    ],
+    "purpose": "short execution check, not a fully trained performance baseline"
+  },
+  "not_established": [
+    "full-training held-out wrist repetition performance",
+    "less than one second true reporting delay",
+    "independent video validation of the declared phase-pairing convention"
+  ],
+  "historical_workflow_image": {
+    "path": "figures/workflow-v2.png",
+    "note": "Predates wrist-only and direct label.csv reference update; status text superseded by README"
+  },
+  "previous_waist_preparation": {
     "sessions": 43,
     "split_sizes": {
       "test": 6,
@@ -67,22 +149,5 @@
       }
     ],
     "reference_repetitions": 0
-  },
-  "real_station_smoke": {
-    "training_batches": 2,
-    "validation_batches": 2,
-    "output": "strength_training/tas_runs/real_data_smoke",
-    "evaluation_output": "strength_training/tas_runs/real_data_smoke_evaluation",
-    "purpose": "execution verification only; not a trained performance baseline"
-  },
-  "not_established": [
-    "validated real repetition targets",
-    "real repetition performance",
-    "less than one second true reporting delay"
-  ],
-  "workflow_image": {
-    "method": "built-in imagegen",
-    "final": "figures/workflow-v2.png",
-    "prompt": "figures/workflow.prompt.txt"
   }
 }

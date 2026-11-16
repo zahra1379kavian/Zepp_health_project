@@ -1,9 +1,10 @@
 # Clock-aligned sensor data
 
-For causal MS-TCN station/NULL classification and individual-repetition
-segmentation, see the [implementation and run instructions](temporal_segmentation/README.md).
-That pipeline includes exclusions, subject splits, both prediction heads,
-streaming decoding, evaluation, and a synthetic end-to-end demo.
+For **wrist-only** causal MS-TCN station/NULL classification and individual-repetition
+segmentation, see the [exact run commands](temporal_segmentation/README.md).
+That pipeline now derives repetition targets directly from the matching wrist
+column of the reliable `label.csv` files. Its `run` command prepares the data,
+trains both heads, tunes on validation subjects, and evaluates held-out subjects.
 
 Run from the repository root (Python 3.10+, no additional dependencies):
 

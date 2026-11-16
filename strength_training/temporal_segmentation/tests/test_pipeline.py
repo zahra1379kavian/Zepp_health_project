@@ -9,8 +9,9 @@ import pandas as pd
 import torch
 
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, EXCLUDED_SESSIONS, FEATURES
-from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, log_masks, phase_candidates,
-                                                         prepare, reference_targets, subject_split)
+from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, log_masks,
+                                                         phase_label_targets, prepare, reference_targets,
+                                                         select_wrist, subject_split)
 from strength_training.temporal_segmentation.decode import DecoderConfig, RepDecoder, decode_sequence
 from strength_training.temporal_segmentation.demo import synthetic_source
 from strength_training.temporal_segmentation.metrics import (covered_repetitions, match_repetitions,
@@ -100,11 +101,7 @@ class DataTests(unittest.TestCase):
                 "coverage": [{"start_ms": 0, "end_ms": 1000}],
                 "repetitions": [{"station": "squat", "start_ms": 80, "end_ms": 400}]}
 
-    def test_no_implicit_phase_repetition_supervision(self):
-        raw = np.array(["squat_phase1", "squat_phase2", "rest"])
-        candidates = phase_candidates(np.arange(3) * 40, raw)
-        self.assertEqual(len(candidates), 1)
-        self.assertFalse(candidates[0]["validated"])
+    def test_missing_external_reference_entry_is_not_negative_supervision(self):
         b, m, r, _ = reference_targets(np.arange(3)*40, np.ones(3, bool), None, "waist")
         self.assertFalse(m.any())
         self.assertEqual(b.sum(), 0)
@@ -174,6 +171,105 @@ class DataTests(unittest.TestCase):
             t2, x2 = load_sensor(p)
             np.testing.assert_array_equal(x, x2)
             np.testing.assert_array_equal(t, t2)
+
+    def test_wrist_selection_ignores_waist_and_prefers_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "S1_waist.csv").touch()
+            self.assertEqual(select_wrist(root), (None, None))
+            (root / "right_wrist.csv").touch()
+            self.assertEqual(select_wrist(root)[0], "right_wrist")
+            (root / "left_wrist.csv").touch()
+            self.assertEqual(select_wrist(root)[0], "left_wrist")
+            with self.assertRaisesRegex(ValueError, "wrist signals only"):
+                select_wrist(root, "waist")
+            with self.assertRaisesRegex(ValueError, "waist file"):
+                load_sensor(root / "S1_waist.csv")
+
+    def test_label_targets_match_synthetic_full_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, references = synthetic_source(root / "source", subjects=3)
+            # A right-only session must use right-wrist labels, never waist labels.
+            first = root / "source" / "20260101_DEMO000"
+            (first / "left_wrist.csv").rename(first / "right_wrist.csv")
+            labels = pd.read_csv(first / "label.csv").rename(columns={"left_wrist": "right_wrist"})
+            labels["waist"] = "rest"
+            labels.to_csv(first / "label.csv", index=False)
+            (first / "S1_waist.csv").write_text("invalid waist stream must never be read")
+            manifest = prepare(root / "source", root / "prepared", alignment)
+            expected = json.loads(references.read_text())["sessions"]
+            for session in manifest["sessions"]:
+                a = load_arrays(root / "prepared" / session["session"])
+                reps = json.loads((root / "prepared" / session["session"] / "references.json").read_text())
+                got = [{k: r[k] for k in ("station", "start_ms", "end_ms")} for r in reps]
+                self.assertEqual(got, expected[session["session"]]["repetitions"])
+                self.assertEqual(a["boundary"].sum(), 8)
+                self.assertTrue(session["sensor"].endswith("wrist.csv"))
+            self.assertEqual(manifest["sessions"][0]["label_column"], "right_wrist")
+
+
+class PhaseReferenceTests(unittest.TestCase):
+    def targets(self, labels, invalid=None):
+        raw = np.array(labels)
+        valid = np.ones(len(raw), bool)
+        if invalid is not None:
+            valid[invalid] = False
+        return phase_label_targets(np.arange(len(raw))*40, raw, valid)
+
+    def test_internal_transition_is_inside_rep_trailing_transition_outside(self):
+        b, coverage, reps, rejected = self.targets([
+            "rest", "squat_phase1", "squat_transition", "squat_phase2",
+            "squat_transition", "rest"])
+        self.assertEqual([(r["start_ms"], r["end_ms"]) for r in reps], [(40, 160)])
+        self.assertEqual(b[1, 0], 1)
+        self.assertEqual(b[4, 1], 1)
+        self.assertTrue(coverage.all())
+        self.assertEqual(rejected, [])
+
+    def test_opposite_order_and_paused_same_phase(self):
+        _, _, reps, rejected = self.targets([
+            "rest", "squat_phase2", "squat_transition", "squat_phase2",
+            "squat_phase1", "rest"])
+        self.assertEqual(len(reps), 1)
+        self.assertEqual(reps[0]["phase_order"], "phase2-phase1")
+        self.assertEqual((reps[0]["start_ms"], reps[0]["end_ms"]), (40, 200))
+        self.assertEqual(rejected, [])
+
+    def test_no_pair_across_rest_or_another_station(self):
+        b, coverage, reps, rejected = self.targets([
+            "rest", "squat_phase1", "rest", "squat_phase2", "push-up_phase1", "rest"])
+        self.assertEqual(reps, [])
+        self.assertEqual(len(rejected), 3)
+        self.assertFalse(b.any())
+        self.assertFalse(coverage[[1, 3, 4]].any())
+        self.assertTrue(coverage[[0, 2, 5]].all())
+
+    def test_gap_drops_cycle_without_corrupting_following_one(self):
+        b, coverage, reps, rejected = self.targets([
+            "rest", "squat_phase1", "squat_transition", "squat_phase2",
+            "squat_phase1", "squat_phase2", "rest"], invalid=2)
+        self.assertEqual(len(reps), 1)
+        self.assertEqual((reps[0]["start_ms"], reps[0]["end_ms"]), (160, 240))
+        self.assertFalse(coverage[1:4].any())
+        self.assertEqual(b.sum(), 2)
+
+    def test_known_end_tick_survives_unpaired_following_phase(self):
+        b, coverage, reps, rejected = self.targets([
+            "rest", "squat_phase1", "squat_phase2", "squat_phase1", "squat_phase1", "rest"])
+        self.assertEqual(len(reps), 1)
+        self.assertTrue(coverage[3])
+        self.assertEqual(b[3, 1], 1)
+        self.assertFalse(coverage[4])
+
+    def test_recording_edges_and_plank_do_not_invent_repetitions(self):
+        b, coverage, reps, rejected = self.targets([
+            "squat_phase1", "squat_phase2", "rest", "plank", "rest",
+            "squat_phase1", "squat_phase2"])
+        self.assertEqual(reps, [])
+        self.assertEqual(len(rejected), 2)
+        self.assertFalse(b.any())
+        self.assertTrue(coverage[2:5].all())
 
 
 class DecoderTests(unittest.TestCase):

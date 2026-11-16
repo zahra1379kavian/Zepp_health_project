@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .constants import CLASSES, DT_MS, FEATURES
-from .data import load_arrays, load_sensor, runs, write_json
+from .data import WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json
 from .decode import DecoderConfig, RepDecoder, decode_sequence, group_sets
 from .metrics import (aggregate_repetitions, classification_metrics, confusion_matrix,
                       count_rows, covered_repetitions, false_exercise_events, repetition_metrics)
@@ -70,16 +70,18 @@ class Windows(Dataset):
 def train(args):
     root, out = Path(args.data), Path(args.output)
     manifest = json.loads((root / "manifest.json").read_text())
+    if manifest["location"] not in WRIST_LOCATIONS:
+        raise ValueError("Prepare a wrist-only dataset; waist datasets are not supported")
     if out.exists():
         raise FileExistsError(f"Refusing to overwrite {out}")
     if args.epochs < 1 or args.batch_size < 1 or args.max_steps < 0:
         raise ValueError("epochs/batch-size must be positive; max-steps must be nonnegative")
     if not args.station_only:
         if min(manifest["train_boundary_positives"]) == 0:
-            raise ValueError("No validated training repetitions. Supply references at prepare, or use --station-only.")
+            raise ValueError("No training repetitions. Prepare with --reference-mode labels or supply references.")
         val_names = manifest["split"]["validation"]
         if not sum(s["reference_repetitions"] for s in manifest["sessions"] if s["session"] in val_names):
-            raise ValueError("No validated validation repetitions; cannot select a repetition model")
+            raise ValueError("No validation repetitions; cannot select a repetition model")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -124,6 +126,9 @@ def train(args):
                     loss_sum += float(loss.detach()) * n
                     frames += n
                     batches += 1
+                    if batches % 100 == 0:
+                        print(f"Epoch {epoch}/{args.epochs} {split}: batch {batches}/{len(loader)}; "
+                              f"mean loss {loss_sum / max(frames, 1):.4f}", flush=True)
                     if args.max_steps and batches >= args.max_steps:
                         break
             record[f"{split}_loss"] = loss_sum / max(frames, 1)
@@ -135,6 +140,8 @@ def train(args):
             checkpoint = {"version": 1, "model": model.state_dict(), "config": configuration(model),
                           "normalization": manifest["normalization"], "classes": CLASSES, "features": FEATURES,
                           "location": manifest["location"], "station_only": args.station_only,
+                          "reference_mode": manifest.get("reference_mode"),
+                          "reference_convention": manifest.get("reference_convention"),
                           "data_manifest_sha256": digest(root / "manifest.json"), "split": manifest["split"],
                           "epoch": epoch, "validation_loss": best, "seed": args.seed,
                           "partial_epoch_max_steps": args.max_steps}
@@ -149,6 +156,8 @@ def train(args):
 
 def load_checkpoint(path, device="cpu", data=None):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if checkpoint["location"] not in WRIST_LOCATIONS:
+        raise ValueError("This method now uses wrist signals only; retrain the old waist checkpoint")
     if checkpoint["classes"] != CLASSES or checkpoint["features"] != FEATURES:
         raise ValueError("Checkpoint vocabulary/features are incompatible")
     if data is not None and digest(Path(data) / "manifest.json") != checkpoint["data_manifest_sha256"]:
@@ -228,6 +237,9 @@ def evaluate(args):
     hours = sum(r["rest_hours"] for r in sessions)
     events = sum(r["false_exercise_events"] for r in sessions)
     report = {"split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
+              "reference_mode": manifest.get("reference_mode"),
+              "reference_convention": manifest.get("reference_convention"),
+              "sensor_policy": manifest.get("wrist_selection"),
               "classification": classification_metrics(pooled_cm),
               "false_exercise_events": events, "rest_hours": hours,
               "false_exercise_events_per_rest_hour": events / hours if hours else None,
@@ -296,6 +308,10 @@ def predict(args):
     if not 1 <= args.chunk <= 20:
         raise ValueError("Online chunk size must be 1..20 samples (at most 760 ms buffering)")
     model, ckpt = load_checkpoint(args.checkpoint, args.device)
+    input_side = Path(args.input).stem
+    if (ckpt["location"] in ("left_wrist", "right_wrist") and
+            input_side in ("left_wrist", "right_wrist") and input_side != ckpt["location"]):
+        raise ValueError("Input wrist side differs from the checkpoint's training location")
     config, _, selection = decoder_config(args.decoder, args.checkpoint)
     t, x = load_sensor(args.input)
     norm = ckpt["normalization"]
@@ -350,3 +366,35 @@ def predict(args):
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
     write_json(out / "predictions.json", summary)
     return summary
+
+
+def run_pipeline(args):
+    """One command for the real wrist experiment; no station-only fallback."""
+    from .__main__ import main
+    out = Path(args.output)
+    if out.exists():
+        raise FileExistsError(f"Refusing to overwrite {out}; choose another --output")
+    if args.epochs < 1 or args.batch_size < 1 or args.tolerance_ms <= 0:
+        raise ValueError("epochs, batch-size and tolerance-ms must be positive")
+    root = Path(args.data) if args.data else out / "data"
+    if args.data:
+        manifest = json.loads((root / "manifest.json").read_text())
+        if manifest.get("version", 0) < 2 or manifest["location"] != args.location:
+            raise ValueError("--data must be a current wrist dataset matching --location")
+        if manifest.get("reference_mode") != "labels":
+            raise ValueError("The run command expects references derived from label.csv")
+    else:
+        main(["prepare", "--source", str(args.source), "--alignment", str(args.alignment),
+              "--location", args.location, "--reference-mode", "labels",
+              "--seed", str(args.seed), "--output", str(root)])
+    common = ["--device", args.device, "--threads", str(args.threads)]
+    main(["train", "--data", str(root), "--output", str(out / "model"),
+          "--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
+          "--seed", str(args.seed), *common])
+    checkpoint = str(out / "model" / "best.pt")
+    main(["tune", "--data", str(root), "--checkpoint", checkpoint,
+          "--tolerance-ms", str(args.tolerance_ms), "--output", str(out / "decoder.json"), *common])
+    main(["evaluate", "--data", str(root), "--checkpoint", checkpoint,
+          "--decoder", str(out / "decoder.json"), "--split", "test",
+          "--output", str(out / "test"), *common])
+    print(f"Wrist experiment complete. Report: {out / 'test' / 'report.json'}", flush=True)

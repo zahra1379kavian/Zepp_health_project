@@ -11,8 +11,10 @@ def main(argv=None):
     prepare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     prepare.add_argument("--output", type=Path, required=True)
     prepare.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
-    prepare.add_argument("--location", choices=["waist", "left_wrist", "right_wrist"], default="waist")
+    prepare.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
     prepare.add_argument("--references", type=Path)
+    prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels",
+                         help="Default: derive full cycles from trusted label.csv wrist phases")
     prepare.add_argument("--seed", type=int, default=42)
 
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
@@ -48,7 +50,17 @@ def main(argv=None):
     predict.add_argument("--chunk", type=int, default=1, help="1..20 samples; default is one sample (40 ms)")
     demo = sub.add_parser("demo", help="Run the whole pipeline with generated, validated synthetic boundaries")
     demo.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/demo"))
-    for command in (train, sub.choices["evaluate"], sub.choices["tune"], predict, demo):
+    run = sub.add_parser("run", help="Wrist-only prepare → train both heads → tune → held-out evaluation")
+    run.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/wrist_full"))
+    run.add_argument("--data", type=Path, help="Reuse a prepared wrist dataset instead of preparing it again")
+    run.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
+    run.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
+    run.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
+    run.add_argument("--epochs", type=int, default=30)
+    run.add_argument("--batch-size", type=int, default=8)
+    run.add_argument("--seed", type=int, default=42)
+    run.add_argument("--tolerance-ms", type=int, default=400)
+    for command in (train, sub.choices["evaluate"], sub.choices["tune"], predict, demo, run):
         command.add_argument("--device", default="cpu")
         command.add_argument("--threads", type=int, default=2)
     args = parser.parse_args(argv)
@@ -57,11 +69,15 @@ def main(argv=None):
         torch.set_num_threads(args.threads)
     if args.command == "prepare":
         from .data import prepare as prepare_dataset
-        result = prepare_dataset(args.source, args.output, args.alignment, args.location, args.references, args.seed)
+        result = prepare_dataset(args.source, args.output, args.alignment, args.location,
+                                 args.references, args.seed, args.reference_mode)
         print(f"Saved {len(result['sessions'])} eligible sessions; excluded {len(result['excluded'])}: {args.output}")
     elif args.command == "demo":
         from .demo import run_demo
         run_demo(args.output, args.device)
+    elif args.command == "run":
+        from .runner import run_pipeline
+        run_pipeline(args)
     else:
         from . import runner
         result = getattr(runner, args.command)(args)
