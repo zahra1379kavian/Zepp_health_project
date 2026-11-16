@@ -101,10 +101,6 @@
     "less than one second true reporting delay",
     "independent video validation of the declared phase-pairing convention"
   ],
-  "historical_workflow_image": {
-    "path": "figures/workflow-v2.png",
-    "note": "Predates wrist-only and direct label.csv reference update; status text superseded by README"
-  },
   "previous_waist_preparation": {
     "sessions": 43,
     "split_sizes": {

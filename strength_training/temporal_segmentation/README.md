@@ -345,6 +345,4 @@ python -m strength_training.temporal_segmentation demo \
 | `verification.json` | Recorded execution checks and package versions |
 
 Previous waist datasets/checkpoints are historical artifacts and cannot be used
-with this wrist-only method. The earlier `figures/workflow-v2.png` also depicts
-an older status before automatic label conversion; its pending-reference note
-and test count are superseded by this document.
+with this wrist-only method.

@@ -1,26 +1,14 @@
 Use case: infographic-diagram
 Asset type: project method implementation workflow, landscape scientific infographic.
-Primary request: Show completed software steps and remaining research work for causal temporal action segmentation and repetition counting from wearable sensors.
-Style: crisp, readable research-poster typography on an off-white background; teal completed steps, amber pending items; clear arrows, restrained sensor and timeline illustrations. Wide landscape composition. All text must be legible and spelled correctly.
-Title: "Causal MS-TCN: station + repetition segmentation"
-Subtitle: "Implementation complete • Real repetition validation pending"
-Top pipeline, with six connected cards carrying green check marks:
+Primary request: Show the six connected software steps for causal temporal action segmentation and repetition counting from wearable sensors.
+Style: crisp, readable Times New Roman typography on an off-white background; teal workflow cards; clear arrows and restrained sensor illustrations. Compact wide composition, tightly cropped around the six cards with a small outer margin. All text must be legible and spelled correctly.
+Canvas: 2172 x 379 pixels. Keep approximately 12 pixels of whitespace above and below the cards; do not add large vertical margins. Preserve card contents and proportions when cropping.
+No title, subtitle, or banner. Show only the pipeline, with six connected cards carrying green check marks:
 1. "Load + align" / "25 Hz • sync_timestamp • 9 sensor channels"
 2. "Mask + split" / "Exclusions • sensor gaps • subject split"
 3. "Causal MS-TCN" / "Past + current samples only"
 4. "Two dense heads" with two branches: "15 stations + NULL" and "Rep start + end"
 5. "Online decoder" / "Pair boundaries • label reps • count" / "Plank = duration"
 6. "Evaluate" / "F1 • count MAE • start/end errors"
-Below the pipeline, a simple illustrative timeline showing a gray NULL interval, teal squat repetition 1, teal squat repetition 2, gray NULL, with separate start and end tick markers. Caption: "Illustrative predictions — not measured results".
-Bottom left teal status box: "VERIFIED IN CODE" / "35 tests passed" / "Synthetic end-to-end run passed" / "Real-data preparation: 43 sessions" / "31 train • 6 validation • 6 test"
-Bottom right amber status box: "STILL REQUIRED" / "Validate full-repetition references" / "Train + evaluate the real repetition model" / "Measure accuracy and <1 s reporting delay"
-Footer: "MS-TCN-inspired causal adaptation • WEAR motivates continuous inertial localization"
+End the figure after the six workflow cards. No separate prediction timeline, horizontal timeline bar, boundary axis, ticks, labels, captions, status boxes, footer text, or decorative footer lines. Retain diagrams and labels inside the six cards, including the repetition bar inside the Online decoder card.
 Constraints: Do not imply validated real-world performance. Do not imply true station IDs are model inputs. NULL means category-relative rest. No set-boundary-only output. No logos or watermark.
-
-Final built-in imagegen edit (workflow-v2.png): Preserve the complete image except
-two corrections. Replace the bottom imperative sentence with exactly:
-"No true station IDs required • NULL = category-relative rest".
-Align start_1 to the left edge of repetition 1, put end_1 / start_2 at the shared
-boundary between adjacent repetitions, and align end_2 to the right edge of
-repetition 2. There must be three timeline ticks total. Keep all status counts,
-the pending-validation message, and the illustrative-not-measured caption.
