@@ -6,11 +6,11 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from baseline.counter import bandpass, count_peaks, decode
-from baseline.features import extract, pc1, window_ends
-from baseline.pipeline import (check_split, evaluate, fit, fit_period_bounds,
+from baseline.ReoFit.counter import bandpass, count_peaks, decode
+from baseline.ReoFit.features import extract, pc1, window_ends
+from baseline.ReoFit.pipeline import (check_split, evaluate, fit, fit_period_bounds,
                                infer, load_model, predict)
-from baseline.demo import synthetic_source
+from baseline.ReoFit.demo import synthetic_source
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
 from strength_training.temporal_segmentation.data import prepare, subject_folds
 
