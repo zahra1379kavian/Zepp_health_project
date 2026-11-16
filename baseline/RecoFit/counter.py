@@ -5,6 +5,7 @@ choices because the paper does not specify them. Reference-calibrated interval
 conversion is an additional adaptation, not a result claimed by RecoFit.
 """
 
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -132,6 +133,8 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
     by the local period and rounded to 40 ms. Offsets are for this sensor wrist,
     indexed by station and the PCA axis used to choose polarity. Uncalibrated
     peaks remain count-only diagnostics; they do not acquire invented boundaries.
+    Their per-station counts reject repeated sightings with the causal spacing
+    rule, independently of calibrated events, and include no interval validation.
     Emit only when that full interval has been observed. No artificial EOF cycle.
     """
     from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
@@ -140,6 +143,7 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
     t, labels, valid = np.asarray(t), np.asarray(labels), np.asarray(valid, bool)
     filtered = bandpass(acceleration, valid)
     repetitions, holds, peaks, uncalibrated = [], [], [], set()
+    uncalibrated_counts = Counter()
     boundary_offsets = boundary_offsets or {}
     boundaries = np.r_[0, np.flatnonzero((labels[1:] != labels[:-1]) |
                                         (valid[1:] != valid[:-1]))+1, len(t)]
@@ -158,6 +162,7 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
             continue
         minimum, maximum = period_bounds[name]["min_s"], period_bounds[name]["max_s"]
         last_peak, last_period = -np.inf, 0
+        last_uncalibrated_peak, last_uncalibrated_period = -np.inf, 0
         for tick, left, candidates in peak_windows(filtered, a, b, minimum, maximum, mode, step, config):
             for row in candidates:
                 peak, period = left+row["index"], row["period_samples"]
@@ -169,6 +174,11 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
                 offsets = boundary_offsets.get(name, {}).get(str(row["axis"]))
                 if offsets is None:
                     uncalibrated.add(name)
+                    if (mode == "causal" and peak-last_uncalibrated_peak <
+                            config.spacing_fraction*max(2, min(period, last_uncalibrated_period))):
+                        continue
+                    uncalibrated_counts[name] += 1
+                    last_uncalibrated_peak, last_uncalibrated_period = peak, period
                     continue
                 start = peak+int(round(period*offsets["start_periods"]))
                 end = peak+int(round(period*offsets["end_periods"]))
@@ -184,9 +194,9 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
                                     "reported_at_ms": report, "boundary_method": "training_calibrated_peak_offsets"})
                 last_peak, last_period = peak, period
     repetitions.sort(key=lambda r: (r["reported_at_ms"], r["start_ms"]))
-    from collections import Counter
     return {"repetitions": repetitions, "holds": holds,
             "counts_by_station": dict(Counter(r["station"] for r in repetitions)),
             "offline_peaks": peaks,
             "uncalibrated_stations": sorted(uncalibrated),
+            "uncalibrated_peak_counts_by_station": dict(sorted(uncalibrated_counts.items())),
             "offline_peak_counts_by_station": dict(Counter(r["station"] for r in peaks))}

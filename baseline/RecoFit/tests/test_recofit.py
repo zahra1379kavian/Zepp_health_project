@@ -1,3 +1,4 @@
+from collections import Counter
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +10,7 @@ import pandas as pd
 
 from baseline.RecoFit.counter import CounterConfig, bandpass, count_peaks, decode
 from baseline.RecoFit.features import extract, filtered_inputs, pc1, window_ends
-from baseline.RecoFit.pipeline import (check_split, classify, evaluate, fit, fit_period_bounds,
+from baseline.RecoFit.pipeline import (check_split, classify, cross_validate, evaluate, fit, fit_period_bounds,
                                       fit_boundary_offsets, infer, load_model, predict)
 from baseline.RecoFit.demo import synthetic_source
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
@@ -324,6 +325,22 @@ class SignalTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["offline_peaks"]), len(result["repetitions"]))
         self.assertTrue(all(r["reported_at_ms"] == (len(x)-1)*40 for r in result["repetitions"]))
 
+    def test_uncalibrated_peak_counts_do_not_repeat_overlapping_window_sightings(self):
+        x = sine_signal(seconds=60)
+        t, valid = np.arange(len(x))*DT_MS, np.ones(len(x), bool)
+        labels = np.full(len(x), CLASSES.index("squat"))
+        bounds = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        config = CounterConfig(buffer_seconds=4.)
+        for mode, step in (("offline", 5), ("causal", 1), ("causal", 5), ("causal", 7)):
+            with self.subTest(mode=mode, step=step):
+                result = decode(t, x, labels, valid, bounds, mode, step, config)
+                self.assertEqual(result["uncalibrated_peak_counts_by_station"], {"squat": 30})
+                self.assertEqual(result["uncalibrated_stations"], ["squat"])
+                self.assertEqual(result["repetitions"], [])
+        calibrated = decode(t, x, labels, valid, bounds, config=config, boundary_offsets=SINE_OFFSETS)
+        self.assertEqual(calibrated["uncalibrated_peak_counts_by_station"], {})
+        self.assertEqual(calibrated["uncalibrated_stations"], [])
+
 
 class CalibrationTests(unittest.TestCase):
     def setUp(self):
@@ -484,11 +501,15 @@ class CalibrationTests(unittest.TestCase):
         t, valid = np.arange(len(x))*DT_MS, np.ones(len(x), bool)
         labels = np.full(len(x), CLASSES.index("squat"))
         bounds = {"squat": {"min_s": 1.5, "max_s": 2.5}}
-        for offsets in ({}, {"squat": {"1": SINE_OFFSETS["squat"]["0"]}}):
-            result = decode(t, x, labels, valid, bounds, "offline", boundary_offsets=offsets)
-            self.assertGreater(len(result["offline_peaks"]), 8)
-            self.assertEqual(result["repetitions"], [])
-            self.assertEqual(result["uncalibrated_stations"], ["squat"])
+        for mode in ("causal", "offline"):
+            for offsets in ({}, {"squat": {"1": SINE_OFFSETS["squat"]["0"]}}):
+                with self.subTest(mode=mode, offsets=offsets):
+                    result = decode(t, x, labels, valid, bounds, mode, boundary_offsets=offsets)
+                    self.assertEqual(result["repetitions"], [])
+                    self.assertEqual(result["uncalibrated_stations"], ["squat"])
+                    self.assertEqual(result["uncalibrated_peak_counts_by_station"], {"squat": 12})
+                    if mode == "offline":
+                        self.assertEqual(len(result["offline_peaks"]), 12)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -589,6 +610,58 @@ class IntegrationTests(unittest.TestCase):
         report, _ = evaluate(self.root/"data", self.path, self.root/"offline_test", mode="offline")
         self.assertEqual(report["offline_peak_counts"]["status"], "scored")
         self.assertEqual(len(report["offline_peak_counts"]["count_rows"]), 28)
+
+    def test_uncalibrated_counts_reach_reports_even_without_reference_coverage(self):
+        names = self.model["split"]["test"]
+        labels = [np.load(self.root/"data"/name/"y.npy") for name in names]
+        coverage_path = self.root/"data"/names[0]/"coverage.npy"
+        coverage = np.load(coverage_path)
+        np.save(coverage_path, np.zeros_like(coverage))
+        try:
+            for mode in ("causal", "offline"):
+                output = self.root/f"uncalibrated_{mode}"
+                # Exercise reporting with known stations and no fitted offsets.
+                with self.subTest(mode=mode), patch("baseline.RecoFit.pipeline.classify", side_effect=labels):
+                    report, records = evaluate(self.root/"data", self.path, output, mode=mode,
+                                               model={**self.model, "boundary_offsets": {}})
+                    counts = Counter()
+                    for record in records:
+                        self.assertEqual(record["uncalibrated_stations"], ["push-up", "squat"])
+                        self.assertTrue(all(n > 0 for n in record["uncalibrated_peak_counts_by_station"].values()))
+                        counts.update(record["uncalibrated_peak_counts_by_station"])
+                    self.assertEqual(report["uncalibrated_stations"], ["push-up", "squat"])
+                    self.assertEqual(report["uncalibrated_peak_counts_by_station"], dict(counts))
+                    self.assertEqual(report["uncalibrated_streams_by_station"], {"push-up": 2, "squat": 2})
+                    affected = report["uncalibrated_streams"]
+                    self.assertEqual({r["side"] for r in affected}, {"left_wrist", "right_wrist"})
+                    self.assertEqual({r["session"] for r in affected}, set(names))
+                    saved = json.loads((output/"report.json").read_text())
+                    for key in ("uncalibrated_peak_counts_by_station", "uncalibrated_streams"):
+                        self.assertEqual(saved[key], report[key])
+                    self.assertEqual(records[0]["repetition_scores"], {})
+        finally:
+            np.save(coverage_path, coverage)
+
+    def test_cross_validation_pools_uncalibrated_counts_and_affected_streams(self):
+        labels = np.load(self.root/"data"/self.model["split"]["test"][0]/"y.npy")
+        output = self.root/"uncalibrated_cv"
+        # All synthetic sessions share station timing; force missing calibration.
+        with patch("baseline.RecoFit.pipeline.classify", return_value=labels), patch(
+                "baseline.RecoFit.pipeline.fit_boundary_offsets", return_value={}):
+            report = cross_validate(self.root/"data", output, folds=3, window_seconds=1.,
+                                    train_step_ms=200, max_windows_per_class=32, c_values=(.1,))
+        counts = Counter()
+        for fold in range(1, 4):
+            saved = json.loads((output/f"fold_{fold}"/"test"/"report.json").read_text())
+            counts.update(saved["uncalibrated_peak_counts_by_station"])
+        self.assertEqual(report["uncalibrated_peak_counts_by_station"], dict(counts))
+        self.assertTrue(all(n > 0 for n in counts.values()))
+        self.assertEqual(report["uncalibrated_streams_by_station"], {"push-up": 12, "squat": 12})
+        affected = report["uncalibrated_streams"]
+        self.assertEqual(len({r["session"] for r in affected}), 12)
+        self.assertEqual({r["side"] for r in affected}, {"left_wrist", "right_wrist"})
+        saved = json.loads((output/"report.json").read_text())
+        self.assertEqual(saved["uncalibrated_streams"], affected)
 
 
 if __name__ == "__main__":

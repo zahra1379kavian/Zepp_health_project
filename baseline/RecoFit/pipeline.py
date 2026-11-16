@@ -206,6 +206,25 @@ def peak_count_summary(records):
             "note": "Offline peak counts use certified peak timestamps; they do not evaluate repetition start/end boundaries."}
 
 
+def uncalibrated_summary(records):
+    """Expose missing-calibration losses independently of reference coverage."""
+    counts, streams = Counter(), Counter()
+    affected = []
+    for record in records:
+        stations = record.get("uncalibrated_stations", [])
+        counts.update(record.get("uncalibrated_peak_counts_by_station", {}))
+        streams.update(stations)
+        if stations:
+            affected.append({key: record[key] for key in (
+                "session", "source_session", "subject", "side", "uncalibrated_stations",
+                "uncalibrated_peak_counts_by_station")})
+    return {"uncalibrated_stations": sorted(streams),
+            "uncalibrated_peak_counts_by_station": dict(sorted(counts.items())),
+            "uncalibrated_streams_by_station": dict(sorted(streams.items())),
+            "uncalibrated_streams": affected,
+            "uncalibrated_peak_note": "Detected peaks lacking wrist/station/axis offsets, across all valid predicted exercise samples regardless of reference coverage. Causal counts reject repeated sightings using the peak spacing rule. These are peak diagnostics, not complete repetitions or additional scored misses."}
+
+
 def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         prediction_step_ms=200, max_windows_per_class=3000, c_values=(.1, 1., 10.),
         seed=42, confirm_steps=3, counter_config=CounterConfig()):
@@ -388,6 +407,8 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
         labels, result = infer(model, arrays["t"], arrays["x"], arrays["valid"], mode, side=info["side"])
         record = {"session": name, "source_session": info["source_session"],
                   "subject": info["subject"], "side": info["side"],
+                  "uncalibrated_stations": result["uncalibrated_stations"],
+                  "uncalibrated_peak_counts_by_station": result["uncalibrated_peak_counts_by_station"],
                   "confusion_matrix": confusion_matrix(arrays["y"], labels, arrays["valid"]).tolist(),
                   "repetition_scores": {}, **false_exercise_events(arrays["y"], labels, arrays["valid"])}
         references = json.loads((root/name/"references.json").read_text())
@@ -405,6 +426,7 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
         records.append(record)
         print(f"Evaluated {name}: {len(result['repetitions'])} complete interval estimates", flush=True)
     report = {**grouped_stream_report(records, tolerances, tolerance_ms),
+              **uncalibrated_summary(records),
               "method": "RecoFit-style adapted to wrist IMUs at 25 Hz", "mode": mode,
               "split": split_name, "report_scope": "single_split_diagnostic",
               "timing_tolerance_ms": tolerance_ms, "report_tolerances_ms": tolerances,
@@ -466,6 +488,7 @@ def cross_validate(root, output, *, folds=5, seed=42, mode="causal", tolerance_m
     tolerances = reporting_tolerances(report_tolerances_ms, tolerance_ms)
     scores = [s["segmentation_f1"] for s in summaries if s["segmentation_f1"] is not None]
     pooled = {**grouped_stream_report(all_records, tolerances, tolerance_ms),
+              **uncalibrated_summary(all_records),
               "offline_peak_counts": peak_count_summary(all_records),
               "report_scope": "subject_wise_cross_validation", "folds": summaries,
               "fold_segmentation_f1_mean": float(np.mean(scores)) if scores else None,

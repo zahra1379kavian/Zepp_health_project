@@ -154,7 +154,15 @@ Explicit adaptations and assumptions:
    calibration counts are saved in `training.json` and the model. Refit existing
    models to replace offsets learned with the previous full-buffer schedule.
    A missing calibration has no symmetric-period fallback: its peaks have no estimated
-   interval, and the station appears in `uncalibrated_stations`. These learned
+   interval. Both counting modes expose `uncalibrated_stations` and
+   `uncalibrated_peak_counts_by_station` in stream results and `report.json`.
+   Reports also include `uncalibrated_streams_by_station` and `uncalibrated_streams`
+   with each affected stream's station counts and wrist/subject metadata, including
+   in pooled cross-validation reports. Causal counts apply peak spacing rejection
+   so overlapping windows do not repeatedly count a peak. These diagnostics cover
+   all valid predicted exercise samples, including samples without reference
+   coverage; they count detected peaks, not verified complete intervals or extra
+   scored misses. These learned
    offsets correct systematic phase shifts, but cannot track every change in
    wrist orientation, cadence or pause duration. Timing still needs held-out
    measurement; these are not the temporal model's phase-boundary predictions.
