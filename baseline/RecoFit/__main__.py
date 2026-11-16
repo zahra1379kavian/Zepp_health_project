@@ -5,13 +5,14 @@ from pathlib import Path
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="RecoFit-style wrist baseline at 25 Hz")
+    parser = argparse.ArgumentParser(prog="python -m baseline.RecoFit",
+                                     description="RecoFit-style wrist baseline at 25 Hz")
     sub = parser.add_subparsers(dest="command", required=True)
     prepare = sub.add_parser("prepare", help="Reuse exact-clock preparation, exclusions and wrist references")
     prepare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     prepare.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
     prepare.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
-    prepare.add_argument("--output", type=Path, default=Path("baseline/data"))
+    prepare.add_argument("--output", type=Path, default=Path("baseline/RecoFit/data"))
     prepare.add_argument("--seed", type=int, default=42)
     prepare.add_argument("--references", type=Path)
     prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels")
@@ -51,7 +52,7 @@ def main(argv=None):
         p.add_argument("--mode", choices=["causal", "offline"], default="causal",
                        help="causal: immutable prefix-only interval events; offline: batch counter diagnostic")
     demo = sub.add_parser("demo", help="Small synthetic integration check; not a real-data benchmark")
-    demo.add_argument("--output", type=Path, default=Path("baseline/runs/demo"))
+    demo.add_argument("--output", type=Path, default=Path("baseline/RecoFit/runs/demo"))
     args = parser.parse_args(argv)
     if args.command == "prepare":
         from strength_training.temporal_segmentation.data import prepare as prepare_data

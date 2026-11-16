@@ -6,7 +6,7 @@ https://dmorris.net/publications/Morris_Workout_CHI_2014.pdf), with a two-stage
 exercise/rest and exercise-type SVM pipeline adapted to this project's **25 Hz
 wrist data**. It needs no station ID or session exercise list at inference.
 
-The implementation lives under `baseline/`. It reuses the project's data
+The implementation lives under `baseline/RecoFit/`. It reuses the project's data
 preparation and metrics modules, which require NumPy, pandas and SciPy, but
 **does not import or require PyTorch**. Source recordings are preserved.
 
@@ -15,17 +15,17 @@ preparation and metrics modules, which require NumPy, pandas and SciPy, but
 From the repository root:
 
 ```bash
-python3 -m venv baseline/.venv
-source baseline/.venv/bin/activate
+python3 -m venv baseline/RecoFit/.venv
+source baseline/RecoFit/.venv/bin/activate
 python -m pip install -r baseline/requirements.txt
 
-python -m baseline run \
+python -m baseline.RecoFit run \
   --data strength_training/tas_data_both_wrists \
-  --output baseline/runs/recofit_cv \
+  --output baseline/RecoFit/runs/recofit_cv \
   --folds 5
 ```
 
-The main report is `baseline/runs/recofit_cv/cross_validation/report.json`.
+The main report is `baseline/RecoFit/runs/recofit_cv/cross_validation/report.json`.
 Each `fold_*/model/` contains `model.joblib` and `training.json`; each
 `fold_*/test/` contains predictions, metrics and a fold report. Every subject
 is tested once. Both wrists from the same subject stay together in training,
@@ -39,16 +39,20 @@ output root. The commands run on CPU. Default fitting caps each endpoint class
 and each pure recognition class at 3,000 sampled windows; evaluation uses every
 eligible timestamp, without subsampling the held-out recordings.
 
+`prepare` defaults to `baseline/RecoFit/data`; `demo` defaults to
+`baseline/RecoFit/runs/demo`. Generated data, run outputs, models, and the local
+virtual environment under `baseline/RecoFit/` are ignored by Git.
+
 ## Prepare from the cleaned recordings
 
 If the version-4 prepared dataset is unavailable, use:
 
 ```bash
-python -m baseline prepare \
+python -m baseline.RecoFit prepare \
   --source strength_training/strength_training_data_clean \
-  --output baseline/data
+  --output baseline/RecoFit/data
 
-python -m baseline run --data baseline/data --output baseline/runs/recofit_cv
+python -m baseline.RecoFit run --data baseline/RecoFit/data --output baseline/RecoFit/runs/recofit_cv
 ```
 
 Preparation reuses `strength_training.temporal_segmentation.data.prepare`:
@@ -152,11 +156,11 @@ sensor driver.
 For an offline counter comparison using the same trained classifiers:
 
 ```bash
-python -m baseline evaluate \
+python -m baseline.RecoFit evaluate \
   --data strength_training/tas_data_both_wrists \
-  --model baseline/runs/recofit_cv/cross_validation/fold_1/model/model.joblib \
+  --model baseline/RecoFit/runs/recofit_cv/cross_validation/fold_1/model/model.joblib \
   --mode offline \
-  --output baseline/runs/recofit_fold1_offline
+  --output baseline/RecoFit/runs/recofit_fold1_offline
 ```
 
 This counts each full predicted exercise bout using all its samples. It saves
@@ -177,19 +181,19 @@ that receives reference station labels or repetition boundaries.
 For a diagnostic single subject split:
 
 ```bash
-python -m baseline train \
+python -m baseline.RecoFit train \
   --data strength_training/tas_data_both_wrists \
-  --output baseline/runs/recofit_single/model
+  --output baseline/RecoFit/runs/recofit_single/model
 
-python -m baseline evaluate \
+python -m baseline.RecoFit evaluate \
   --data strength_training/tas_data_both_wrists \
-  --model baseline/runs/recofit_single/model/model.joblib \
-  --output baseline/runs/recofit_single/test
+  --model baseline/RecoFit/runs/recofit_single/model/model.joblib \
+  --output baseline/RecoFit/runs/recofit_single/test
 
-python -m baseline predict \
-  --model baseline/runs/recofit_single/model/model.joblib \
+python -m baseline.RecoFit predict \
+  --model baseline/RecoFit/runs/recofit_single/model/model.joblib \
   --input strength_training/strength_training_data_clean/20260602_LRFVFZEIVGAM/left_wrist.csv \
-  --output baseline/runs/recofit_prediction
+  --output baseline/RecoFit/runs/recofit_prediction
 ```
 
 The prediction example illustrates the format; headline results must come from
@@ -220,7 +224,7 @@ Run the regression and integration checks:
 
 ```bash
 python -m unittest baseline.RecoFit.tests.test_recofit -v
-python -m baseline demo --output baseline/runs/demo
+python -m baseline.RecoFit demo --output baseline/RecoFit/runs/demo
 ```
 
 The tests check regular/double peaks, local tempo changes, constant inputs,
@@ -234,5 +238,5 @@ sensor-only prediction. Synthetic results do not establish real accuracy.
 
 A capped fit was also checked on the existing real version-4 data, followed by
 180 seconds of held-out replay in both modes. Generated smoke-test artifacts
-are under `baseline/runs/real_smoke/` locally and excluded from version control.
+are under `baseline/RecoFit/runs/real_smoke/` locally and excluded from version control.
 The full five-fold real-data experiment has not been run as part of implementation.

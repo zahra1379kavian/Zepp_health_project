@@ -1,1 +1,1 @@
-"""RecoFit-style wrist baseline. Run python -m baseline --help."""
+"""RecoFit-style wrist baseline. Run python -m baseline.RecoFit --help."""
