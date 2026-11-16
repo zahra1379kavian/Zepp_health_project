@@ -7,7 +7,7 @@ The project has two objectives, in this order:
 1. **Immediate objective — repetition segmentation and counting.** Use continuous wearable sensor data to count repetitions at each station and identify the **start and end time of every individual repetition**. A set contains multiple repetitions; detecting set starts and ends is a by-product of repetition segmentation.
 2. **Type of strength training station is not know**. So you need to handle unknow stations and segment the reps.**Do not assume we can input station ID to the model**.
  The reporting delay of the rep counting should be **less than 1s** after the end of the rep.  **we don't know which exercise a subject complete during a recording** for our new data, so don't use which stations have done for a session.
-3. **Later objective — recognition of strength-training station types.** Develop broader station-type recognition after successful development of the repetition-segmentation model, tentatively in the new year (2027).
+3. **Later objective — recognition of strength-training station types.** Develop broader station-type recognition after successful development of the repetition-segmentation model.
 
 The immediate pipeline is **classify the current stations and rest → segment individual repetitions → count repetitions per station**. Classification of the currently labeled stations is a supporting step in the immediate objective; broader station-type recognition is the later research objective. At inference, the pipeline must predict station/rest labels from sensors rather than receive true station labels, set boundaries, or repetition boundaries as inputs. New manual labels for inter-set transitions are not a prerequisite.
 

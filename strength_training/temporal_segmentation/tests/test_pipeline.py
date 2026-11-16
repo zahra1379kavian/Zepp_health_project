@@ -11,13 +11,14 @@ import torch
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, EXCLUDED_SESSIONS, FEATURES
 from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, log_masks,
                                                          phase_label_targets, prepare, reference_targets,
-                                                         select_wrist, subject_split)
+                                                         select_wrist, subject_split, subject_folds,
+                                                         dense_phase_targets, training_statistics)
 from strength_training.temporal_segmentation.decode import DecoderConfig, RepDecoder, decode_sequence
 from strength_training.temporal_segmentation.demo import synthetic_source
 from strength_training.temporal_segmentation.metrics import (covered_repetitions, match_repetitions,
                                                             repetition_metrics)
 from strength_training.temporal_segmentation.model import DenseMSTCN, ModelConfig, dense_loss
-from strength_training.temporal_segmentation.runner import Windows
+from strength_training.temporal_segmentation.runner import Windows, checkpoint_key, score_cache
 
 
 class ModelTests(unittest.TestCase):
@@ -58,7 +59,8 @@ class ModelTests(unittest.TestCase):
     def test_all_masked_loss_is_zero_and_differentiable(self):
         outputs = self.model(self.x)
         valid = torch.zeros(1, 75, dtype=torch.bool)
-        loss = dense_loss(outputs, torch.zeros(1, 75, dtype=torch.long), torch.zeros(1, 75, 2), valid, valid)
+        loss = dense_loss(outputs, torch.zeros(1, 75, dtype=torch.long),
+                          torch.zeros(1, 75, dtype=torch.long), valid, valid)
         self.assertEqual(loss.item(), 0)
         loss.backward()
         self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in self.model.parameters()))
@@ -69,6 +71,23 @@ class ModelTests(unittest.TestCase):
         loss = dense_loss(output, torch.zeros(1, 4, dtype=torch.long), torch.ones(1, 4, 2), valid, ~valid)
         loss.backward()
         self.assertEqual(output[0][1].grad.abs().sum(), 0)
+
+    def test_dense_phase_loss_supervises_interior_frames_only_where_covered(self):
+        output = [(torch.zeros(1, 16, 12, requires_grad=True), torch.zeros(1, 3, 12, requires_grad=True))]
+        target = torch.tensor([[0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0]])
+        valid = torch.ones(1, 12, dtype=torch.bool)
+        covered = valid.clone()
+        covered[:, 0] = False
+        dense_loss(output, torch.zeros_like(target), target, valid, covered).backward()
+        self.assertTrue((output[0][1].grad[:, :, 1:].abs().sum(1) > 0).all())
+        self.assertEqual(output[0][1].grad[:, :, 0].abs().sum(), 0)
+
+    def test_boundary_baseline_streaming_is_still_supported(self):
+        model = DenseMSTCN(ModelConfig(stages=2, layers=2, channels=8, repetition_head="boundary")).eval()
+        expected = model(self.x)[-1]
+        p, q, _ = model.stream(self.x)
+        torch.testing.assert_close(p, expected[0])
+        torch.testing.assert_close(q, expected[1])
 
 
 class DataTests(unittest.TestCase):
@@ -128,6 +147,33 @@ class DataTests(unittest.TestCase):
         self.assertEqual(len(refs), 0)
         self.assertEqual(len(removed), 1)
 
+    def test_cut_reference_preserves_preceding_shared_end(self):
+        entry = self.entry()
+        entry["repetitions"].append({"station": "squat", "start_ms": 400, "end_ms": 800})
+        valid = np.ones(25, bool)
+        valid[15] = False
+        boundary, coverage, refs, removed = reference_targets(np.arange(25)*40, valid, entry, "waist")
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(coverage[10])
+        self.assertEqual(boundary[10, 1], 1)
+        self.assertFalse(coverage[11:21].any())
+        scored, _ = covered_repetitions(refs, np.arange(25)*40, coverage, refs)
+        self.assertEqual(repetition_metrics(scored, refs)["tp"], 1)
+
+    def test_subject_folds_are_disjoint_and_test_every_subject_once(self):
+        rows = [{"session": f"date{i}_{s}", "subject": s} for i in range(2) for s in "abcdefghi"]
+        folds = subject_folds(rows, 4, seed=7)
+        self.assertEqual(folds, subject_folds(rows, 4, seed=7))
+        tested = []
+        for split in folds:
+            groups = [{n.split("_")[1] for n in split[k]} for k in ("train", "validation", "test")]
+            self.assertFalse(groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+            tested.extend(split["test"])
+        self.assertCountEqual(tested, [r["session"] for r in rows])
+        with self.assertRaises(ValueError):
+            subject_folds(rows, 2)
+
     def test_subjects_never_cross_splits(self):
         rows = [{"session": f"date{i}_{s}", "subject": s} for i in range(2) for s in "abcdef"]
         split = subject_split(rows)
@@ -158,6 +204,11 @@ class DataTests(unittest.TestCase):
             self.assertFalse(valid[:28].any())
             self.assertEqual(x.shape, (9, 156))
             self.assertTrue(refs[valid].all())
+            for split in subject_folds(manifest["sessions"], 3):
+                stats = training_statistics(root / "prepared", split["train"])
+                fold_x = np.concatenate([load_arrays(root / "prepared" / n)["x"][
+                    load_arrays(root / "prepared" / n)["valid"]] for n in split["train"]])
+                np.testing.assert_allclose(stats["normalization"]["mean"], fold_x.astype(float).mean(0))
 
     def test_sensor_labels_cannot_change_features(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,14 +278,30 @@ class PhaseReferenceTests(unittest.TestCase):
         self.assertTrue(coverage.all())
         self.assertEqual(rejected, [])
 
-    def test_opposite_order_and_paused_same_phase(self):
+    def test_initial_phase2_is_incomplete_and_does_not_reverse_convention(self):
         _, _, reps, rejected = self.targets([
             "rest", "squat_phase2", "squat_transition", "squat_phase2",
             "squat_phase1", "rest"])
+        self.assertEqual(reps, [])
+        self.assertEqual(len(rejected), 2)
+
+    def test_phase1_pause_and_dense_transition_targets(self):
+        raw = np.array(["rest", "squat_phase1", "squat_transition", "squat_phase1",
+                        "squat_phase2", "squat_transition", "squat_phase2", "rest"])
+        t, valid = np.arange(len(raw))*40, np.ones(len(raw), bool)
+        _, coverage, reps, rejected = phase_label_targets(t, raw, valid)
         self.assertEqual(len(reps), 1)
-        self.assertEqual(reps[0]["phase_order"], "phase2-phase1")
-        self.assertEqual((reps[0]["start_ms"], reps[0]["end_ms"]), (40, 200))
+        self.assertEqual(reps[0]["phase_order"], "phase1-phase2")
         self.assertEqual(rejected, [])
+        phase, mask = dense_phase_targets(t, raw, valid, coverage, reps)
+        np.testing.assert_array_equal(phase, [0, 1, 1, 1, 2, 2, 2, 0])
+        self.assertTrue(mask.all())
+
+    def test_orphan_phase2_then_complete_cycle(self):
+        _, _, reps, rejected = self.targets([
+            "rest", "squat_phase2", "squat_phase1", "squat_phase2", "rest"])
+        self.assertEqual([(r["start_ms"], r["end_ms"]) for r in reps], [(80, 160)])
+        self.assertEqual(len(rejected), 1)
 
     def test_no_pair_across_rest_or_another_station(self):
         b, coverage, reps, rejected = self.targets([
@@ -291,13 +358,76 @@ class DecoderTests(unittest.TestCase):
         q[40:, 1] = 1
         self.assertEqual(len(decode_sequence(t, p, q, np.ones(50, bool))["repetitions"]), 2)
 
-    def test_null_and_plank_do_not_generate_reps(self):
-        for label in ("NULL", "plank"):
-            t, p, q = self.sequence(label)
-            result = decode_sequence(t, p, q, np.ones(50, bool))
-            self.assertEqual(result["repetitions"], [])
-            if label == "plank":
-                self.assertEqual(result["holds"][0]["duration_s"], 2.)
+    def test_null_station_does_not_veto_complete_repetitions(self):
+        t, p, q = self.sequence("NULL")
+        result = decode_sequence(t, p, q, np.ones(50, bool))
+        self.assertEqual(result["counts"], {"unknown": 2})
+
+    def test_station_label_is_selected_from_exercise_classes(self):
+        t, p, q = self.sequence("NULL")
+        p[:, 0], p[:, CLASSES.index("squat")] = .6, .4
+        result = decode_sequence(t, p, q, np.ones(50, bool), DecoderConfig(station_threshold=.3))
+        self.assertEqual(result["counts"], {"squat": 2})
+
+    def test_chunk_arrival_includes_confirmation_delay(self):
+        t, p, q = self.sequence()
+        decoder, reps = RepDecoder(), []
+        for a in range(0, len(t), 7):
+            b = min(a + 7, len(t))
+            for i in range(a, b):
+                reps.extend(decoder.step(t[i], p[i], q[i], reported_at_ms=int(t[b-1])))
+        self.assertEqual([r["end_ms"] for r in reps], [800, 1600])
+        self.assertEqual([r["reported_at_ms"] for r in reps], [1080, 1920])
+
+    def test_invalid_decoder_thresholds_and_noninteger_lag_are_rejected(self):
+        for kwargs in ({"end_threshold": 1.1}, {"phase_threshold": 0}, {"lag_frames": 2.5}):
+            with self.assertRaises(ValueError):
+                DecoderConfig(**kwargs)
+
+    def test_plank_is_a_hold(self):
+        t, p, q = self.sequence("plank")
+        result = decode_sequence(t, p, q, np.ones(50, bool))
+        self.assertEqual(result["repetitions"], [])
+        self.assertEqual(result["holds"][0]["duration_s"], 2.)
+
+    def test_broad_boundary_peak_uses_peak_time_and_actual_confirmation_time(self):
+        t, p, q = self.sequence()
+        q[:, 1] = 0
+        q[18:23, 1] = [.55, .7, .95, .7, .4]
+        result = decode_sequence(t, p, q, np.ones(50, bool))
+        rep = result["repetitions"][0]
+        self.assertEqual(rep["end_ms"], 800)
+        self.assertEqual(rep["reported_at_ms"], 880)
+
+    def test_dense_phases_count_first_and_unknown_reps(self):
+        t, p, _ = self.sequence("NULL")
+        labels = np.zeros(50, int)
+        labels[2:10], labels[10:20], labels[20:30], labels[30:40] = 1, 2, 1, 2
+        q = np.eye(3)[labels]
+        result = decode_sequence(t, p, q, np.ones(50, bool))
+        self.assertEqual(result["counts"], {"unknown": 2})
+        self.assertEqual([(r["start_ms"], r["end_ms"], r["reported_at_ms"]) for r in result["repetitions"]],
+                         [(80, 800, 880), (800, 1600, 1680)])
+        # A one-frame phase glitch must not invent an early boundary.
+        q[15] = [0, 1, 0]
+        self.assertEqual(decode_sequence(t, p, q, np.ones(50, bool))["counts"], {"unknown": 2})
+
+    def test_phase_decoder_gap_and_eof_do_not_complete_partial_cycle(self):
+        t, p, _ = self.sequence()
+        labels = np.zeros(50, int)
+        labels[2:10], labels[10:20] = 1, 2
+        q = np.eye(3)[labels]
+        self.assertEqual(decode_sequence(t[:21], p[:21], q[:21], np.ones(21, bool))["repetitions"], [])
+        valid = np.ones(50, bool)
+        valid[15] = False
+        self.assertEqual(decode_sequence(t, p, q, valid)["repetitions"], [])
+
+    def test_short_phase_cycle_cannot_absorb_later_orphan_phase2(self):
+        t, p, _ = self.sequence()
+        labels = np.zeros(50, int)
+        labels[2:5], labels[5:8], labels[15:25] = 1, 2, 2
+        result = decode_sequence(t, p, np.eye(3)[labels], np.ones(50, bool), DecoderConfig(min_rep_ms=280))
+        self.assertEqual(result["repetitions"], [])
 
     def test_gap_cancels_partial_rep(self):
         t, p, q = self.sequence()
@@ -346,6 +476,53 @@ class MetricsTests(unittest.TestCase):
         scored, unscored = covered_repetitions([self.rep(0, 400), self.rep(400, 1200)], t, mask)
         self.assertEqual(len(scored), 1)
         self.assertEqual(len(unscored), 1)
+
+    def test_matching_precedes_coverage_filter_at_both_edges(self):
+        t, coverage = np.arange(50)*40, np.zeros(50, bool)
+        coverage[10:31] = True
+        refs = [self.rep(400, 1200)]
+        for predicted in (self.rep(360, 1200), self.rep(400, 1240)):
+            scored, unscored = covered_repetitions([predicted], t, coverage, refs)
+            self.assertEqual(unscored, [])
+            self.assertEqual(repetition_metrics(scored, refs)["f1"], 1)
+
+    def test_only_matched_outside_predictions_survive_coverage_filter(self):
+        t, coverage = np.arange(50)*40, np.zeros(50, bool)
+        coverage[10:40] = True
+        refs = [self.rep(400, 1200)]
+        predictions = [self.rep(360, 1200), self.rep(360, 1240), self.rep(400, 1200, "push-up")]
+        scored, unscored = covered_repetitions(predictions, t, coverage, refs)
+        self.assertEqual(len(unscored), 1)
+        metric = repetition_metrics(scored, refs)
+        self.assertEqual((metric["tp"], metric["extra"], metric["missed"]), (1, 1, 0))
+
+    def test_unknown_station_can_match_in_segmentation_score(self):
+        predicted, refs = [self.rep(0, 1000, "unknown")], [self.rep(0, 1000)]
+        self.assertEqual(repetition_metrics(predicted, refs)["tp"], 0)
+        self.assertEqual(repetition_metrics(predicted, refs, require_station=False)["tp"], 1)
+
+    def test_early_matched_report_meets_deadline_but_is_reported_separately(self):
+        metric = repetition_metrics([self.rep(0, 960)], [self.rep(0, 1000)])
+        self.assertEqual(metric["matched_reported_before_1s_fraction"], 1)
+        self.assertEqual(metric["matched_early_report_fraction"], 1)
+        self.assertEqual(metric["matched_reported_0_to_999ms_fraction"], 0)
+        late = self.rep(0, 1000) | {"reported_at_ms": 2000}
+        self.assertEqual(repetition_metrics([late], [self.rep(0, 1000)])["matched_reported_before_1s_fraction"], 0)
+
+    def test_checkpoint_ranking_uses_f1_then_count_error(self):
+        rows = [{"f1": .7, "count_mae_all_station_sessions": 0, "loss": .1},
+                {"f1": .8, "count_mae_all_station_sessions": 2, "loss": 9},
+                {"f1": .8, "count_mae_all_station_sessions": 1, "loss": 10}]
+        self.assertIs(max(rows, key=checkpoint_key), rows[2])
+
+    def test_validation_selection_retains_edge_match(self):
+        t = np.arange(50)*40
+        p, q, coverage = np.zeros((50, 16)), np.zeros((50, 2)), np.zeros(50, bool)
+        p[:, CLASSES.index("squat")] = 1
+        q[9, 0], q[30, 1], coverage[10:40] = 1, 1, True
+        arrays = {"t": t, "coverage": coverage, "valid": np.ones(50, bool)}
+        cache = [("subject", arrays, p, q, [self.rep(400, 1200)])]
+        self.assertEqual(score_cache(cache, DecoderConfig(), 400)["f1"], 1)
 
 
 if __name__ == "__main__":

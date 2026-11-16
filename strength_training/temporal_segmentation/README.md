@@ -1,6 +1,9 @@
 # Wrist-only temporal action segmentation and repetition counting
 
-This is the confirmed **station/NULL head + repetition start/end head** method.
+The default method uses a **station/NULL head + dense NULL/phase1/phase2 head**.
+The user has validated **phase1 → phase2** as one complete repetition. Boundaries
+are derived from the predicted phase sequence. An explicit start/end-head
+baseline remains available with `train --repetition-head boundary`.
 It uses wrist signals only. The authoritative targets are the matching wrist
 column of each reliable `label.csv` in `strength_training_data_clean`.
 No separate repetition-reference file is required for the default run.
@@ -22,22 +25,48 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r strength_training/temporal_segmentation/requirements.txt
 ```
 
-The real wrist dataset is already prepared in this workspace. Run the full
-experiment with:
+Prepare a new version-3 dataset, then run the experiment:
 
 ```bash
+python -m strength_training.temporal_segmentation prepare \
+  --output strength_training/tas_data_wrist_phases
+
 python -m strength_training.temporal_segmentation run \
-  --data strength_training/tas_data_wrist \
+  --data strength_training/tas_data_wrist_phases \
   --output strength_training/tas_runs/wrist_full \
   --epochs 30 --device cpu
 ```
 
-This trains **both heads**, selects the best checkpoint by validation loss,
-selects repetition thresholds on validation subjects, and evaluates the held-out
-test subjects. There is no station-only fallback. Training prints progress every
+The existing `tas_data_wrist` is version 2 and must be prepared again: it lacks
+dense phase targets and records the former phase-order convention. Existing
+outputs are preserved. Old wrist boundary checkpoints can still be loaded for
+replay; the phase architecture requires retraining.
+
+This trains **both heads**, selects the best checkpoint by validation repetition
+F1 (independent of station labels), breaking ties with session count MAE. It uses
+a fixed decoder and the declared tolerance during checkpoint selection. It then
+tunes thresholds on validation subjects and evaluates held-out test subjects.
+There is no station-only fallback. Training prints progress every
 100 batches. CPU training can take substantial time; the command runs up to
 30 epochs with early stopping. Use `--device cuda` only if your environment has
-compatible GPU PyTorch installed.
+compatible GPU PyTorch installed. `--max-steps` caps loss batches only; checkpoint
+selection always decodes the complete validation sessions.
+
+For the recommended subject-wise evaluation, use:
+
+```bash
+python -m strength_training.temporal_segmentation cross-validate \
+  --data strength_training/tas_data_wrist_phases \
+  --output strength_training/tas_runs/wrist_cv \
+  --folds 5 --epochs 30 --tolerance-ms 400
+```
+
+Each subject appears in exactly one test fold. The next fold supplies validation
+subjects; the remaining folds train. Normalization and loss weights are refitted
+for every fold. Checkpoints and decoder thresholds use only that fold's validation
+subjects. `report.json` pools held-out predictions and reports fold F1 mean and
+standard deviation; `fold_*/` retains individual models, splits, and reports.
+Five folds with 43 subjects gives 8–9 test subjects per fold and tests all 43.
 
 On a fresh checkout without prepared data, omit `--data`:
 
@@ -60,27 +89,27 @@ synthetic demo before this experiment.
 | File under `strength_training/tas_runs/wrist_full/` | Contents |
 | --- | --- |
 | `model/best.pt` | Best two-head checkpoint |
-| `model/history.json` | Training/validation losses |
+| `model/history.json` | Losses and validation repetition/count metrics |
 | `decoder.json` | Validation-selected thresholds and declared timing tolerance |
 | `test/report.json` | Held-out classification, count, detection and timing metrics |
 | `test/<session>.json` | Predicted repetitions, counts, plank holds, sets and session metrics |
 
 Every predicted repetition contains its station, `start_ms`, `end_ms`, confidence,
 and sample-time `reported_at_ms`. A session's counts are aggregated by predicted
-station. Reference count scores cover eligible intervals with complete phase
+station, including `unknown` when station evidence is weak. Station uncertainty
+does not discard a completed cycle. Reference count scores cover eligible intervals with complete phase
 cycles; excluded or incomplete reference regions are reported separately.
 
 ## How label.csv becomes repetition targets
 
-You confirmed that the `label.csv` files are reliable. The code therefore uses
-those files directly, with the following **declared conversion convention**:
+You confirmed that the `label.csv` files are reliable and that a full repetition
+is phase1 followed by phase2. The code uses those files directly:
 
 1. A bout is a continuous run of the same normalized exercise label. Rest or a
    different exercise ends it. This is only a reference-conversion step; bout
    boundaries are never supplied to the inference model.
-2. Pair opposite phases of that exercise, anchored to the first observed phase
-   in each bout. Usually the sequence is `phase1 → phase2`; a bout beginning with
-   `phase2` uses `phase2 → phase1`.
+2. Pair `phase1 → phase2` only. An initial `phase2` is incomplete and cannot
+   reverse the repetition convention. A later complete pair remains eligible.
 3. Include same-exercise transitions between those two phases in the repetition.
    End the repetition immediately after the second phase. A trailing transition
    is not part of the completed repetition and never becomes an extra repetition.
@@ -91,6 +120,12 @@ those files directly, with the following **declared conversion convention**:
    missing sensor sample, or an excluded interval. Those intervals can still
    train the station head when its inputs and labels are eligible.
 6. Plank is a static hold and has no repetition count.
+
+The dense targets retain phase labels throughout each accepted cycle. Internal
+transition pauses continue the preceding phase; transitions outside cycles,
+rest, and plank use the phase head's NULL target. Incomplete or excluded phase
+regions are masked. These transition/pause rules are operational conventions;
+the user's validation specifically confirmed the phase order.
 
 All intervals use `[start_ms, end_ms)` on the session's 40 ms grid. The start
 impulse is at the first phase's start; the end impulse is at the first sample
@@ -104,28 +139,30 @@ rest | phase1 | transition | phase2 | transition | phase1 | phase2 | rest
        <-------- rep 1 ----------->              <---- rep 2 ---->
 ```
 
-Label reliability is user-confirmed. The pairing rule is an explicit operational
-convention, not a claim that a separate video audit established these boundaries.
-It is saved in the dataset manifest, model checkpoint, and evaluation report.
+Label reliability and phase order are user-confirmed; no independent video audit
+was performed by this code review. The convention and validation source are saved
+in the dataset manifest; the convention is copied into checkpoints and reports.
 Each session also has `reference_audit.json`, listing the chosen label column,
 accepted cycles, and rejected intervals. This makes the reported counts traceable
 to the original labels without changing the source files.
 
 ## Verified wrist data and checks
 
-The updated preparation produced:
+An audit of all 43 existing wrist-label arrays using the confirmed phase order found:
 
 - **43 sessions:** 39 using left wrist, 4 using right wrist.
-- **31 training / 6 validation / 6 test subjects**, split before creating windows.
+- The original single split has **31 training / 6 validation / 6 test subjects**;
+  subject-wise folds are now available.
 - **21,277 complete phase-derived repetition references** and 12 unpaired phases
   excluded from boundary supervision/scoring.
 - **74.1357 eligible wrist-sensor hours**, including ordinary inter-set rest.
 - **60.65 minutes** of available sled-pull data kept separately as an unscored probe.
 
-The 43-test suite passed. The updated wrist-only synthetic pipeline and the new
-`run` command both completed through held-out evaluation. A short real-wrist
-training/validation check verifies both heads can train on the derived targets.
-These checks establish executable code, not a fully trained model's accuracy.
+The phase-order audit leaves the total of 21,277 accepted references unchanged.
+The regression suite and dense-phase synthetic prepare/train/tune/evaluate/predict
+pipeline passed, as did a three-fold synthetic cross-validation run. The synthetic
+training was deliberately short and does not establish model accuracy. Prior real
+training checks in `verification.json` describe the historical boundary model.
 Full held-out repetition performance and the <1 second true reporting-delay goal
 still need to be measured by the full experiment.
 
@@ -166,9 +203,13 @@ python -m strength_training.temporal_segmentation evaluate \
 
 The default matching tolerance is 400 ms at **each** endpoint. Declare it before
 examining test results; `tune` stores it and selects thresholds only on validation
-subjects. Prediction stations must match reference stations for a repetition
-match. Matching is one-to-one, maximizing match count before minimizing timing
-error. Reports include missed/extra reps, start/end MAE, count MAE and exact-count
+subjects. The `segmentation` report matches boundaries independently of station;
+the `repetitions` report additionally requires station agreement. Matching is
+one-to-one, maximizing match count before minimizing timing error. Predictions
+are matched against all retained references **before** coverage filtering; only
+unmatched predictions outside certified coverage are unscored. Both metrics and
+their count tables use this rule, including threshold and checkpoint selection.
+Reports include missed/extra reps, start/end MAE, count MAE and exact-count
 accuracy per session/station, per-subject and per-exercise results, macro F1,
 per-class precision/recall, confusion matrix and false exercise events per rest hour.
 
@@ -176,7 +217,8 @@ per-class precision/recall, confusion matrix and false exercise events per rest 
 diagnostics. They are not used by the full wrist experiment. Independently
 specified reference JSONs can still override automatic conversion using
 `prepare --references FILE`; entries must identify the actual selected
-`left_wrist` or `right_wrist` location. Their schema is implemented in
+`left_wrist` or `right_wrist` location. External references default to the boundary
+head because they need not certify phase labels. Their schema is implemented in
 `data.reference_targets()` and shown by the synthetic demo's `references.json`.
 
 ## Prediction from sensors only
@@ -200,13 +242,23 @@ Named waist files and old waist checkpoints are rejected.
 
 `DenseMSTCN.stream()` and `RepDecoder.step()` can be used in a live sensor loop.
 The CLI replays a CSV, not a hardware driver. At 25 Hz, `--chunk 1` adds no
-intentional buffering. Sensor gaps reset the network and decoder. Incomplete
+intentional input buffering. The decoder confirms phase changes over three
+frames (80 ms after the boundary), preserving the original boundary timestamp.
+The boundary-head baseline likewise uses a local peak with two future frames,
+rather than the first threshold crossing. `reported_at_ms` includes this delay;
+CSV runtime reports list decoder delay separately from chunk buffering.
+Sensor gaps reset the network and decoder. Incomplete
 cycles at gaps, timeouts, or EOF are not emitted. Plank holds are reported as
 durations, and sets are a secondary grouping using a 10 second gap.
 
 Runtime timings include compute and buffering relative to **predicted** ends.
 True reporting delay also includes error relative to the reference end, transport,
-and processing backlog. Causality alone does not prove the <1 second requirement.
+and processing backlog. `matched_reported_before_1s_fraction` accepts an early
+report only after endpoint-tolerant matching; early reports are also counted in
+`matched_early_report_fraction`. The older `matched_reported_0_to_999ms_fraction`
+remains as a stricter diagnostic. Exactly 1,000 ms fails the deadline. These
+fractions cover matched reps only; recall accounts for missed reps. Causality
+alone does not prove the <1 second requirement.
 
 ## Architecture and data handling
 
@@ -215,16 +267,17 @@ This is a causal adaptation of
 with continuous inertial localization motivated by
 [WEAR (Bock et al., IMWUT 2024)](https://mariusbock.github.io/wear/).
 The original MS-TCN uses symmetric convolutions and one action head; causal
-padding and the repetition boundary head are additions here. This does not
+padding and the repetition heads are additions here. This does not
 reproduce the WEAR benchmark architectures.
 
 The default model has 3 stages, 6 dilated residual layers per stage, and 64
 channels. Its history is 378 past samples (15.12 seconds), with no future
-lookahead. Each stage has 16 station logits and independent start/end logits.
+lookahead in the network. Each stage has 16 station logits and 3 phase logits.
 Refinement consumes predicted probabilities; no true station IDs or boundaries
 are inference inputs. The loss is the mean over stages of weighted station
-cross-entropy, 0.15 times truncated log-probability smoothing, and masked boundary
-BCE. Class and boundary weights come from training subjects only.
+cross-entropy, 0.15 times truncated station log-probability smoothing, and masked
+weighted phase cross-entropy. Phase logits are not temporally smoothed. The
+boundary baseline uses masked BCE instead. All weights come from training subjects.
 
 Sensors join exactly to `label.csv` on `sync_timestamp`. No interpolation or
 forward fill occurs. Only the matching selected wrist label column supplies
@@ -236,8 +289,11 @@ tested against full causal inference.
 Calibration, `Other`, and sled-pull intervals are excluded from standard training
 and evaluation. The separate sled-pull mask is `probe.npy`; existing rest labels
 cannot score unseen-exercise detection. NULL means category-relative rest, not
-an unknown-exercise detector. Recognition of genuinely new station types remains
-phase 2. The current model infers which of the 15 stations is being used.
+an unknown-exercise detector. A weak station prediction is reported as `unknown`
+without vetoing the phase-derived count. This removes the known-class gate but
+does not demonstrate generalization to unseen exercises; that requires the
+separate probe with suitable repetition references. Confident plank predictions
+remain duration-only.
 
 ## Tests and source files
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Causal MS-TCN: station/NULL + repetition boundaries")
+    parser = argparse.ArgumentParser(description="Causal MS-TCN: station/NULL + dense repetition phases")
     sub = parser.add_subparsers(dest="command", required=True)
     prepare = sub.add_parser("prepare", help="Exact-clock joins, exclusions, references and subject splits")
     prepare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
@@ -14,23 +14,28 @@ def main(argv=None):
     prepare.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
     prepare.add_argument("--references", type=Path)
     prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels",
-                         help="Default: derive full cycles from trusted label.csv wrist phases")
+                         help="Default: validated phase1 then phase2 cycles from label.csv wrist phases")
     prepare.add_argument("--seed", type=int, default=42)
 
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
-    train.add_argument("--data", type=Path, required=True)
-    train.add_argument("--output", type=Path, required=True)
-    train.add_argument("--station-only", action="store_true")
-    train.add_argument("--epochs", type=int, default=30)
-    train.add_argument("--batch-size", type=int, default=8)
-    train.add_argument("--window", type=int, default=256)
-    train.add_argument("--stages", type=int, default=3)
-    train.add_argument("--layers", type=int, default=6)
-    train.add_argument("--channels", type=int, default=64)
-    train.add_argument("--learning-rate", type=float, default=1e-3)
-    train.add_argument("--patience", type=int, default=6)
-    train.add_argument("--seed", type=int, default=42)
-    train.add_argument("--max-steps", type=int, default=0, help="Diagnostic cap per epoch/split; 0 means all batches")
+    cv = sub.add_parser("cross-validate", help="Subject-wise folds with separate validation and pooled held-out scores")
+    cv.add_argument("--folds", type=int, default=5)
+    for command in (train, cv):
+        command.add_argument("--data", type=Path, required=True)
+        command.add_argument("--output", type=Path, required=True)
+        command.add_argument("--station-only", action="store_true")
+        command.add_argument("--repetition-head", choices=["auto", "phase", "boundary"], default="auto")
+        command.add_argument("--epochs", type=int, default=30)
+        command.add_argument("--batch-size", type=int, default=8)
+        command.add_argument("--window", type=int, default=256)
+        command.add_argument("--stages", type=int, default=3)
+        command.add_argument("--layers", type=int, default=6)
+        command.add_argument("--channels", type=int, default=64)
+        command.add_argument("--learning-rate", type=float, default=1e-3)
+        command.add_argument("--patience", type=int, default=6)
+        command.add_argument("--seed", type=int, default=42)
+        command.add_argument("--tolerance-ms", type=int, default=400)
+        command.add_argument("--max-steps", type=int, default=0, help="Diagnostic cap per epoch/split; 0 means all batches")
 
     for name in ("evaluate", "tune"):
         command = sub.add_parser(name)
@@ -60,7 +65,7 @@ def main(argv=None):
     run.add_argument("--batch-size", type=int, default=8)
     run.add_argument("--seed", type=int, default=42)
     run.add_argument("--tolerance-ms", type=int, default=400)
-    for command in (train, sub.choices["evaluate"], sub.choices["tune"], predict, demo, run):
+    for command in (train, cv, sub.choices["evaluate"], sub.choices["tune"], predict, demo, run):
         command.add_argument("--device", default="cpu")
         command.add_argument("--threads", type=int, default=2)
     args = parser.parse_args(argv)
@@ -80,7 +85,7 @@ def main(argv=None):
         run_pipeline(args)
     else:
         from . import runner
-        result = getattr(runner, args.command)(args)
+        result = getattr(runner, args.command.replace("-", "_"))(args)
         print(f"{args.command} complete: {result if args.command == 'train' else args.output}")
 
 

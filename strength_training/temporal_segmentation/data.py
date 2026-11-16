@@ -16,8 +16,8 @@ from .constants import CLASSES, DT_MS, EXCLUDED_SCENES, EXCLUDED_SESSIONS, FEATU
 
 WRIST_LOCATIONS = ("wrist", "left_wrist", "right_wrist")
 PHASE_CONVENTION = (
-    "Within each continuous same-exercise bout, pair opposite phases starting "
-    "from the first observed phase (phase1 or phase2). Same-exercise transitions "
+    "User-validated full repetition: phase1 then phase2, within each continuous "
+    "same-exercise bout. An initial phase2 is incomplete. Same-exercise transitions "
     "between phases are inside the repetition; transitions after the second phase "
     "are outside it. Repeated same-phase runs separated by transitions are a "
     "paused phase. Never pair across rest, another exercise, exclusions, or gaps. "
@@ -150,16 +150,14 @@ def reference_targets(t, valid, entry, location):
         boundary[i, 0] = 1
         boundary[j, 1] = 1
         repetitions.append({"station": name, "start_ms": a, "end_ms": b})
+    # A removed cycle may share its start/end with a retained neighbour.
+    # Keep the neighbour's known event supervised after all coverage cuts.
+    covered |= boundary.any(axis=1) & valid
     return boundary, covered & valid, repetitions, removed
 
 
 def phase_label_targets(t, raw, valid):
-    """Convert user-confirmed reliable wrist phase labels using PHASE_CONVENTION.
-
-    Reliability of label.csv is user-confirmed. The cycle-pairing convention is
-    an explicit implementation choice, recorded in the manifest, not an inferred
-    claim about video validation. All station labels remain supervised where valid.
-    """
+    """Convert wrist labels with the user-validated phase1 -> phase2 order."""
     boundary = np.zeros((len(t), 2), np.float32)
     coverage = np.array(valid, dtype=bool, copy=True)
     repetitions, rejected = [], []
@@ -168,9 +166,12 @@ def phase_label_targets(t, raw, valid):
     blocks, bout_station = [], None
 
     def finish():
-        for k in range(0, len(blocks), 2):
+        k = 0
+        while k < len(blocks):
             first = blocks[k]
-            second = blocks[k+1] if k+1 < len(blocks) else None
+            second = (blocks[k+1] if first[0] == "phase1" and k+1 < len(blocks)
+                      and blocks[k+1][0] == "phase2" else None)
+            k += 2 if second else 1
             a, b = first[1], second[2] if second else first[2]
             reason = None
             if second is None:
@@ -208,6 +209,51 @@ def phase_label_targets(t, raw, valid):
     return boundary, coverage & valid, repetitions, rejected
 
 
+def dense_phase_targets(t, raw, valid, coverage, repetitions):
+    """NULL / phase1 / phase2 on certified cycles and reference negatives.
+
+    Within a retained cycle, same-exercise transition pauses continue the prior
+    phase. Outside cycles transitions are NULL. Unpaired/cut phases are masked.
+    External references without corresponding phase labels remain boundary-only.
+    """
+    phase = np.zeros(len(t), np.int64)
+    mask = np.array(coverage & valid, copy=True)
+    phase[np.char.endswith(raw.astype(str), "_phase1")] = 1
+    phase[np.char.endswith(raw.astype(str), "_phase2")] = 2
+    for rep in repetitions:
+        a, b = np.searchsorted(t, [rep["start_ms"], rep["end_ms"]])
+        last = 0
+        for i in range(a, b):
+            if phase[i]:
+                last = phase[i]
+            elif str(raw[i]) == rep["station"] + "_transition":
+                phase[i] = last
+    # A restored shared boundary may also be an orphan phase's first frame.
+    # Boundary supervision remains valid, but it does not certify that phase.
+    accepted = np.zeros(len(t), bool)
+    for rep in repetitions:
+        a, b = np.searchsorted(t, [rep["start_ms"], rep["end_ms"]])
+        accepted[a:b] = True
+    mask &= (phase == 0) | accepted
+    return phase, mask
+
+
+def subject_folds(sessions, folds=5, seed=42):
+    """Outer test folds with a separate rotating validation fold."""
+    subjects = sorted({s["subject"] for s in sessions})
+    if not 3 <= folds <= len(subjects):
+        raise ValueError("Use 3..number-of-subjects folds for disjoint train/validation/test")
+    np.random.default_rng(seed).shuffle(subjects)
+    groups = [set(g) for g in np.array_split(subjects, folds)]
+    result = []
+    for i in range(folds):
+        test, validation = groups[i], groups[(i + 1) % folds]
+        train = set(subjects) - test - validation
+        result.append({key: [s["session"] for s in sessions if s["subject"] in ids]
+                       for key, ids in (("train", train), ("validation", validation), ("test", test))})
+    return result
+
+
 def subject_split(sessions, seed=42):
     subjects = sorted({s["subject"] for s in sessions})
     if len(subjects) < 3:
@@ -239,7 +285,7 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
     refs = json.loads(Path(references_path).read_text()) if references_path else {"version": 1, "sessions": {}}
     if refs.get("version") != 1:
         raise ValueError("Unsupported references schema")
-    manifest = {"version": 2, "source": str(source), "location": location,
+    manifest = {"version": 3, "source": str(source), "location": location,
                 "classes": CLASSES, "features": FEATURES, "sample_period_ms": DT_MS,
                 "alignment_source": str(Path(alignment_path).resolve()),
                 "references_source": str(Path(references_path).resolve()) if references_path else
@@ -248,6 +294,8 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
                 "reference_convention": "See external reference entries" if references_path else
                 (PHASE_CONVENTION if reference_mode == "labels" else None),
                 "label_reliability": "User confirmed label.csv files are reliable references",
+                "phase_order_validated": reference_mode == "labels" and not references_path,
+                "phase_validation_source": "User confirmed phase1 then phase2 in code review",
                 "seed": seed, "sessions": [], "excluded": [],
                 "wrist_selection": "left wrist when present, otherwise right; fixed per session" if location == "wrist" else location}
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -288,11 +336,13 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
                 boundary, coverage, reps, cut = reference_targets(t, valid, refs["sessions"].get(name), selected_location)
             else:
                 boundary, coverage, reps, cut = phase_label_targets(t, raw, valid)
+            phase, phase_mask = dense_phase_targets(t, raw, valid, coverage, reps)
             path = dest / name
             path.mkdir()
             for key, array in dict(x=x, t=t, y=y, raw=raw, valid=valid, available=available,
                                    eligible=eligible, probe=probe & available,
-                                   boundary=boundary, coverage=coverage).items():
+                                   boundary=boundary, coverage=coverage,
+                                   phase=phase, phase_mask=phase_mask).items():
                 np.save(path / f"{key}.npy", array, allow_pickle=False)
             write_json(path / "references.json", reps)
             write_json(path / "reference_audit.json", {"source": manifest["references_source"],
@@ -312,32 +362,42 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
         if unknown:
             raise ValueError(f"References name unknown sessions: {sorted(unknown)}")
         manifest["split"] = subject_split(manifest["sessions"], seed)
-        sums, squares, count = np.zeros(len(FEATURES)), np.zeros(len(FEATURES)), 0
-        class_counts = np.zeros(len(CLASSES), np.int64)
-        boundary_positives, boundary_frames = np.zeros(2), 0
-        for name in manifest["split"]["train"]:
-            arrays = load_arrays(dest / name)
-            selected = arrays["x"][arrays["valid"]].astype(np.float64)
-            sums += selected.sum(0)
-            squares += (selected ** 2).sum(0)
-            count += len(selected)
-            class_counts += np.bincount(arrays["y"][arrays["valid"]], minlength=len(CLASSES))
-            mask = arrays["coverage"]
-            boundary_positives += arrays["boundary"][mask].sum(0)
-            boundary_frames += int(mask.sum())
-        if count == 0:
-            raise ValueError("No eligible training samples")
-        mean = sums / count
-        std = np.sqrt(np.maximum(squares / count - mean ** 2, 1e-8))
-        manifest["normalization"] = {"mean": mean.tolist(), "std": std.tolist(), "fit_samples": count}
-        manifest["train_class_counts"] = class_counts.tolist()
-        manifest["train_boundary_positives"] = boundary_positives.tolist()
-        manifest["train_boundary_frames"] = boundary_frames
+        manifest.update(training_statistics(dest, manifest["split"]["train"]))
         write_json(dest / "manifest.json", manifest)
         dest.rename(output)
     return manifest
 
 
 def load_arrays(path):
-    return {key: np.load(Path(path) / f"{key}.npy", mmap_mode="r", allow_pickle=False)
-            for key in ("x", "t", "y", "valid", "boundary", "coverage", "probe")}
+    arrays = {key: np.load(Path(path) / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+              for key in ("x", "t", "y", "valid", "boundary", "coverage", "probe")}
+    for key in ("phase", "phase_mask"):
+        if (Path(path) / f"{key}.npy").exists():
+            arrays[key] = np.load(Path(path) / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+    return arrays
+
+
+def training_statistics(root, sessions):
+    """Fit normalization and all loss weights on this fold's training subjects."""
+    sums, squares, count = np.zeros(len(FEATURES)), np.zeros(len(FEATURES)), 0
+    class_counts, phase_counts = np.zeros(len(CLASSES), np.int64), np.zeros(3, np.int64)
+    boundary_positives, boundary_frames = np.zeros(2), 0
+    for name in sessions:
+        arrays = load_arrays(Path(root) / name)
+        selected = arrays["x"][arrays["valid"]].astype(np.float64)
+        sums += selected.sum(0)
+        squares += (selected ** 2).sum(0)
+        count += len(selected)
+        class_counts += np.bincount(arrays["y"][arrays["valid"]], minlength=len(CLASSES))
+        mask = arrays["coverage"]
+        boundary_positives += arrays["boundary"][mask].sum(0)
+        boundary_frames += int(mask.sum())
+        if "phase" in arrays:
+            phase_counts += np.bincount(arrays["phase"][arrays["phase_mask"]], minlength=3)
+    if count == 0:
+        raise ValueError("No eligible training samples")
+    mean = sums / count
+    std = np.sqrt(np.maximum(squares / count - mean ** 2, 1e-8))
+    return {"normalization": {"mean": mean.tolist(), "std": std.tolist(), "fit_samples": count},
+            "train_class_counts": class_counts.tolist(), "train_phase_counts": phase_counts.tolist(),
+            "train_boundary_positives": boundary_positives.tolist(), "train_boundary_frames": boundary_frames}

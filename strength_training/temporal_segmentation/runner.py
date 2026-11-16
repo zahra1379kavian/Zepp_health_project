@@ -14,7 +14,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .constants import CLASSES, DT_MS, FEATURES
-from .data import WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json
+from .data import (WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json,
+                   subject_folds, training_statistics)
 from .decode import DecoderConfig, RepDecoder, decode_sequence, group_sets
 from .metrics import (aggregate_repetitions, classification_metrics, confusion_matrix,
                       count_rows, covered_repetitions, false_exercise_events, repetition_metrics)
@@ -30,13 +31,14 @@ def digest(path):
 
 
 class Windows(Dataset):
-    def __init__(self, root, sessions, norm, history, width):
+    def __init__(self, root, sessions, norm, history, width, repetition_head="boundary"):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name) for name in sessions]
         self.mean = np.asarray(norm["mean"], np.float32)
         self.std = np.asarray(norm["std"], np.float32)
         self.history, self.width = history, width
+        self.repetition_head = repetition_head
         self.windows = []
         for i, arrays in enumerate(self.arrays):
             for a, b in runs(arrays["valid"]):
@@ -64,6 +66,10 @@ class Windows(Dataset):
         boundary[offset:stop] = arrays["boundary"][left:end]
         reference = np.zeros(length, bool)
         reference[offset:stop] = arrays["coverage"][left:end]
+        if self.repetition_head == "phase":
+            boundary = np.zeros(length, np.int64)
+            boundary[offset:stop] = arrays["phase"][left:end]
+            reference[offset:stop] = arrays["phase_mask"][left:end]
         return tuple(torch.from_numpy(a.copy()) for a in (x.T, mask, y, boundary, target_mask, reference))
 
 
@@ -74,9 +80,13 @@ def train(args):
         raise ValueError("Prepare a wrist-only dataset; waist datasets are not supported")
     if out.exists():
         raise FileExistsError(f"Refusing to overwrite {out}")
-    if args.epochs < 1 or args.batch_size < 1 or args.max_steps < 0:
+    if (args.epochs < 1 or args.batch_size < 1 or args.max_steps < 0 or args.patience < 1
+            or getattr(args, "tolerance_ms", 400) <= 0):
         raise ValueError("epochs/batch-size must be positive; max-steps must be nonnegative")
     if not args.station_only:
+        if manifest.get("reference_mode") == "labels" and (
+                manifest.get("version", 0) < 3 or not manifest.get("phase_order_validated")):
+            raise ValueError("Reprepare label references with the validated phase1 -> phase2 convention")
         if min(manifest["train_boundary_positives"]) == 0:
             raise ValueError("No training repetitions. Prepare with --reference-mode labels or supply references.")
         val_names = manifest["split"]["validation"]
@@ -85,10 +95,15 @@ def train(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    config = ModelConfig(stages=args.stages, layers=args.layers, channels=args.channels)
+    head = getattr(args, "repetition_head", "auto")
+    if head == "auto":
+        head = "phase" if manifest.get("reference_mode") == "labels" and not args.station_only else "boundary"
+    if head == "phase" and not manifest.get("phase_order_validated"):
+        raise ValueError("Dense phase training requires the validated phase convention; reprepare data")
+    config = ModelConfig(stages=args.stages, layers=args.layers, channels=args.channels, repetition_head=head)
     model = DenseMSTCN(config).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
-                               model.history_samples, args.window)
+                               model.history_samples, args.window, head)
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
@@ -101,9 +116,17 @@ def train(args):
     positives = np.asarray(manifest["train_boundary_positives"])
     positive_weights = np.clip((manifest["train_boundary_frames"] - positives) / np.maximum(positives, 1), 1, 100)
     positive_weights = torch.tensor(positive_weights, dtype=torch.float32, device=args.device)
+    phase_counts = np.asarray(manifest.get("train_phase_counts", [0, 0, 0]), dtype=float)
+    if head == "phase" and not args.station_only and min(phase_counts[1:]) == 0:
+        raise ValueError("No supervised phase1/phase2 training samples; reprepare phase targets")
+    phase_weights = np.where(phase_counts > 0, 1 / np.sqrt(np.maximum(phase_counts, 1)), 0)
+    phase_weights /= max(phase_weights[phase_weights > 0].mean() if phase_weights.any() else 0, 1e-12)
+    phase_weights = torch.tensor(phase_weights, dtype=torch.float32, device=args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     out.mkdir(parents=True)
-    history, best, stale = [], float("inf"), 0
+    history, best, stale = [], None, 0
+    selection_decoder = DecoderConfig()
+    tolerance = getattr(args, "tolerance_ms", 400)
     for epoch in range(1, args.epochs + 1):
         record = {"epoch": epoch}
         for split, loader in loaders.items():
@@ -114,7 +137,7 @@ def train(args):
                     x, mask, y, boundary, valid, reference = [a.to(args.device) for a in batch]
                     outputs = model(x, mask)
                     loss = dense_loss(outputs, y, boundary, valid, reference, weights, positive_weights,
-                                      boundary_weight=0 if args.station_only else 1)
+                                      boundary_weight=0 if args.station_only else 1, phase_weights=phase_weights)
                     if not torch.isfinite(loss):
                         raise RuntimeError("Nonfinite training loss")
                     if split == "train":
@@ -133,17 +156,28 @@ def train(args):
                         break
             record[f"{split}_loss"] = loss_sum / max(frames, 1)
             record[f"{split}_batches"] = batches
+        if args.station_only:
+            key = (-record["validation_loss"],)
+        else:
+            cache = validation_cache(model, root, manifest, args.device)
+            summary = score_cache(cache, selection_decoder, tolerance, require_station=False)
+            record["validation_segmentation"] = summary
+            key = checkpoint_key(summary)
         history.append(record)
         print(json.dumps(record), flush=True)
-        if record["validation_loss"] < best:
-            best, stale = record["validation_loss"], 0
-            checkpoint = {"version": 1, "model": model.state_dict(), "config": configuration(model),
+        if best is None or key > best:
+            best, stale = key, 0
+            checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
                           "normalization": manifest["normalization"], "classes": CLASSES, "features": FEATURES,
                           "location": manifest["location"], "station_only": args.station_only,
                           "reference_mode": manifest.get("reference_mode"),
                           "reference_convention": manifest.get("reference_convention"),
                           "data_manifest_sha256": digest(root / "manifest.json"), "split": manifest["split"],
-                          "epoch": epoch, "validation_loss": best, "seed": args.seed,
+                          "epoch": epoch, "validation_loss": record["validation_loss"], "seed": args.seed,
+                          "selection_rule": "validation loss" if args.station_only else
+                          "maximize station-independent repetition F1; tie-break by session count MAE",
+                          "selection_key": list(best), "selection_decoder": asdict(selection_decoder),
+                          "tolerance_ms": tolerance,
                           "partial_epoch_max_steps": args.max_steps}
             torch.save(checkpoint, out / "best.pt")
         else:
@@ -162,7 +196,9 @@ def load_checkpoint(path, device="cpu", data=None):
         raise ValueError("Checkpoint vocabulary/features are incompatible")
     if data is not None and digest(Path(data) / "manifest.json") != checkpoint["data_manifest_sha256"]:
         raise ValueError("Dataset manifest differs from the checkpoint's training dataset")
-    model = DenseMSTCN(ModelConfig(**checkpoint["config"])).to(device).eval()
+    configuration = dict(checkpoint["config"])
+    configuration.setdefault("repetition_head", "boundary")
+    model = DenseMSTCN(ModelConfig(**configuration)).to(device).eval()
     model.load_state_dict(checkpoint["model"])
     return model, checkpoint
 
@@ -170,7 +206,8 @@ def load_checkpoint(path, device="cpu", data=None):
 @torch.no_grad()
 def probabilities(model, x, valid, norm, device="cpu", chunk=512):
     """Offline replay of exact causal outputs, resetting all caches at each gap."""
-    p, q = np.zeros((len(x), len(CLASSES)), np.float32), np.zeros((len(x), 2), np.float32)
+    p = np.zeros((len(x), len(CLASSES)), np.float32)
+    q = np.zeros((len(x), model.config.repetition_classes), np.float32)
     mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
     for a, b in runs(valid):
         state = None
@@ -179,8 +216,36 @@ def probabilities(model, x, valid, norm, device="cpu", chunk=512):
             features = torch.tensor(((x[left:right] - mean) / std).T[None], device=device)
             station, boundary, state = model.stream(features, state)
             p[left:right] = station.softmax(1)[0].T.cpu().numpy()
-            q[left:right] = boundary.sigmoid()[0].T.cpu().numpy()
+            q[left:right] = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
     return p, q
+
+
+def checkpoint_key(summary):
+    return (summary["f1"], -summary["count_mae_all_station_sessions"])
+
+
+def validation_cache(model, root, manifest, device):
+    cache = []
+    model.eval()
+    for name in manifest["split"]["validation"]:
+        a = load_arrays(Path(root) / name)
+        if not a["coverage"].any():
+            continue
+        p, q = probabilities(model, a["x"], a["valid"], manifest["normalization"], device)
+        refs = json.loads((Path(root) / name / "references.json").read_text())
+        cache.append((name, a, p, q, refs))
+    return cache
+
+
+def score_cache(cache, config, tolerance, require_station=True):
+    scores, rows = [], []
+    for name, a, p, q, refs in cache:
+        result = decode_sequence(a["t"], p, q, a["valid"], config)
+        scored, _ = covered_repetitions(result["repetitions"], a["t"], a["coverage"],
+                                        refs, tolerance, require_station)
+        scores.append(repetition_metrics(scored, refs, tolerance, require_station))
+        rows.extend(count_rows(scored, refs, name, require_station))
+    return aggregate_repetitions(scores, rows)
 
 
 def decoder_config(path, checkpoint_path, default_tolerance=400):
@@ -202,6 +267,7 @@ def evaluate(args):
     out.mkdir(parents=True)
     pooled_cm = np.zeros((len(CLASSES), len(CLASSES)), np.int64)
     sessions, rep_results, counts, exercise_results = [], [], [], {name: [] for name in CLASSES[1:] if name != "plank"}
+    segmentation_results, session_counts = [], []
     for name in manifest["split"][args.split]:
         arrays = load_arrays(root / name)
         p, q = probabilities(model, arrays["x"], arrays["valid"], ckpt["normalization"], args.device)
@@ -216,14 +282,22 @@ def evaluate(args):
                   **false_exercise_events(arrays["y"], predicted, arrays["valid"]),
                   "eligible_samples": int(arrays["valid"].sum()),
                   "reference_samples": int(arrays["coverage"].sum())}
-        scored, unscored = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"])
+        references = json.loads((root / name / "references.json").read_text())
+        scored, unscored = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"],
+                                               references, tolerance)
         if arrays["coverage"].any() and not ckpt["station_only"]:
-            references = json.loads((root / name / "references.json").read_text())
             metric = repetition_metrics(scored, references, tolerance)
             rows = count_rows(scored, references, name)
             result["repetitions"] = aggregate_repetitions([metric], rows)
             rep_results.append(metric)
             counts.extend(rows)
+            detected, _ = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"],
+                                               references, tolerance, require_station=False)
+            detection = repetition_metrics(detected, references, tolerance, require_station=False)
+            detection_rows = count_rows(detected, references, name, require_station=False)
+            result["segmentation"] = aggregate_repetitions([detection], detection_rows)
+            segmentation_results.append(detection)
+            session_counts.extend(detection_rows)
             for station in exercise_results:
                 metric = repetition_metrics([r for r in scored if r["station"] == station],
                                             [r for r in references if r["station"] == station], tolerance)
@@ -239,14 +313,16 @@ def evaluate(args):
     report = {"split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
               "reference_mode": manifest.get("reference_mode"),
               "reference_convention": manifest.get("reference_convention"),
+              "phase_order_validated": manifest.get("phase_order_validated", False),
               "sensor_policy": manifest.get("wrist_selection"),
               "classification": classification_metrics(pooled_cm),
               "false_exercise_events": events, "rest_hours": hours,
               "false_exercise_events_per_rest_hour": events / hours if hours else None,
               "repetitions": aggregate_repetitions(rep_results, counts), "per_subject_session": sessions,
+              "segmentation": aggregate_repetitions(segmentation_results, session_counts),
               "per_exercise": {s: aggregate_repetitions(r, [c for c in counts if c["station"] == s])
                                for s, r in exercise_results.items()},
-              "latency_note": "Causal sample-time replay; matched delays include model timing error, not compute or sensor transport. Early reports and missed reps do not satisfy the <1 s target.",
+              "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
               "coverage_note": "Repetition counts refer only to certified, available intervals, not unannotated whole sessions.",
               "limitations": "One session per subject; uneven exercise and demographic coverage. NULL is category-relative rest, not a learned unknown-exercise class.",
               "excluded_sessions": manifest["excluded"]}
@@ -261,35 +337,25 @@ def tune(args):
     model, ckpt = load_checkpoint(args.checkpoint, args.device, root)
     if ckpt["station_only"]:
         raise ValueError("A station-only checkpoint cannot tune repetition boundaries")
-    cache = []
-    for name in ckpt["split"]["validation"]:
-        a = load_arrays(root / name)
-        if not a["coverage"].any():
-            continue
-        p, q = probabilities(model, a["x"], a["valid"], ckpt["normalization"], args.device)
-        refs = json.loads((root / name / "references.json").read_text())
-        cache.append((name, a, p, q, refs))
+    manifest = json.loads((root / "manifest.json").read_text())
+    cache = validation_cache(model, root, manifest, args.device)
     if not cache or not sum(len(c[-1]) for c in cache):
         raise ValueError("No validated validation repetitions available for threshold selection")
     trials, best_key, best_config = [], None, None
     for event in (.35, .5, .65):
         for station in (.3, .5, .7):
-            config = DecoderConfig(start_threshold=event, end_threshold=event, station_threshold=station)
-            scores, rows = [], []
-            for name, a, p, q, refs in cache:
-                result = decode_sequence(a["t"], p, q, a["valid"], config)
-                scored, _ = covered_repetitions(result["repetitions"], a["t"], a["coverage"])
-                scores.append(repetition_metrics(scored, refs, args.tolerance_ms))
-                rows.extend(count_rows(scored, refs, name))
-            summary = aggregate_repetitions(scores, rows)
-            key = (summary["f1"], -summary["count_mae_all_station_sessions"])
+            config = DecoderConfig(start_threshold=event, end_threshold=event,
+                                   phase_threshold=event, station_threshold=station)
+            summary = score_cache(cache, config, args.tolerance_ms, require_station=False)
+            labelled = score_cache(cache, config, args.tolerance_ms)
+            key = (*checkpoint_key(summary), labelled["f1"])
             trials.append({"event_threshold": event, "station_threshold": station,
-                           "f1": summary["f1"], "count_mae": -key[1]})
+                           "f1": summary["f1"], "count_mae": -key[1], "station_labelled_f1": labelled["f1"]})
             if best_key is None or key > best_key:
                 best_key, best_config = key, config
     result = {"selected_on": "validation", "checkpoint_sha256": digest(args.checkpoint),
               "sessions": ckpt["split"]["validation"], "tolerance_ms": args.tolerance_ms,
-              "selection_rule": "maximize repetition F1, break ties with count MAE; fixed declared tolerance",
+              "selection_rule": "maximize station-independent repetition F1, then session count MAE, then station-labelled F1; fixed tolerance",
               "config": asdict(best_config), "trials": trials}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     write_json(args.output, result)
@@ -318,7 +384,8 @@ def predict(args):
     x = (x - np.array(norm["mean"], np.float32)) / np.array(norm["std"], np.float32)
     out.mkdir(parents=True)
     decoder, repetitions, latencies = RepDecoder(config), [], []
-    all_p, all_q = np.zeros((len(t), len(CLASSES)), np.float32), np.zeros((len(t), 2), np.float32)
+    all_p = np.zeros((len(t), len(CLASSES)), np.float32)
+    all_q = np.zeros((len(t), model.config.repetition_classes), np.float32)
     # Break at actual missing clocks; no interpolation and no phantom cycles.
     edges = np.r_[0, np.flatnonzero(np.diff(t) != DT_MS) + 1, len(t)]
     with (out / "events.jsonl").open("w") as event_file:
@@ -333,7 +400,7 @@ def predict(args):
                 started = time.perf_counter()
                 station, boundary, state = model.stream(features, state)
                 p = station.softmax(1)[0].T.cpu().numpy()
-                q = boundary.sigmoid()[0].T.cpu().numpy()
+                q = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
                 if ckpt["station_only"]:
                     q[:] = 0
                 all_p[left:right], all_q[left:right] = p, q
@@ -344,17 +411,20 @@ def predict(args):
                 latencies.append(elapsed_ms)
                 for event in batch_events:
                     event["compute_ms"] = elapsed_ms
-                    event["buffer_delay_ms"] = event["reported_at_ms"] - event["end_ms"]
-                    event["report_delay_from_predicted_end_ms"] = event["buffer_delay_ms"] + elapsed_ms
+                    event["decoder_delay_ms"] = config.lag_frames * DT_MS
+                    event["buffer_delay_ms"] = event["reported_at_ms"] - event["end_ms"] - event["decoder_delay_ms"]
+                    event["report_delay_from_predicted_end_ms"] = event["reported_at_ms"] - event["end_ms"] + elapsed_ms
                     event_file.write(json.dumps(event) + "\n")
                 if batch_events:
                     event_file.flush()
                 repetitions.extend(batch_events)
     with (out / "frames.csv").open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["sync_timestamp", "predicted_station", "confidence", "start_probability", "end_probability"])
+        rep_columns = (["phase_null_probability", "phase1_probability", "phase2_probability"]
+                       if model.config.repetition_head == "phase" else ["start_probability", "end_probability"])
+        writer.writerow(["sync_timestamp", "predicted_station", "confidence", *rep_columns])
         for clock, p, q in zip(t, all_p, all_q):
-            writer.writerow([int(clock), CLASSES[int(p.argmax())], float(p.max()), float(q[0]), float(q[1])])
+            writer.writerow([int(clock), CLASSES[int(p.argmax())], float(p.max()), *map(float, q)])
     holds = decode_sequence(t, all_p, np.zeros_like(all_q), np.ones(len(t), bool), config)["holds"]
     summary = {"repetitions": repetitions, "counts": dict(Counter(r["station"] for r in repetitions)),
                "holds": holds, "sets": group_sets(repetitions, config.set_gap_ms),
@@ -363,6 +433,7 @@ def predict(args):
                "compute_ms_p50": float(np.percentile(latencies, 50)),
                "compute_ms_p95": float(np.percentile(latencies, 95)),
                "compute_ms_max": max(latencies), "maximum_buffer_delay_ms": (args.chunk - 1) * DT_MS,
+               "decoder_confirmation_delay_ms": config.lag_frames * DT_MS,
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
     write_json(out / "predictions.json", summary)
     return summary
@@ -379,8 +450,8 @@ def run_pipeline(args):
     root = Path(args.data) if args.data else out / "data"
     if args.data:
         manifest = json.loads((root / "manifest.json").read_text())
-        if manifest.get("version", 0) < 2 or manifest["location"] != args.location:
-            raise ValueError("--data must be a current wrist dataset matching --location")
+        if manifest.get("version", 0) < 3 or manifest["location"] != args.location:
+            raise ValueError("Reprepare --data with dense phase targets and the validated phase1 -> phase2 convention")
         if manifest.get("reference_mode") != "labels":
             raise ValueError("The run command expects references derived from label.csv")
     else:
@@ -390,7 +461,7 @@ def run_pipeline(args):
     common = ["--device", args.device, "--threads", str(args.threads)]
     main(["train", "--data", str(root), "--output", str(out / "model"),
           "--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
-          "--seed", str(args.seed), *common])
+          "--seed", str(args.seed), "--tolerance-ms", str(args.tolerance_ms), *common])
     checkpoint = str(out / "model" / "best.pt")
     main(["tune", "--data", str(root), "--checkpoint", checkpoint,
           "--tolerance-ms", str(args.tolerance_ms), "--output", str(out / "decoder.json"), *common])
@@ -398,3 +469,64 @@ def run_pipeline(args):
           "--decoder", str(out / "decoder.json"), "--split", "test",
           "--output", str(out / "test"), *common])
     print(f"Wrist experiment complete. Report: {out / 'test' / 'report.json'}", flush=True)
+
+
+def cross_validate(args):
+    """Each subject is tested once; fitting and threshold tuning stay within folds."""
+    from argparse import Namespace
+
+    root, out = Path(args.data).resolve(), Path(args.output)
+    if out.exists():
+        raise FileExistsError(out)
+    if args.station_only:
+        raise ValueError("Repetition cross-validation requires a repetition head")
+    manifest = json.loads((root / "manifest.json").read_text())
+    if manifest.get("version", 0) < 3:
+        raise ValueError("Reprepare the dataset with the validated phase convention before cross-validation")
+    splits = subject_folds(manifest["sessions"], args.folds, args.seed)
+    reports, metrics, counts, detection_metrics, detection_counts = [], [], [], [], []
+    cm = np.zeros((len(CLASSES), len(CLASSES)), np.int64)
+    for index, split in enumerate(splits):
+        fold = out / f"fold_{index + 1}"
+        data = fold / "data"
+        data.mkdir(parents=True)
+        # Immutable session arrays are shared. Each fold owns its manifest,
+        # training normalization, class weights, checkpoint and decoder.
+        for session in manifest["sessions"]:
+            (data / session["session"]).symlink_to(root / session["session"], target_is_directory=True)
+        fold_manifest = {**manifest, "split": split, "seed": args.seed,
+                         "cross_validation": {"fold": index + 1, "folds": args.folds}}
+        fold_manifest.update(training_statistics(root, split["train"]))
+        write_json(data / "manifest.json", fold_manifest)
+        params = {**vars(args), "data": data, "output": fold / "model"}
+        checkpoint = train(Namespace(**params))
+        params.update(checkpoint=checkpoint, output=fold / "decoder.json")
+        tune(Namespace(**params))
+        params.update(decoder=fold / "decoder.json", split="test", output=fold / "test")
+        report = evaluate(Namespace(**params))
+        reports.append({"fold": index + 1, "split": split, "repetitions": report["repetitions"],
+                        "segmentation": report["segmentation"]})
+        cm += np.array(report["classification"]["confusion_matrix"])
+        for name in split["test"]:
+            a = load_arrays(root / name)
+            if not a["coverage"].any():
+                continue
+            refs = json.loads((root / name / "references.json").read_text())
+            predicted = json.loads((fold / "test" / f"{name}.json").read_text())["repetitions"]
+            for require_station, scores, rows in ((True, metrics, counts),
+                                                   (False, detection_metrics, detection_counts)):
+                scored, _ = covered_repetitions(predicted, a["t"], a["coverage"], refs,
+                                                 args.tolerance_ms, require_station)
+                scores.append(repetition_metrics(scored, refs, args.tolerance_ms, require_station))
+                rows.extend(count_rows(scored, refs, name, require_station))
+        write_json(out / "folds.json", reports)
+    f1 = [r["segmentation"]["f1"] for r in reports if r["segmentation"]["status"] == "scored"]
+    result = {"folds": reports, "classification": classification_metrics(cm),
+              "repetitions": aggregate_repetitions(metrics, counts),
+              "segmentation": aggregate_repetitions(detection_metrics, detection_counts),
+              "fold_segmentation_f1_mean": float(np.mean(f1)) if f1 else None,
+              "fold_segmentation_f1_std": float(np.std(f1, ddof=1)) if len(f1) > 1 else None,
+              "seed": args.seed, "timing_tolerance_ms": args.tolerance_ms,
+              "protocol": "Subject-disjoint outer test folds; next fold validates; remaining folds train. Each subject tested exactly once. Normalization and loss weights refit on training subjects. Checkpoint and decoder selected only on validation."}
+    write_json(out / "report.json", result)
+    return result

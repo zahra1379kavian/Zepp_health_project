@@ -38,18 +38,20 @@ def false_exercise_events(target, predicted, valid):
             if rest_samples else None}
 
 
-def match_repetitions(predictions, references, tolerance_ms=400):
+def match_repetitions(predictions, references, tolerance_ms=400, require_station=True):
     """Maximum-cardinality matching, then minimum total start/end error.
 
-    Both endpoints must be within tolerance and the predicted station must agree.
+    Both endpoints must be within tolerance. Station agreement is optional so
+    repetition segmentation can be assessed independently of station recognition.
     No reference station is ever used in inference or decoding.
     """
     if tolerance_ms <= 0:
         raise ValueError("Matching tolerance must be positive")
     matches = []
-    for name in CLASSES[1:]:
-        pi = [i for i, row in enumerate(predictions) if row["station"] == name]
-        ri = [i for i, row in enumerate(references) if row["station"] == name]
+    names = sorted({r["station"] for r in references}) if require_station else [None]
+    for name in names:
+        pi = [i for i, row in enumerate(predictions) if name is None or row["station"] == name]
+        ri = [i for i, row in enumerate(references) if name is None or row["station"] == name]
         if not pi or not ri:
             continue
         pa = np.array([[predictions[i]["start_ms"], predictions[i]["end_ms"]] for i in pi])
@@ -63,8 +65,8 @@ def match_repetitions(predictions, references, tolerance_ms=400):
     return matches
 
 
-def repetition_metrics(predictions, references, tolerance_ms=400):
-    pairs = match_repetitions(predictions, references, tolerance_ms)
+def repetition_metrics(predictions, references, tolerance_ms=400, require_station=True):
+    pairs = match_repetitions(predictions, references, tolerance_ms, require_station)
     tp, fp, fn = len(pairs), len(predictions) - len(pairs), len(references) - len(pairs)
     start_errors = [abs(predictions[p]["start_ms"] - references[r]["start_ms"]) for p, r in pairs]
     end_errors = [abs(predictions[p]["end_ms"] - references[r]["end_ms"]) for p, r in pairs]
@@ -76,24 +78,37 @@ def repetition_metrics(predictions, references, tolerance_ms=400):
             "start_mae_ms": float(np.mean(start_errors)) if pairs else None,
             "end_mae_ms": float(np.mean(end_errors)) if pairs else None,
             "report_delay_mean_ms": float(np.mean(delays)) if pairs else None,
+            "matched_reported_before_1s_fraction": float(np.mean(np.array(delays) < 1000)) if pairs else None,
+            "matched_early_report_fraction": float(np.mean(np.array(delays) < 0)) if pairs else None,
             "matched_reported_0_to_999ms_fraction": float(np.mean([(0 <= d < 1000) for d in delays])) if pairs else None,
             "start_errors_ms": start_errors, "end_errors_ms": end_errors, "report_delays_ms": delays}
 
 
-def covered_repetitions(predictions, t, coverage):
+def covered_repetitions(predictions, t, coverage, references=(), tolerance_ms=400,
+                        require_station=True):
+    """Match first; coverage can exclude only unmatched predictions.
+
+    Retain matches across coverage edges within the declared timing tolerance,
+    including accepted references whose shared endpoint abuts an exclusion.
+    """
+    matched = {p for p, _ in match_repetitions(predictions, references, tolerance_ms, require_station)}
     intervals = [(int(t[a]), int(t[b-1] + DT_MS)) for a, b in runs(coverage)]
     scored, unscored = [], []
-    for rep in predictions:
+    for i, rep in enumerate(predictions):
         inside = any(a <= rep["start_ms"] < rep["end_ms"] < b for a, b in intervals)
-        (scored if inside else unscored).append(rep)
+        (scored if i in matched or inside else unscored).append(rep)
     return scored, unscored
 
 
-def count_rows(predictions, references, session):
+def count_rows(predictions, references, session, require_station=True):
     p, r = Counter(x["station"] for x in predictions), Counter(x["station"] for x in references)
+    if not require_station:
+        p, r = Counter({"all": len(predictions)}), Counter({"all": len(references)})
+    names = [n for n in CLASSES[1:] if n != "plank"] if require_station else ["all"]
+    names += sorted((set(p) | set(r)) - set(names))
     return [{"session": session, "station": name, "predicted": p[name], "reference": r[name],
              "absolute_error": abs(p[name] - r[name]), "exact": p[name] == r[name]}
-            for name in CLASSES[1:] if name != "plank"]
+            for name in names]
 
 
 def aggregate_repetitions(results, counts):
@@ -111,6 +126,8 @@ def aggregate_repetitions(results, counts):
             "start_mae_ms": float(np.mean(starts)) if starts else None,
             "end_mae_ms": float(np.mean(ends)) if ends else None,
             "report_delay_mean_ms": float(np.mean(delays)) if delays else None,
+            "matched_reported_before_1s_fraction": float(np.mean(np.array(delays) < 1000)) if delays else None,
+            "matched_early_report_fraction": float(np.mean(np.array(delays) < 0)) if delays else None,
             "matched_reported_0_to_999ms_fraction": float(np.mean([(0 <= d < 1000) for d in delays])) if delays else None,
             "count_mae_all_station_sessions": float(np.mean([r["absolute_error"] for r in counts])) if counts else None,
             "exact_count_accuracy_all_station_sessions": float(np.mean([r["exact"] for r in counts])) if counts else None,
