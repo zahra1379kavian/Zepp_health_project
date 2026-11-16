@@ -1,8 +1,8 @@
 """PCA + locally autocorrelation-guided peak counting from RecoFit (2014).
 
 Filter order/ripple, PCA polarity and AC context size are explicit implementation
-choices because the paper does not specify them. The interval conversion is an
-additional symmetric-period heuristic, not a result claimed by RecoFit.
+choices because the paper does not specify them. Reference-calibrated interval
+conversion is an additional adaptation, not a result claimed by RecoFit.
 """
 
 from dataclasses import dataclass
@@ -52,7 +52,7 @@ def select_peaks(values, periods, minimum_distance):
 
 
 def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=CounterConfig()):
-    """Count an observed buffer; return sample index, local period and amplitude."""
+    """Return peaks with sample index, local period, amplitude and PCA sign axis."""
     if not (0 < min_period_s < max_period_s):
         raise ValueError("Expected 0 < min_period < max_period")
     x = np.asarray(filtered_acceleration, np.float64)
@@ -62,7 +62,8 @@ def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=Counte
     maximum = max(minimum+1, int(np.floor(max_period_s*FS)))
     if len(x) <= minimum+2:
         return []
-    signal = pc1(x)
+    signal, axis = pc1(x, return_axis=True)
+    polarity_axis = int(np.argmax(np.abs(axis)))
     if np.ptp(signal) < 1e-8:
         return []
     candidates = [(int(p), float(signal[p])) for p in find_peaks(signal)[0]]
@@ -80,16 +81,19 @@ def count_peaks(filtered_acceleration, min_period_s, max_period_s, config=Counte
         return []
     threshold = config.amplitude_fraction*np.quantile([candidates[i][1] for i in chosen], .4)
     return [{"index": candidates[i][0], "period_samples": int(periods[i]),
-             "amplitude": candidates[i][1]} for i in chosen
+             "amplitude": candidates[i][1], "axis": polarity_axis} for i in chosen
             if candidates[i][1] > 0 and candidates[i][1] >= threshold]
 
 
 def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
-           config=CounterConfig()):
+           config=CounterConfig(), *, boundary_offsets=None):
     """Counter consumes predicted labels only. Causal events are never retracted.
 
     Labels are stabilized by classify; a committed station change ends the set.
-    Boundary adaptation: peak +/- half the estimated period, rounded to 40 ms.
+    Boundary adaptation: training-fitted start/end offsets from the peak, scaled
+    by the local period and rounded to 40 ms. Offsets are for this sensor wrist,
+    indexed by station and the PCA axis used to choose polarity. Uncalibrated
+    peaks remain count-only diagnostics; they do not acquire invented boundaries.
     Emit only when that full interval has been observed. No artificial EOF cycle.
     """
     from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
@@ -97,7 +101,8 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
         raise ValueError("Invalid decode mode or step")
     t, labels, valid = np.asarray(t), np.asarray(labels), np.asarray(valid, bool)
     filtered = bandpass(acceleration, valid)
-    repetitions, holds, peaks = [], [], []
+    repetitions, holds, peaks, uncalibrated = [], [], [], set()
+    boundary_offsets = boundary_offsets or {}
     boundaries = np.r_[0, np.flatnonzero((labels[1:] != labels[:-1]) |
                                         (valid[1:] != valid[:-1]))+1, len(t)]
     for a, b in zip(boundaries[:-1], boundaries[1:]):
@@ -118,10 +123,17 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
                 peak, period = left+row["index"], row["period_samples"]
                 if mode == "causal" and peak-last_peak < config.spacing_fraction*max(2, min(period, last_period)):
                     continue
-                start, end = peak-period//2, peak+(period-period//2)
                 if mode == "offline":
                     peaks.append({"station": name, "peak_ms": int(t[peak]),
                                   "period_ms": int(period*DT_MS)})
+                offsets = boundary_offsets.get(name, {}).get(str(row["axis"]))
+                if offsets is None:
+                    uncalibrated.add(name)
+                    continue
+                start = peak+int(round(period*offsets["start_periods"]))
+                end = peak+int(round(period*offsets["end_periods"]))
+                if end <= start:
+                    continue
                 if start < a or end >= b or end > tick:
                     continue
                 if mode == "causal" and t[tick]-t[end] < config.confirmation_ms:
@@ -129,11 +141,12 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
                 report = int(t[tick]) if mode == "causal" else int(t[-1])
                 repetitions.append({"station": name, "start_ms": int(t[start]), "end_ms": int(t[end]),
                                     "peak_ms": int(t[peak]), "period_ms": int(period*DT_MS),
-                                    "reported_at_ms": report, "boundary_method": "peak_plus_minus_half_period"})
+                                    "reported_at_ms": report, "boundary_method": "training_calibrated_peak_offsets"})
                 last_peak, last_period = peak, period
     repetitions.sort(key=lambda r: (r["reported_at_ms"], r["start_ms"]))
     from collections import Counter
     return {"repetitions": repetitions, "holds": holds,
             "counts_by_station": dict(Counter(r["station"] for r in repetitions)),
             "offline_peaks": peaks,
+            "uncalibrated_stations": sorted(uncalibrated),
             "offline_peak_counts_by_station": dict(Counter(r["station"] for r in peaks))}

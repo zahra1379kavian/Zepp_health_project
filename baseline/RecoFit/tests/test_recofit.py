@@ -10,10 +10,14 @@ import pandas as pd
 from baseline.RecoFit.counter import bandpass, count_peaks, decode
 from baseline.RecoFit.features import extract, filtered_inputs, pc1, window_ends
 from baseline.RecoFit.pipeline import (check_split, classify, evaluate, fit, fit_period_bounds,
-                                      infer, load_model, predict)
+                                      fit_boundary_offsets, infer, load_model, predict)
 from baseline.RecoFit.demo import synthetic_source
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
+from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
 from strength_training.temporal_segmentation.data import prepare, subject_folds
+
+
+# Explicit boundary calibration for the positive-X sine fixtures.
+SINE_OFFSETS = {"squat": {"0": {"start_periods": -.25, "end_periods": .75}}}
 
 
 def sine_signal(seconds=24, period=2., harmonic=0.):
@@ -64,9 +68,9 @@ class ClassificationTests(unittest.TestCase):
         periods = {"squat": {"min_s": 1.5, "max_s": 2.5}}
         for mode in ("causal", "offline"):
             with self.subTest(mode=mode):
-                expected = decode(t, x, clean, valid, periods, mode)
+                expected = decode(t, x, clean, valid, periods, mode, boundary_offsets=SINE_OFFSETS)
                 self.assertGreater(len(expected["repetitions"]), 8)
-                self.assertEqual(decode(t, x, labels, valid, periods, mode), expected)
+                self.assertEqual(decode(t, x, labels, valid, periods, mode, boundary_offsets=SINE_OFFSETS), expected)
 
     def test_vote_ties_keep_committed_station(self):
         squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
@@ -213,14 +217,14 @@ class SignalTests(unittest.TestCase):
         valid = np.ones(len(x), bool)
         labels = np.full(len(x), CLASSES.index("squat"))
         periods = {"squat": {"min_s": 1.5, "max_s": 2.5}}
-        full = decode(t, x, labels, valid, periods)
-        prefix = decode(t[:400], x[:400], labels[:400], valid[:400], periods)
+        full = decode(t, x, labels, valid, periods, boundary_offsets=SINE_OFFSETS)
+        prefix = decode(t[:400], x[:400], labels[:400], valid[:400], periods, boundary_offsets=SINE_OFFSETS)
         early = [r for r in full["repetitions"] if r["reported_at_ms"] <= t[399]]
         self.assertEqual(early, prefix["repetitions"])
         self.assertGreater(len(early), 3)
-        self.assertTrue(all(r["end_ms"] <= r["reported_at_ms"] for r in early))
+        self.assertTrue(all(r["end_ms"]+200 <= r["reported_at_ms"] for r in early))
         valid[300:330] = False
-        cut = decode(t, x, labels, valid, periods)
+        cut = decode(t, x, labels, valid, periods, boundary_offsets=SINE_OFFSETS)
         self.assertTrue(all(r["end_ms"] <= t[300] or r["start_ms"] >= t[330] for r in cut["repetitions"]))
 
     def test_plank_is_hold_and_tail_does_not_become_rep(self):
@@ -232,15 +236,115 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(result["repetitions"], [])
         self.assertEqual(result["holds"][0]["duration_ms"], 1000)
         labels[:] = CLASSES.index("squat")
-        result = decode(t, x, labels, valid, {"squat": {"min_s": 1.5, "max_s": 2.5}})
+        result = decode(t, x, labels, valid, {"squat": {"min_s": 1.5, "max_s": 2.5}},
+                        boundary_offsets=SINE_OFFSETS)
         self.assertEqual(result["repetitions"], [])
 
     def test_offline_peaks_and_interval_counts_are_separate(self):
         x = sine_signal()
         result = decode(np.arange(len(x))*40, x, np.full(len(x), CLASSES.index("squat")),
-                        np.ones(len(x), bool), {"squat": {"min_s": 1.5, "max_s": 2.5}}, mode="offline")
+                        np.ones(len(x), bool), {"squat": {"min_s": 1.5, "max_s": 2.5}}, mode="offline",
+                        boundary_offsets=SINE_OFFSETS)
         self.assertGreaterEqual(len(result["offline_peaks"]), len(result["repetitions"]))
         self.assertTrue(all(r["reported_at_ms"] == (len(x)-1)*40 for r in result["repetitions"]))
+
+
+class CalibrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.sessions = []
+
+    def stream(self, name, starts, duration, *, sign=1., axis=0, station="squat", length=1000,
+               side="left_wrist"):
+        folder = self.root/name
+        folder.mkdir()
+        t = np.arange(length)*DT_MS
+        x = np.zeros((length, 9))
+        x[:, axis] = sign*np.sin(np.arange(length)*2*np.pi/50)
+        arrays = {"t": t, "x": x, "y": np.full(length, CLASSES.index(station)),
+                  "valid": np.ones(length, bool), "coverage": np.ones(length, bool),
+                  "boundary": np.zeros((length, 2)), "probe": np.zeros(length, bool)}
+        for key, values in arrays.items():
+            np.save(folder/f"{key}.npy", values)
+        references = [{"station": station, "start_ms": start*DT_MS, "end_ms": (start+duration)*DT_MS}
+                      for start in starts]
+        (folder/"references.json").write_text(json.dumps(references))
+        self.sessions.append({"session": name, "side": side})
+        (self.root/"manifest.json").write_text(json.dumps({
+            "version": 4, "features": FEATURES, "classes": CLASSES,
+            "sample_period_ms": DT_MS, "sessions": self.sessions}))
+        return arrays
+
+    def test_periods_use_start_gaps_including_pauses_and_pool_gaps_for_singletons(self):
+        self.stream("train", [50, 190, 330], 90)
+        self.stream("singleton", [50], 10, station="push-up")
+        bounds = fit_period_bounds(self.root, ["train", "singleton"])
+        self.assertAlmostEqual(bounds["squat"]["min_s"], 5.6*.8)
+        self.assertAlmostEqual(bounds["squat"]["max_s"], 5.6*1.25)
+        self.assertEqual(bounds["squat"]["training_start_gaps"], 2)
+        self.assertEqual(bounds["push-up"]["source"], "pooled_training_start_gaps")
+        self.assertEqual(bounds["push-up"]["max_s"], bounds["squat"]["max_s"])
+        fallback = fit_period_bounds(self.root, ["singleton"])
+        self.assertEqual(fallback["push-up"]["source"], "fixed_fallback")
+
+    def test_period_pairs_never_cross_bouts_gaps_or_uncertified_samples(self):
+        arrays = self.stream("train", [50, 100, 150, 200, 250, 300], 40)
+        arrays["y"][110:120] = 0
+        arrays["y"][160:170] = CLASSES.index("push-up")
+        arrays["valid"][210:220] = False
+        arrays["coverage"][260:270] = False
+        for key in ("y", "valid", "coverage"):
+            np.save(self.root/"train"/f"{key}.npy", arrays[key])
+        result = fit_period_bounds(self.root, ["train"])["squat"]
+        self.assertEqual(result["training_start_gaps"], 1)
+        self.assertAlmostEqual(result["max_s"], 2.*1.25)
+
+    def test_boundary_calibration_resolves_opposite_wrist_phases_and_axis_changes(self):
+        starts = range(50, 900, 50)
+        self.stream("left", starts, 50)
+        self.stream("right", starts, 50, sign=-1., side="right_wrist")
+        self.stream("left_y", starts, 50, axis=1)
+        names = ["left", "right", "left_y"]
+        bounds = fit_period_bounds(self.root, names)
+        offsets = fit_boundary_offsets(self.root, names, bounds)
+        left = offsets["left_wrist"]["squat"]["0"]
+        right = offsets["right_wrist"]["squat"]["0"]
+        self.assertAlmostEqual(abs(left["start_periods"]-right["start_periods"]), .5, delta=.06)
+        # Different recording length/context from fitting; references are not passed to decode.
+        t = np.arange(1250)*DT_MS
+        labels, valid = np.full(len(t), CLASSES.index("squat")), np.ones(len(t), bool)
+        for side, sign, axis in (("left_wrist", 1., 0), ("right_wrist", -1., 0), ("left_wrist", 1., 1)):
+            x = np.zeros((len(t), 3))
+            x[:, axis] = sign*np.sin(np.arange(len(t))*2*np.pi/50)
+            for mode in ("causal", "offline"):
+                with self.subTest(side=side, axis=axis, mode=mode):
+                    result = decode(t, x, labels, valid, bounds, mode, boundary_offsets=offsets[side])
+                    rows = [r for r in result["repetitions"] if 4000 <= r["start_ms"] < 46000]
+                    self.assertGreater(len(rows), 15)
+                    for r in rows:
+                        expected = round(r["start_ms"]/2000)*2000
+                        self.assertLessEqual(abs(r["start_ms"]-expected), 200)
+                        self.assertLessEqual(abs(r["end_ms"]-(expected+2000)), 200)
+                        self.assertEqual(r["boundary_method"], "training_calibrated_peak_offsets")
+
+    def test_boundary_calibration_learns_active_duration_separately_from_period(self):
+        self.stream("train", range(50, 900, 50), 35)
+        bounds = fit_period_bounds(self.root, ["train"])
+        offsets = fit_boundary_offsets(self.root, ["train"], bounds)["left_wrist"]["squat"]["0"]
+        self.assertAlmostEqual(offsets["end_periods"]-offsets["start_periods"], .7, delta=.03)
+
+    def test_uncalibrated_polarity_has_no_symmetric_interval_fallback(self):
+        x = sine_signal()
+        t, valid = np.arange(len(x))*DT_MS, np.ones(len(x), bool)
+        labels = np.full(len(x), CLASSES.index("squat"))
+        bounds = {"squat": {"min_s": 1.5, "max_s": 2.5}}
+        for offsets in ({}, {"squat": {"1": SINE_OFFSETS["squat"]["0"]}}):
+            result = decode(t, x, labels, valid, bounds, "offline", boundary_offsets=offsets)
+            self.assertGreater(len(result["offline_peaks"]), 8)
+            self.assertEqual(result["repetitions"], [])
+            self.assertEqual(result["uncalibrated_stations"], ["squat"])
 
 
 class IntegrationTests(unittest.TestCase):
@@ -268,6 +372,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_period_bounds_never_use_heldout_references(self):
         original = fit_period_bounds(self.root/"data", self.model["split"]["train"])
+        offsets = fit_boundary_offsets(self.root/"data", self.model["split"]["train"], original)
         name = self.model["split"]["test"][0]
         file = self.root/"data"/name/"references.json"
         before = file.read_text()
@@ -276,19 +381,30 @@ class IntegrationTests(unittest.TestCase):
             references[0]["end_ms"] += 100000000
             file.write_text(json.dumps(references))
             self.assertEqual(original, fit_period_bounds(self.root/"data", self.model["split"]["train"]))
+            self.assertEqual(offsets, fit_boundary_offsets(self.root/"data", self.model["split"]["train"], original))
         finally:
             file.write_text(before)
+
+    def test_old_models_require_retraining_and_wrist_identity_is_explicit(self):
+        import joblib
+        legacy = {**self.model, "format": "recofit_wrist_v1"}
+        path = self.root/"legacy.joblib"
+        joblib.dump(legacy, path)
+        with self.assertRaisesRegex(ValueError, "Retrain"):
+            load_model(path)
+        with self.assertRaisesRegex(ValueError, "Specify side"):
+            infer(self.model, np.arange(10)*DT_MS, np.zeros((10, 9)), np.ones(10, bool))
 
     def test_inference_is_causal_and_invariant_to_unused_magnetometer(self):
         path = self.root/"data"/self.model["split"]["test"][0]
         t, x, valid = [np.load(path/f"{key}.npy") for key in ("t", "x", "valid")]
-        labels, full = infer(self.model, t, x, valid)
-        prefix_labels, prefix = infer(self.model, t[:500], x[:500], valid[:500])
+        labels, full = infer(self.model, t, x, valid, side="left_wrist")
+        prefix_labels, prefix = infer(self.model, t[:500], x[:500], valid[:500], side="left_wrist")
         np.testing.assert_array_equal(labels[:500], prefix_labels)
         self.assertEqual([r for r in full["repetitions"] if r["reported_at_ms"] <= t[499]],
                           prefix["repetitions"])
         x[:, 6:] = 999999
-        changed, result = infer(self.model, t, x, valid)
+        changed, result = infer(self.model, t, x, valid, side="left_wrist")
         np.testing.assert_array_equal(labels, changed)
         self.assertEqual(full["repetitions"], result["repetitions"])
 
@@ -299,12 +415,12 @@ class IntegrationTests(unittest.TestCase):
         frame = frame.drop(index=range(250, 260))
         sensor = self.root/"unlabelled.csv"
         frame.to_csv(sensor, index=False)
-        result = predict(self.path, sensor, self.root/"prediction")
+        result = predict(self.path, sensor, self.root/"prediction", side="left_wrist")
         self.assertEqual(result["reference_scoring"], "unscored_sensor_only_prediction")
         frames = pd.read_csv(self.root/"prediction"/"frames.csv")
         self.assertEqual(int((frames.available == 0).sum()), 10)
         with self.assertRaises(FileExistsError):
-            predict(self.path, sensor, self.root/"prediction")
+            predict(self.path, sensor, self.root/"prediction", side="left_wrist")
 
     def test_evaluation_reports_reference_metrics_and_paired_wrists(self):
         report, records = evaluate(self.root/"data", self.path, self.root/"test")

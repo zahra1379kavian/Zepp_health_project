@@ -75,6 +75,8 @@ Preparation reuses `strength_training.temporal_segmentation.data.prepare`:
 `prepare --references FILE` supports the existing side-specific external
 reference schema. `--reference-mode none` is an explicit unscored diagnostic;
 period limits then use fixed fallbacks when no training references exist.
+Without reference calibration, offline peaks can still be counted, but the
+counter does not produce repetition interval estimates.
 
 ## What follows the paper, and what is adapted
 
@@ -118,18 +120,37 @@ Explicit adaptations and assumptions:
    without rest must first outvote the segment's accumulated history, so its
    recognition delay can exceed 600 ms. Predictions already emitted are never
    relabeled. All learned station types remain candidates; no workout circuit
-   list is provided. Existing model files use this smoothing without retraining.
+   list is provided.
 4. Feature scaling fits training subjects only. A shared SVM C is selected from
    0.1, 1 and 10 by macro F1 on capped validation windows. This selection is
    a window-level diagnostic; the final reports score continuous recordings.
-   Period limits use training reference-duration 1st/99th percentiles, expanded
-   by 0.8/1.25, with a minimum of 240 ms. Missing classes use pooled training
-   durations, then fixed 0.5–8 second defaults if there are no references.
+   Period limits use the 1st/99th percentiles of **consecutive reference-start
+   gaps**, expanded by 0.8/1.25, with a minimum of 240 ms. This includes pauses
+   between repetitions. Pairs must belong to the same exercise bout and wrist
+   stream, with continuous valid, reference-covered samples between starts;
+   rest, another exercise, exclusions and sensor gaps break the pairing. Classes
+   without usable pairs use pooled training start gaps, then fixed 0.5–8 second
+   defaults (also expanded) if no training pairs exist. `training_start_gaps`
+   and `source` in `training.json` record the evidence behind each limit.
 5. The paper counts peaks; it does not define individual repetition start/end
-   times. Here **start/end are estimated as peak ± half the local period**,
-   rounded to the 40 ms grid. These estimates need measurement against your
-   phase-derived references. They cannot establish completion or reliably
-   resolve pauses. They are not the phase-boundary output of the temporal model.
+   times. Here **start and end offsets from the peak are calibrated separately
+   on training references**, as fractions of the local period, then rounded to
+   the 40 ms grid. Calibration is separate for each exercise, wrist and dominant
+   PCA loading axis, whose positive sign chooses the peak phase. Opposite wrist
+   phases are therefore not averaged together, and active duration need not equal
+   start-to-start spacing. Training uses overlapping buffers of at most 30 seconds;
+   each reference contributes at most once per axis, and cycles containing
+   multiple retained peaks are excluded from calibration. Median offsets and
+   calibration counts are saved in `training.json` and the model. A missing
+   calibration has no symmetric-period fallback: its peaks have no estimated
+   interval, and the station appears in `uncalibrated_stations`. These learned
+   offsets correct systematic phase shifts, but cannot track every change in
+   wrist orientation, cadence or pause duration. Timing still needs held-out
+   measurement; these are not the temporal model's phase-boundary predictions.
+
+These corrections require newly fitted **v2 models**. Loading a v1 model asks
+for retraining because its duration-based period limits and symmetric interval
+estimates cannot be corrected from the saved classifiers alone.
 
 This is a documented reimplementation and adaptation, not the authors' original
 source or an exact reproduction of their reported experiment.
@@ -202,9 +223,14 @@ channels. Accelerometer and gyro channels are used; magnetometer channels are
 ignored. Wrist CSV gaps are restored as unavailable grid samples and reset
 processing. Raw prediction reads no labels or workout logs and is unscored.
 It writes `predictions.json`, timestamped `events.jsonl`, and `frames.csv`.
+The sensor wrist selects its training calibration. Prediction infers it from
+`left_wrist.csv` / `right_wrist.csv` or a model trained on only one wrist; for
+other filenames with a two-wrist model, provide `--side left_wrist` or
+`--side right_wrist`. Python callers pass `side=` to `infer` or `predict`.
 
 Each event contains `station`, `start_ms`, `end_ms`, `peak_ms`, `period_ms`,
 `reported_at_ms`, and `boundary_method`. Intervals use `[start_ms, end_ms)`.
+Calibrated events use `boundary_method: training_calibrated_peak_offsets`.
 `counts_by_station` counts these estimated complete intervals; edge peaks can
 therefore appear in offline peak counts without becoming complete intervals.
 The method predicts known training station types and NULL. NULL is the project's
@@ -227,7 +253,10 @@ python -m unittest baseline.RecoFit.tests.test_recofit -v
 python -m baseline.RecoFit demo --output baseline/RecoFit/runs/demo
 ```
 
-The tests check regular/double peaks, local tempo changes, constant inputs,
+The tests check start-gap limits with pauses and bout/gap/coverage resets,
+wrist/axis-specific boundary calibration, separate active durations, missing
+calibration, legacy-model rejection, regular/double peaks, local tempo changes,
+constant inputs,
 future independence, station-vote stability under brief/alternating errors,
 sustained station changes, vote resets at rest/gaps, preserved repetition counts,
 exclusion/gap resets, absent/incomplete cycles, phase-label
@@ -239,4 +268,8 @@ sensor-only prediction. Synthetic results do not establish real accuracy.
 A capped fit was also checked on the existing real version-4 data, followed by
 180 seconds of held-out replay in both modes. Generated smoke-test artifacts
 are under `baseline/RecoFit/runs/real_smoke/` locally and excluded from version control.
+The v2 period/boundary corrections were also checked with a new capped fit on
+the 57 training streams and 180-second excerpts from two held-out streams in
+both modes. This checks integration, not timing accuracy; some polarity axes
+absent from calibration correctly produced no interval estimates.
 The full five-fold real-data experiment has not been run as part of implementation.

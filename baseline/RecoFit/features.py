@@ -11,8 +11,8 @@ from scipy.signal import butter, find_peaks, sosfilt, sosfilt_zi
 FS = 25
 
 
-def pc1(x):
-    """Deterministic PCA; accepts (..., time, axes), including constant inputs."""
+def pc1(x, *, return_axis=False):
+    """Deterministic PCA on (..., time, axes); optionally return the signed axis."""
     centered = x - x.mean(axis=-2, keepdims=True)
     covariance = np.swapaxes(centered, -1, -2) @ centered
     _, vectors = np.linalg.eigh(covariance)
@@ -20,7 +20,8 @@ def pc1(x):
     largest = np.argmax(np.abs(axis), axis=-1)
     sign = np.take_along_axis(axis, largest[..., None], axis=-1)[..., 0]
     axis = axis * np.where(sign < 0, -1., 1.)[..., None]
-    return np.einsum("...tc,...c->...t", centered, axis)
+    signal = np.einsum("...tc,...c->...t", centered, axis)
+    return (signal, axis) if return_axis else signal
 
 
 def filtered_inputs(x, valid, cutoff=8.):

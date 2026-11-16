@@ -17,7 +17,7 @@ def main(argv=None):
     prepare.add_argument("--references", type=Path)
     prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels")
 
-    train = sub.add_parser("train", help="Fit SVMs/period bounds on training subjects; select C on validation")
+    train = sub.add_parser("train", help="Fit SVMs, period bounds and boundary offsets on training subjects")
     cv = sub.add_parser("cross-validate", help="Disjoint subject folds and pooled test metrics")
     run = sub.add_parser("run", help="Prepare if needed, then run subject-wise cross-validation")
     for p in (train, cv, run):
@@ -42,6 +42,8 @@ def main(argv=None):
     evaluate.add_argument("--split", choices=["test", "validation"], default="test")
     prediction = sub.add_parser("predict", help="Sensor-only wrist CSV prediction; embedded labels ignored")
     prediction.add_argument("--input", type=Path, required=True)
+    prediction.add_argument("--side", choices=["left_wrist", "right_wrist"],
+                            help="sensor wrist; inferred from left_wrist.csv/right_wrist.csv or a single-wrist model")
     for p in (evaluate, prediction):
         p.add_argument("--model", type=Path, required=True)
         p.add_argument("--output", type=Path, required=True)
@@ -64,7 +66,7 @@ def main(argv=None):
     else:
         from . import pipeline
         if args.command == "predict":
-            pipeline.predict(args.model, args.input, args.output, mode=args.mode)
+            pipeline.predict(args.model, args.input, args.output, mode=args.mode, side=args.side)
         elif args.command == "evaluate":
             pipeline.evaluate(args.data, args.model, args.output, split_name=args.split, mode=args.mode,
                               tolerance_ms=args.tolerance_ms, report_tolerances_ms=args.report_tolerances_ms)

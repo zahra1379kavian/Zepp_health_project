@@ -25,3 +25,7 @@ plan.md
 !/strength_training/temporal_segmentation/requirements.txt
 !/strength_training/temporal_segmentation/figures/workflow.prompt.txt
 
+# RecoFit workflow is a maintained documentation asset
+!/baseline/RecoFit/workflow.png
+!/baseline/RecoFit/workflow.prompt.txt
+

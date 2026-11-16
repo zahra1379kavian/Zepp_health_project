@@ -21,7 +21,7 @@ from strength_training.temporal_segmentation.metrics import (
     confusion_matrix, count_rows, false_exercise_events, grouped_stream_report, score_stream,
     reporting_tolerances,
 )
-from .counter import CounterConfig, decode
+from .counter import CounterConfig, bandpass, count_peaks, decode
 from .features import FS, feature_batches, filtered_inputs, window_ends
 
 
@@ -102,21 +102,86 @@ def classifier(x, y, c, seed):
 
 
 def fit_period_bounds(root, names):
-    durations = {name: [] for name in CLASSES[1:] if name != "plank"}
+    """Fit cycle spacing, including pauses, within certified training bouts."""
+    gaps = {name: [] for name in CLASSES[1:] if name != "plank"}
+    references = Counter()
     for stream in names:
-        for r in json.loads((Path(root)/stream/"references.json").read_text()):
-            durations[r["station"]].append((r["end_ms"]-r["start_ms"])/1000)
-    pooled = [v for values in durations.values() for v in values]
+        arrays = load_arrays(Path(root)/stream)
+        ordered = sorted(json.loads((Path(root)/stream/"references.json").read_text()),
+                         key=lambda r: r["start_ms"])
+        references.update(r["station"] for r in ordered if r["station"] in gaps)
+        for previous, current in zip(ordered[:-1], ordered[1:]):
+            name = current["station"]
+            if name not in gaps or previous["station"] != name:
+                continue
+            a, b = np.searchsorted(arrays["t"], [previous["start_ms"], current["start_ms"]])
+            if (a >= b or b >= len(arrays["t"]) or
+                    not arrays["valid"][a:b+1].all() or not arrays["coverage"][a:b+1].all() or
+                    not (arrays["y"][a:b+1] == CLASSES.index(name)).all()):
+                continue
+            gaps[name].append((current["start_ms"]-previous["start_ms"])/1000)
+    pooled = [v for values in gaps.values() for v in values]
     result = {}
-    for name, values in durations.items():
+    for name, values in gaps.items():
         source = values or pooled
         low, high = np.quantile(source, [.01, .99]) if source else (.5, 8.)
         minimum = max(.24, float(low)*.8)
         maximum = max(minimum+.08, float(high)*1.25)
-        result[name] = {"min_s": minimum, "max_s": maximum, "training_references": len(values),
-                        "source": "station_training_references" if values else
-                                  "pooled_training_references" if pooled else "fixed_fallback"}
+        result[name] = {"min_s": minimum, "max_s": maximum, "training_references": references[name],
+                        "training_start_gaps": len(values),
+                        "source": "station_training_start_gaps" if values else
+                                  "pooled_training_start_gaps" if pooled else "fixed_fallback"}
     return result
+
+
+def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig()):
+    """Calibrate peak phase and active duration using training references only.
+
+    Separate wrist/axis groups avoid averaging peaks at opposite motion phases.
+    Both endpoint offsets are learned independently as fractions of local period,
+    so a pause between cycles is not automatically included in the active interval.
+    Bounded overlapping buffers mirror the inference PCA context. Each reference
+    contributes at most once per polarity axis; ambiguous multi-peak cycles are
+    excluded. No cross-exercise or cross-wrist fallback can supply a missing phase.
+    """
+    root = Path(root)
+    sides = {s["session"]: s["side"] for s in manifest_at(root)["sessions"]}
+    samples = {}
+    for stream in names:
+        arrays = load_arrays(root/stream)
+        references = json.loads((root/stream/"references.json").read_text())
+        filtered = bandpass(arrays["x"], arrays["valid"])
+        buffer = int(config.buffer_seconds*FS)
+        seen = set()
+        for name in sorted({r["station"] for r in references} & period_bounds.keys()):
+            limits = period_bounds[name]
+            station_references = [r for r in references if r["station"] == name]
+            for a, b in runs(arrays["valid"] & (arrays["y"] == CLASSES.index(name))):
+                ticks = sorted(set(range(a+buffer-1, b, max(1, buffer//2))) | {b-1})
+                for tick in ticks:
+                    left = max(a, tick+1-buffer)
+                    peaks = count_peaks(filtered[left:tick+1], limits["min_s"], limits["max_s"], config)
+                    for i, reference in enumerate(station_references):
+                        start, end = np.searchsorted(arrays["t"],
+                                                     [reference["start_ms"], reference["end_ms"]])
+                        if start < left or end > tick or not arrays["coverage"][start:end+1].all():
+                            continue
+                        matches = [p for p in peaks if start <= left+p["index"] < end]
+                        if len(matches) != 1:
+                            continue
+                        row = matches[0]
+                        key = (name, i, row["axis"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        peak, period = left+row["index"], row["period_samples"]
+                        group = samples.setdefault(sides[stream], {}).setdefault(name, {}).setdefault(str(row["axis"]), [])
+                        group.append(((start-peak)/period, (end-peak)/period))
+    return {side: {name: {axis: {"start_periods": float(np.median(np.array(rows)[:, 0])),
+                               "end_periods": float(np.median(np.array(rows)[:, 1])),
+                               "training_references": len(rows)}
+                         for axis, rows in axes.items()} for name, axes in stations.items()}
+            for side, stations in samples.items()}
 
 
 def new_directory(path):
@@ -174,9 +239,13 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         if score > best_f1:
             best_f1, best = score, (binary, recognition, c)
     binary, recognition, c = best
-    model = {"format": "recofit_wrist_v1", "binary": binary, "recognition": recognition,
+    periods = fit_period_bounds(root, split["train"])
+    print("Calibrating repetition boundaries on training subjects", flush=True)
+    offsets = fit_boundary_offsets(root, split["train"], periods, counter_config)
+    model = {"format": "recofit_wrist_v2", "binary": binary, "recognition": recognition,
              "window_samples": window, "prediction_step": prediction_step_ms//DT_MS,
-             "confirm_steps": confirm_steps, "period_bounds": fit_period_bounds(root, split["train"]),
+             "confirm_steps": confirm_steps, "period_bounds": periods, "boundary_offsets": offsets,
+             "sensor_sides": sorted({s["side"] for s in manifest["sessions"] if s["session"] in split["train"]}),
              "counter_config": asdict(counter_config), "classes": CLASSES, "features": FEATURES,
              "sample_period_ms": DT_MS, "split": split, "seed": seed,
              "reference_convention": manifest.get("reference_convention"),
@@ -193,14 +262,19 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
                "window_seconds": window/FS, "prediction_step_ms": prediction_step_ms,
                "confirm_steps": confirm_steps, "counter_config": asdict(counter_config),
                "period_bounds": model["period_bounds"], "split": split,
+               "boundary_offsets": offsets, "sensor_sides": model["sensor_sides"],
                "reference_convention": model["reference_convention"],
-               "note": "Feature scaling and period bounds fit training subjects only; C selected on validation windows. No session exercise lists."})
+               "note": "Feature scaling, start-to-start period bounds and wrist/axis boundary offsets fit training subjects only; C selected on validation windows. No session exercise lists."})
     return output/"model.joblib"
 
 
 def load_model(path):
     model = joblib.load(path)
-    if (model.get("format") != "recofit_wrist_v1" or model.get("classes") != CLASSES or
+    if model.get("format") == "recofit_wrist_v1":
+        raise ValueError("Retrain this RecoFit model: v1 uses duration-based periods and uncalibrated symmetric boundaries")
+    if (model.get("format") != "recofit_wrist_v2" or "boundary_offsets" not in model or
+            "sensor_sides" not in model or
+            model.get("classes") != CLASSES or
             model.get("features") != FEATURES or model.get("sample_period_ms") != DT_MS):
         raise ValueError("Unsupported RecoFit model")
     return model
@@ -267,7 +341,11 @@ def classify(model, x, valid):
     return prediction
 
 
-def infer(model, t, x, valid, mode="causal"):
+def infer(model, t, x, valid, mode="causal", *, side=None):
+    if side is None and len(model["sensor_sides"]) == 1:
+        side = model["sensor_sides"][0]
+    if side not in ("left_wrist", "right_wrist"):
+        raise ValueError("Specify side='left_wrist' or side='right_wrist' for wrist-specific boundary calibration")
     t, x, valid = np.asarray(t), np.asarray(x), np.asarray(valid, bool).copy()
     if (not len(t) or x.shape != (len(t), len(FEATURES)) or valid.shape != t.shape or
             not np.isfinite(x[valid]).all() or np.any(np.diff(t) != DT_MS)):
@@ -275,11 +353,13 @@ def infer(model, t, x, valid, mode="causal"):
     start = time.perf_counter()
     labels = classify(model, x, valid)
     result = decode(t, x, labels, valid, model["period_bounds"], mode,
-                    model["prediction_step"], CounterConfig(**model["counter_config"]))
+                    model["prediction_step"], CounterConfig(**model["counter_config"]),
+                    boundary_offsets=model["boundary_offsets"].get(side, {}))
+    result["side"] = side
     result["mode"] = mode
     result["runtime"] = {"compute_seconds": time.perf_counter()-start,
                          "sensor_seconds": len(t)*DT_MS/1000}
-    result["boundary_note"] = "Intervals are symmetric local-period estimates around peaks, not phase boundaries from the original paper."
+    result["boundary_note"] = "Start/end offsets from peaks are calibrated on training references per exercise, wrist and PCA polarity axis, then scaled by local period. Uncalibrated peaks have no interval estimate. Residual timing error and pauses still require held-out measurement."
     result["latency_note"] = (
         "Causal sample-time replay; reported_at_ms includes classifier/counter waiting but excludes compute/transport. Deadline must be measured against reference ends."
         if mode == "causal" else "Offline full-session diagnostic; every event is marked available at the final observed timestamp.")
@@ -301,8 +381,8 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
     metadata, records = {s["session"]: s for s in manifest["sessions"]}, []
     for name in model["split"][split_name]:
         arrays = load_arrays(root/name)
-        labels, result = infer(model, arrays["t"], arrays["x"], arrays["valid"], mode)
         info = metadata[name]
+        labels, result = infer(model, arrays["t"], arrays["x"], arrays["valid"], mode, side=info["side"])
         record = {"session": name, "source_session": info["source_session"],
                   "subject": info["subject"], "side": info["side"],
                   "confusion_matrix": confusion_matrix(arrays["y"], labels, arrays["valid"]).tolist(),
@@ -336,15 +416,19 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
     return report, records
 
 
-def predict(model_path, input_path, output, *, mode="causal"):
+def predict(model_path, input_path, output, *, mode="causal", side=None):
+    if Path(output).exists():
+        raise FileExistsError(f"Refusing to overwrite {output}")
     model = load_model(model_path)
+    if side is None and Path(input_path).stem in ("left_wrist", "right_wrist"):
+        side = Path(input_path).stem
     sensor_t, sensor_x = load_sensor(input_path)  # only clocks + nine channels; labels ignored
     t = np.arange(sensor_t[0], sensor_t[-1]+DT_MS, DT_MS, dtype=np.int64)
     indices = ((sensor_t-t[0])//DT_MS).astype(int)
     x, valid = np.zeros((len(t), len(FEATURES)), np.float32), np.zeros(len(t), bool)
     x[indices], valid[indices] = sensor_x, True
+    labels, result = infer(model, t, x, valid, mode, side=side)
     out = new_directory(output)
-    labels, result = infer(model, t, x, valid, mode)
     result["input"] = str(Path(input_path).resolve())
     result["reference_scoring"] = "unscored_sensor_only_prediction"
     write_json(out/"predictions.json", result)

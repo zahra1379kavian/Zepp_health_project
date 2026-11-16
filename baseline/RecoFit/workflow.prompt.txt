@@ -1,0 +1,86 @@
+Use case: infographic-diagram
+Asset type: scientific workflow image documenting the current RecoFit-style wrist baseline.
+Primary request: Create a NEW pipeline figure matching the visual style of strength_training/temporal_segmentation/figures/workflow.png. Show all implementation stages in baseline/RecoFit, including preparation, fitting, sensor-only inference, peak counting, calibrated boundary estimation, and evaluation.
+Input image: style reference only. Replace all original workflow content; do not retain the temporal-model steps.
+
+Style: crisp, readable Times New Roman-style serif typography; teal rounded cards with dark teal title bands, white title text, green check badges, pale backgrounds, teal connectors, simple scientific mini-diagrams. Closely follow the reference's palette and visual hierarchy. Keep all text sharp and legible, with correct spelling. A check means an implemented stage, never validated real-world performance. Apply a small soft shadow only behind the final Evaluate + export card.
+Canvas: approximately 3072 x 1280 pixels, wide landscape. Twelve equal cards in two rows of six. Compact spacing and small outer margins; no large blank areas. No overall title, banner, caption, watermark, or decorative footer.
+Flow: top row numbered 1 through 6 from LEFT to RIGHT; connect 6 straight down to 7 at the FAR RIGHT of the bottom row; bottom row runs RIGHT to LEFT as 7, 8, 9, 10, 11, 12. Clearly show arrowheads between every adjacent step. This is a single snake-shaped reading path. Do not connect 1 directly to 12. Each card should contain a short title, the specified text, and a restrained illustrative diagram where space allows. Do not shrink text to fit excess decoration.
+
+Card 1, upper left:
+Title: "1. Load + align"
+Text: "25 Hz • sync_timestamp"; "Each wrist is a separate stream"; "Acceleration XYZ + gyro XYZ"
+Diagram: small wrist sensor and colored time-series traces. These are the six channels used by RecoFit; magnetometer is not used.
+
+Card 2:
+Title: "2. Mask + split"
+Text: "Exclusions + sensor gaps"; "5 subject-wise folds"; "Both wrists stay with subject"
+Diagram: masked strip and grouped subject icons.
+Small distinct reference-target box: "Phase1 → phase2 references"; "Fitting + scoring only"
+
+Card 3:
+Title: "3. Filter + window"
+Text: "Causal 8 Hz low-pass"; "5 s trailing windows"; "Training stride: 1 s"; "Prediction stride: 200 ms"
+Diagram: waveform with a shaded trailing window ending at the current sample. Do not show future samples inside the window.
+
+Card 4:
+Title: "4. Extract features"
+Two stacked feature boxes:
+"Exercise / rest: 224" / "8 signals × 28 features"
+"Station type: 60" / "aX, aYZPC1, gPC1 × 20"
+Small text: "Statistics • spectrum"; "Autocorrelation"
+These branches feed the corresponding classifiers.
+
+Card 5:
+Title: "5. Fit SVMs"
+Text: "StandardScaler + balanced"; "linear SVMs"; "Train-only feature scaling"
+Two small classifier boxes: "Exercise / rest" and "Station type"
+Text: "Validation selects C:"; "0.1, 1, 10"
+
+Card 6, upper right:
+Title: "6. Calibrate counter"
+Text: "Training references only"
+Two stacked mini-boxes:
+"Start-to-start gaps" / "→ station period bounds"
+"Station + wrist + PCA axis" / "→ start / end peak offsets"
+Use a small peak with independent left and right offset markers. Do not depict symmetric half-period boundaries.
+
+Card 7, lower right:
+Title: "7. Predict + smooth"
+Text: "Sensor-only causal replay"; "Exercise / rest: 3 decisions"; "Segment-wide station votes"; "New leader: 3 confirmations"; "Station / NULL → bouts"
+Small text: "Rest / change / gap ends bout"
+Diagram: short categorical strip with stable exercise blocks. These are predicted labels, never ground-truth inference inputs.
+
+Card 8, one position left of 7:
+Title: "8. Counting signal"
+Text: "Raw acceleration XYZ"; "0.15–11 Hz elliptic bandpass"; "Mean-center + PCA → PC1"; "Causal buffer: at most 30 s"; "Update every 200 ms"
+Diagram: three raw-acceleration traces merging into one PC1 trace. The counting signal comes from raw acceleration, independently of the classification low-pass.
+
+Card 9:
+Title: "9. Candidate peaks"
+Text: "Local maxima of PC1"; "Rank by amplitude"; "Reject spacing below"; "the minimum period"
+Diagram: PC1 waveform with several maxima; dim rejected nearby peaks and highlight retained candidates.
+
+Card 10:
+Title: "10. Refine peaks"
+Text: "Local autocorrelation → T"; "Keep spacing ≥ 0.75T"; "Keep positive amplitude"; "≥ 0.5 × P40"
+Small text: "P40: retained-peak amplitude" (40th percentile).
+Diagram: local autocorrelation curve marking the selected period T, plus a compact amplitude threshold indication. Spacing is enforced by amplitude-ranked peak rejection.
+
+Card 11:
+Title: "11. Emit + count"
+Text: "Start / end = peak"; "+ learned offset × T"; "40 ms grid"; "Wait until end + 200 ms"; "Freeze events • count by station"
+Small highlighted tag: "Plank → hold duration"
+Small text: "No calibration → no interval"
+Diagram: one peak, independently placed start and end ticks, and a repetition interval. Label the bracket between start and end "rep interval". Do not label that bracket T: T is the local cycle spacing, and the calibrated active interval can have a different duration. Offsets come from training, not held-out references.
+
+Card 12, lower left, main result with a subtle shadow:
+Title: "12. Evaluate + export"
+Text: "F1 • count MAE"; "Start / end errors • delay"; "False exercise events"; "By exercise / subject / wrist"; "JSON • JSONL • CSV"
+Small separated option box: "Offline option:"; "Whole-bout peak counts"
+Diagram: small clipboard or report sheet. Do not invent scores or imply measured accuracy.
+
+Scientific constraints: This documents the project's adapted RecoFit implementation, not an exact reproduction of the original paper. Classifier input is acceleration and gyro only. Training labels and phase references are targets used for fitting and scoring, never inference labels or repetition boundaries. Scaling, period bounds and peak offsets are fitted only on training subjects; SVM C is chosen on validation. NULL is category-relative rest. Boundary offsets depend on exercise, wrist and PCA polarity axis, and are scaled by local period. A missing calibration produces no interval. Causal counting uses only observations available so far, emits complete estimated intervals after a 200 ms wait, and freezes events. Offline counting is a separate whole-bout diagnostic. Do not claim phase-perfect boundaries, unseen-exercise recognition, real-world validation, or a sub-second latency guarantee.
+
+Generation method: built-in imagegen, with the existing workflow image as a style reference.
+Typography: Times New Roman requested; the generated raster font cannot be verified as an installed font.
