@@ -1,0 +1,14 @@
+# Local sensor datasets
+/strength_training/strength_training_data_clean/
+/strength_training/strength_training_data_aligned/
+
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.png
+*.csv
+
+# macOS metadata
+.DS_Store
+

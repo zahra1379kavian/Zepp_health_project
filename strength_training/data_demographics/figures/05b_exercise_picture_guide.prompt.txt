@@ -1,0 +1,20 @@
+Use case: scientific-educational.
+Asset type: an exercise-name picture dictionary to accompany a strength-training annotation timeline.
+Create a polished, very legible schematic reference poster on pure white, approximately 2048 by 2560 pixels, portrait orientation. Exactly 15 evenly spaced cards in a strict 3-column by 5-row grid. Title: "Exercise picture guide". Small subtitle: "Match the name to the movement". Short legend: "Gray = start   Teal = finish   Arrow = movement". Each card contains its exact English name in large bold dark navy type, a very simple anatomically correct human diagram with relevant gym equipment, and the exact short plain-English memory cue below. Use one consistent neutral adult human silhouette, navy outlines, gray starting position and teal finishing position, orange arrows. Show clear body posture and correct equipment; sparse, schematic instructional illustration, not a photograph. No busy gym background. Clear separation between panels. Enough space for every title and caption. Poses should be much larger than the text. No extra cards, no extra exercise names. Each panel should stand alone as a clear visual mnemonic, not technical coaching. Keep the person fully within its card.
+Exact row-major order, titles, captions, and motion:
+Row 1 column 1: "Squat"; "Sit down, then stand up". Side view, feet planted, hips and knees bend into squat then return standing.
+Row 1 column 2: "Deadlift"; "Lift the bar from the floor". Side view, hip hinge with a flat back holding a barbell near shins, then stand with bar at thighs.
+Row 1 column 3: "Lunges"; "Step forward, bend both knees". Side view, one foot far forward, lower back knee toward ground, then rise.
+Row 2 column 1: "Hip thrust"; "Raise your hips". Side view, shoulders supported on low bench, feet on ground, bent knees; hips low then lift to align torso and thighs horizontally.
+Row 2 column 2: "Bench press"; "Lie on a bench, push the bar up". Side view, person lying on bench, feet grounded, press barbell from chest upward above chest.
+Row 2 column 3: "Push-up"; "Push your body away from the floor". Side view, hands and toes on floor, straight torso, elbows bent then arms extended.
+Row 3 column 1: "Overhead press (OHP)"; "Push weights above your head". Standing with dumbbells at shoulders, then extend arms overhead.
+Row 3 column 2: "Dips"; "Lower and raise your body on bars". Parallel bars, hands beside hips supporting hanging body, bend elbows then straighten, feet off ground. Do not show a bench dip.
+Row 3 column 3: "Pull-up"; "Pull your body up to the bar". Fixed overhead bar, full hanging body with arms extended then elbows bent and chin near bar.
+Row 4 column 1: "Lat pulldown"; "Pull the high bar to your chest". Seated at a cable machine, long overhead bar pulled down to upper chest in front of the face, thighs under pad. Show the cable and high pulley.
+Row 4 column 2: "Rowing"; "Pull the handle toward your belly". Seated cable resistance row, feet braced, torso upright, arms reach forward horizontally then pull cable handle to belly. This is strength-training rowing, not a rowing boat.
+Row 4 column 3: "Biceps curls"; "Bend your elbows to lift the weights". Standing, upper arms stay at sides, dumbbells move from thighs toward shoulders by bending elbows.
+Row 5 column 1: "Plank"; "Hold your body straight". Static side-view forearm plank, elbows under shoulders, forearms and toes on floor, body straight. No upward lifting motion; use a small "HOLD" indication.
+Row 5 column 2: "Crunch"; "Lift your shoulders a little". Lying on back with knees bent and feet flat; curl shoulders just off floor, lower back remains down. Do not show a full sit-up.
+Row 5 column 3: "Leg raise"; "Lie down and lift straight legs". Supine on floor, arms at sides, legs straight: low hovering starting pose then raise straight legs toward vertical. Torso remains on floor.
+Use these exact 15 exercise titles and exact captions, spelled correctly. Avoid cropped people, tangled limbs, ambiguous bars, duplicated titles, extra limbs, decorative symbols, or tiny illegible text.
