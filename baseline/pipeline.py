@@ -18,7 +18,7 @@ from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FE
 from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, runs,
                                                          subject_folds, write_json)
 from strength_training.temporal_segmentation.metrics import (
-    confusion_matrix, false_exercise_events, grouped_stream_report, score_stream,
+    confusion_matrix, count_rows, false_exercise_events, grouped_stream_report, score_stream,
     reporting_tolerances,
 )
 from .counter import CounterConfig, decode
@@ -125,6 +125,20 @@ def new_directory(path):
     return path
 
 
+def peak_count_summary(records):
+    """Paper-style offline peak counts, separately from interval-based scoring."""
+    rows = [row for record in records for row in record.get("offline_peak_count_rows", [])]
+    active = [row for row in rows if row["predicted"] or row["reference"]]
+    return {"status": "scored" if rows else "not_applicable",
+            "count_mae_all_station_sessions": float(np.mean([r["absolute_error"] for r in rows])) if rows else None,
+            "exact_count_accuracy_all_station_sessions": float(np.mean([r["exact"] for r in rows])) if rows else None,
+            "count_mae_active_station_sessions": float(np.mean([r["absolute_error"] for r in active])) if active else None,
+            "exact_count_accuracy_active_station_sessions": float(np.mean([r["exact"] for r in active])) if active else None,
+            "within_one_accuracy_active_station_sessions": float(np.mean([r["absolute_error"] <= 1 for r in active])) if active else None,
+            "count_rows": rows,
+            "note": "Offline peak counts use certified peak timestamps; they do not evaluate repetition start/end boundaries."}
+
+
 def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         prediction_step_ms=200, max_windows_per_class=3000, c_values=(.1, 1., 10.),
         seed=42, confirm_steps=3, counter_config=CounterConfig()):
@@ -132,10 +146,10 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
     manifest = manifest_at(root)
     split = split or manifest["split"]
     check_split(manifest, split)
-    if (window_seconds < .5 or train_step_ms < DT_MS or train_step_ms % DT_MS or
+    if (not np.isfinite(window_seconds) or window_seconds < .5 or train_step_ms < DT_MS or train_step_ms % DT_MS or
             prediction_step_ms < DT_MS or prediction_step_ms % DT_MS or
             max_windows_per_class < 1 or confirm_steps < 1 or
-            not c_values or any(c <= 0 for c in c_values)):
+            not c_values or any(not np.isfinite(c) or c <= 0 for c in c_values)):
         raise ValueError("Invalid window, step, sample cap, SVM C or confirmation settings")
     window = int(round(window_seconds*FS))
     if output.exists():
@@ -269,6 +283,12 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
         if np.any(arrays["coverage"]):
             record["repetition_scores"] = score_stream(result["repetitions"], references, arrays["t"],
                                                          arrays["coverage"], record, tolerances)
+            if mode == "offline":
+                peak_indices = [int(np.searchsorted(arrays["t"], p["peak_ms"])) for p in result["offline_peaks"]]
+                certified = [p for p, i in zip(result["offline_peaks"], peak_indices) if arrays["coverage"][i]]
+                record["offline_peak_count_rows"] = count_rows(certified, references, name)
+                for row in record["offline_peak_count_rows"]:
+                    row.update({k: record[k] for k in ("subject", "source_session", "side")})
         result["scoring"] = record
         write_json(out/f"{name}.json", result)
         records.append(record)
@@ -277,6 +297,7 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
               "method": "RecoFit-style adapted to wrist IMUs at 25 Hz", "mode": mode,
               "split": split_name, "report_scope": "single_split_diagnostic",
               "timing_tolerance_ms": tolerance_ms, "report_tolerances_ms": tolerances,
+              "offline_peak_counts": peak_count_summary(records),
               "reference_convention": model["reference_convention"],
               "phase_order_validated": model["phase_order_validated"],
               "excluded_sessions": manifest.get("excluded", []),
@@ -330,6 +351,7 @@ def cross_validate(root, output, *, folds=5, seed=42, mode="causal", tolerance_m
     tolerances = reporting_tolerances(report_tolerances_ms, tolerance_ms)
     scores = [s["segmentation_f1"] for s in summaries if s["segmentation_f1"] is not None]
     pooled = {**grouped_stream_report(all_records, tolerances, tolerance_ms),
+              "offline_peak_counts": peak_count_summary(all_records),
               "report_scope": "subject_wise_cross_validation", "folds": summaries,
               "fold_segmentation_f1_mean": float(np.mean(scores)) if scores else None,
               "fold_segmentation_f1_std": float(np.std(scores)) if scores else None,

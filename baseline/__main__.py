@@ -72,13 +72,13 @@ def main(argv=None):
             if args.command == "train":
                 pipeline.fit(args.data, args.output, **kwargs)
             else:
-                if args.command == "run" and not args.data.exists():
-                    from strength_training.temporal_segmentation.data import prepare as prepare_data
+                if args.command == "run":
                     if args.output.exists():
                         raise FileExistsError(f"Refusing to overwrite {args.output}")
-                    # Preparation owns its atomic destination; CV writes a sibling.
-                    prepare_data(args.source, args.output/"data", args.alignment, args.location, seed=args.seed)
-                    args.data = args.output/"data"
+                    if not args.data.exists():
+                        from strength_training.temporal_segmentation.data import prepare as prepare_data
+                        prepare_data(args.source, args.output/"data", args.alignment, args.location, seed=args.seed)
+                        args.data = args.output/"data"
                     args.output = args.output/"cross_validation"
                 pipeline.cross_validate(args.data, args.output, folds=args.folds, mode=args.mode,
                                          tolerance_ms=args.tolerance_ms,

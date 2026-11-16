@@ -89,7 +89,6 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
     Emit only when that full interval has been observed. No artificial EOF cycle.
     """
     from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
-    from strength_training.temporal_segmentation.data import runs
     if mode not in ("causal", "offline") or step < 1:
         raise ValueError("Invalid decode mode or step")
     t, labels, valid = np.asarray(t), np.asarray(labels), np.asarray(valid, bool)

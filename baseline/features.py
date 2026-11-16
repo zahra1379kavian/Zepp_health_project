@@ -105,8 +105,9 @@ def extract(windows):
 
 def window_ends(valid, window, step):
     from strength_training.temporal_segmentation.data import runs
-    return np.concatenate([np.arange(a+window-1, b, step, dtype=np.int64)
-                           for a, b in runs(valid) if b-a >= window]) if np.any(valid) else np.empty(0, np.int64)
+    pieces = [np.arange(a+window-1, b, step, dtype=np.int64)
+              for a, b in runs(valid) if b-a >= window]
+    return np.concatenate(pieces) if pieces else np.empty(0, np.int64)
 
 
 def feature_batches(filtered, ends, window, batch_size=256):
