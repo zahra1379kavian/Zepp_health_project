@@ -27,7 +27,8 @@ def main(argv=None):
         p.add_argument("--prediction-step-ms", type=int, default=200)
         p.add_argument("--max-windows-per-class", type=int, default=3000)
         p.add_argument("--c-values", type=float, nargs="+", default=[.1, 1., 10.])
-        p.add_argument("--confirm-steps", type=int, default=3)
+        p.add_argument("--confirm-steps", type=int, default=3,
+                       help="decisions to confirm exercise/rest and a new segment-wide station vote leader")
         p.add_argument("--seed", type=int, default=42)
     for p in (cv, run):
         p.add_argument("--folds", type=int, default=5)

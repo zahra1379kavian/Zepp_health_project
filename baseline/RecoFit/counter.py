@@ -8,7 +8,7 @@ additional symmetric-period heuristic, not a result claimed by RecoFit.
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import ellip, find_peaks, sosfilt
+from scipy.signal import ellip, find_peaks, sosfilt, sosfilt_zi
 
 from .features import FS, autocorrelation, pc1
 
@@ -28,12 +28,15 @@ class CounterConfig:
 
 
 def bandpass(x, valid):
-    """Causal 0.15--11 Hz elliptic bandpass; only raw accelerometer inputs."""
+    """Causal 0.15--11 Hz accelerometer bandpass, initialized per valid run."""
     from strength_training.temporal_segmentation.data import runs
     output = np.zeros((len(x), 3), np.float64)
     sos = ellip(4, .1, 60, [.15, 11.], btype="bandpass", fs=FS, output="sos")
+    zi = sosfilt_zi(sos)[:, :, None]
     for a, b in runs(valid):
-        output[a:b] = sosfilt(sos, np.asarray(x[a:b, :3], np.float64), axis=0)
+        samples = np.asarray(x[a:b, :3], np.float64)
+        # Start at the first sample's steady state to avoid a gravity step.
+        output[a:b], _ = sosfilt(sos, samples, axis=0, zi=zi*samples[0])
     return output
 
 
@@ -85,6 +88,7 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
            config=CounterConfig()):
     """Counter consumes predicted labels only. Causal events are never retracted.
 
+    Labels are stabilized by classify; a committed station change ends the set.
     Boundary adaptation: peak +/- half the estimated period, rounded to 40 ms.
     Emit only when that full interval has been observed. No artificial EOF cycle.
     """

@@ -6,7 +6,7 @@ All batch rows are independent trailing windows; no future window is used.
 """
 
 import numpy as np
-from scipy.signal import butter, find_peaks, sosfilt
+from scipy.signal import butter, find_peaks, sosfilt, sosfilt_zi
 
 FS = 25
 
@@ -24,12 +24,14 @@ def pc1(x):
 
 
 def filtered_inputs(x, valid, cutoff=8.):
-    """Causal low-pass, reset at every unavailable/excluded sample."""
+    """Causal low-pass, initialized from the first sample of each valid run."""
     from strength_training.temporal_segmentation.data import runs
     result = np.zeros((len(x), 6), np.float64)
     sos = butter(4, cutoff, fs=FS, output="sos")
+    zi = sosfilt_zi(sos)[:, :, None]
     for a, b in runs(valid):
-        result[a:b] = sosfilt(sos, np.asarray(x[a:b, :6], np.float64), axis=0)
+        samples = np.asarray(x[a:b, :6], np.float64)
+        result[a:b], _ = sosfilt(sos, samples, axis=0, zi=zi*samples[0])
     return result
 
 

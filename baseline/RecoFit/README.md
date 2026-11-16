@@ -90,7 +90,9 @@ Explicit adaptations and assumptions:
    fourth-order 8 Hz Butterworth low-pass, and ten spectral bands from 0.1 Hz to
    12.5 Hz. It does not upsample or apply an impossible 20 Hz filter at 25 Hz.
    The counting filter is fourth-order elliptic, 0.1 dB ripple and 60 dB
-   stopband attenuation. Filter state resets at excluded or unavailable samples.
+   stopband attenuation. Both filters initialize each valid stretch at the
+   first sample's steady state to avoid a gravity startup transient. Excluded
+   or unavailable samples reset the state.
 2. Device X replaces anatomical arm X. Wrist orientation is not guaranteed to
    match the original armband. PCA signs use the largest loading's positive
    direction. Autocorrelations are mean-centered and normalized at lag zero.
@@ -101,9 +103,18 @@ Explicit adaptations and assumptions:
    200 ms**. Training uses 1-second strides; binary targets are the current
    window-end class. Recognition trains only on windows fully within one
    exercise. A saturating accumulator requires 3 decisions (600 ms), replacing
-   the paper's six seconds. Recognition updates each decision instead of
-   committing to a fixed label for the entire set. All learned station types
-   are candidates throughout a session; no workout circuit list is provided.
+   the paper's six seconds. Exercise-positive decisions vote for a single station
+   across the active segment, including the decisions confirming its start.
+   The initial station is the vote leader; ties retain the committed label.
+   A different leader must persist for `--confirm-steps` consecutive
+   exercise-positive decisions (3 by default) before the station changes.
+   Brief recognition errors therefore preserve the set and counting buffer.
+   Rest decisions add no votes and interrupt station-change confirmation;
+   confirmed rest and sensor gaps clear all votes. A sustained exercise change
+   without rest must first outvote the segment's accumulated history, so its
+   recognition delay can exceed 600 ms. Predictions already emitted are never
+   relabeled. All learned station types remain candidates; no workout circuit
+   list is provided. Existing model files use this smoothing without retraining.
 4. Feature scaling fits training subjects only. A shared SVM C is selected from
    0.1, 1 and 10 by macro F1 on capped validation windows. This selection is
    a window-level diagnostic; the final reports score continuous recordings.
@@ -125,8 +136,9 @@ The default `--mode causal` recomputes the counter every 200 ms from at most
 30 seconds of the current predicted exercise. It uses only samples already
 observed, waits until a full estimated interval plus 200 ms has been observed,
 and freezes emitted events. Nearby subsequent candidates cannot revise a
-committed peak. Classifier changes, missing samples, and exclusions end a bout;
-incomplete tails do not generate artificial repetitions. Plank produces holds.
+committed peak. Confirmed rest or station changes, missing samples, and exclusions
+end a bout; incomplete tails do not generate artificial repetitions. Plank
+produces holds.
 
 `reported_at_ms` records when the event became available in sample-time replay.
 The method has a five-second classifier cold start after a reset and needs
@@ -207,12 +219,14 @@ predictions are not silently treated as incorrect reference repetitions.
 Run the regression and integration checks:
 
 ```bash
-python -m unittest baseline.tests.test_recofit -v
+python -m unittest baseline.RecoFit.tests.test_recofit -v
 python -m baseline demo --output baseline/runs/demo
 ```
 
 The tests check regular/double peaks, local tempo changes, constant inputs,
-future independence, exclusion/gap resets, absent/incomplete cycles, phase-label
+future independence, station-vote stability under brief/alternating errors,
+sustained station changes, vote resets at rest/gaps, preserved repetition counts,
+exclusion/gap resets, absent/incomplete cycles, phase-label
 preparation, subject separation, training-only period fitting, raw label leakage,
 multiple timing tolerances, and separate offline count metrics. The demo runs
 three-fold cross-validation on synthetic data with paired wrists and then raw

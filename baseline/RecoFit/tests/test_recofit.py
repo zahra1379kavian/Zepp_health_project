@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from baseline.RecoFit.counter import bandpass, count_peaks, decode
-from baseline.RecoFit.features import extract, pc1, window_ends
+from baseline.RecoFit.features import extract, filtered_inputs, pc1, window_ends
 from baseline.RecoFit.pipeline import (check_split, classify, evaluate, fit, fit_period_bounds,
                                       infer, load_model, predict)
 from baseline.RecoFit.demo import synthetic_source
@@ -84,6 +84,9 @@ class ClassificationTests(unittest.TestCase):
         stations = [squat]*3+[other]*4+[squat]+[other]*3
         labels = classify_trace([1]*7+[0]+[1]*3, stations)
         np.testing.assert_array_equal(labels[4::5], [0, 0]+[squat]*8+[other])
+        stations = [squat]*3+[other]*7
+        labels = classify_trace([1]*5+[0]+[1]*4, stations)
+        np.testing.assert_array_equal(labels[4::5], [0, 0]+[squat]*7+[other])
 
     def test_confirmed_rest_clears_vote_for_next_set(self):
         squat, other = CLASSES.index("squat"), CLASSES.index("push-up")
@@ -95,7 +98,7 @@ class ClassificationTests(unittest.TestCase):
         valid = np.ones(150, bool)
         valid[75:80] = False
         labels = classify_trace([1]*30, [squat]*16+[other]*14, valid=valid)
-        self.assertTrue(np.all(labels[74:94] == 0))
+        self.assertTrue(np.all(labels[75:94] == 0))
         self.assertTrue(np.all(labels[94:] == other))
 
     def test_gap_resets_even_when_window_end_cadence_is_unchanged(self):
@@ -159,17 +162,50 @@ class SignalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             count_peaks(sine_signal(), 2, 1)
 
-    def test_causal_filter_ignores_future_and_resets_at_masks(self):
-        x = sine_signal()
+    def test_constant_inputs_have_no_filter_startup_transient(self):
+        x = np.tile([2., -3., np.sqrt(10.4**2-13), .1, -.2, .3], (500, 1))
         valid = np.ones(len(x), bool)
-        a = bandpass(x, valid)
+        filtered = bandpass(x, valid)
+        np.testing.assert_allclose(filtered, np.tile(filtered[0], (len(x), 1)), atol=1e-10)
+        self.assertEqual(count_peaks(filtered, 1.5, 2.5), [])
+        np.testing.assert_allclose(filtered_inputs(x, valid), x, atol=1e-12)
+
+    def test_constant_inputs_restart_without_transients_after_gaps(self):
+        x = np.full((800, 6), np.nan)
+        valid = np.zeros(len(x), bool)
+        stretches = ((5, 205, [2., -3., 9.5, .1, -.2, .3]),
+                     (210, 211, [-10.4, 0., 0., -.4, .5, -.6]),
+                     (220, 800, [0., 10.4, 0., .7, -.8, .9]))
+        for a, b, value in stretches:
+            x[a:b] = value
+            valid[a:b] = True
+        for filter_inputs in (bandpass, filtered_inputs):
+            with self.subTest(filter=filter_inputs.__name__):
+                filtered = filter_inputs(x, valid)
+                self.assertTrue(np.isfinite(filtered).all())
+                self.assertFalse(filtered[~valid].any())
+                for a, b, _ in stretches:
+                    expected = filter_inputs(x[a:b], valid[a:b])
+                    np.testing.assert_allclose(filtered[a:b], expected, atol=1e-10)
+                    np.testing.assert_allclose(filtered[a:b],
+                                               np.tile(expected[0], (b-a, 1)), atol=1e-10)
+                    if filter_inputs is filtered_inputs:
+                        np.testing.assert_allclose(filtered[a:b], x[a:b], atol=1e-12)
+
+    def test_causal_filter_ignores_future_and_resets_at_masks(self):
+        x = np.column_stack((sine_signal(), sine_signal(harmonic=.55)))
+        valid = np.ones(len(x), bool)
         changed = x.copy()
         changed[300:] *= 30
-        np.testing.assert_allclose(a[:300], bandpass(changed, valid)[:300])
-        valid[200:250] = False
-        reset = bandpass(x, valid)
-        np.testing.assert_allclose(reset[250:], bandpass(x[250:], valid[250:]))
-        self.assertFalse(reset[200:250].any())
+        masked = valid.copy()
+        masked[200:250] = False
+        for filter_inputs in (bandpass, filtered_inputs):
+            with self.subTest(filter=filter_inputs.__name__):
+                a = filter_inputs(x, valid)
+                np.testing.assert_allclose(a[:300], filter_inputs(changed, valid)[:300])
+                reset = filter_inputs(x, masked)
+                np.testing.assert_allclose(reset[250:], filter_inputs(x[250:], masked[250:]))
+                self.assertFalse(reset[200:250].any())
 
     def test_counter_causal_events_match_prefix_and_never_cross_masks(self):
         x = sine_signal(seconds=30)
