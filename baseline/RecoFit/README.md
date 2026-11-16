@@ -162,8 +162,7 @@ Explicit adaptations and assumptions:
    so overlapping windows do not repeatedly count a peak. These diagnostics cover
    all valid predicted exercise samples, including samples without reference
    coverage; they count detected peaks, not verified complete intervals or extra
-   scored misses. These learned
-   offsets correct systematic phase shifts, but cannot track every change in
+   scored misses. Learned offsets correct systematic phase shifts, but cannot track every change in
    wrist orientation, cadence or pause duration. Timing still needs held-out
    measurement; these are not the temporal model's phase-boundary predictions.
 
@@ -281,7 +280,8 @@ The tests check start-gap limits with pauses and bout/gap/coverage resets,
 wrist/axis-specific boundary calibration, matching calibration/inference replay
 at default and custom cadences, PCA sign continuity and bout resets,
 causal hold closure and prefix equivalence, separate active durations, missing
-calibration, legacy-model rejection, regular/double peaks, local tempo changes,
+calibration and dropped-peak report aggregation, legacy-model rejection,
+regular/double peaks, local tempo changes,
 constant inputs,
 future independence, station-vote stability under brief/alternating errors,
 sustained station changes, vote resets at rest/gaps, preserved repetition counts,

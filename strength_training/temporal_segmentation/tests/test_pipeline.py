@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -623,6 +624,38 @@ class MetricsTests(unittest.TestCase):
 
 
 class ReportingTests(unittest.TestCase):
+    def test_completed_fold_resume_preserves_results_and_restarts_only_missing_folds(self):
+        from strength_training.temporal_segmentation.__main__ import main
+        from strength_training.temporal_segmentation import runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alignment, _ = synthetic_source(root / "source", subjects=3, both_wrists=True)
+            prepare(root / "source", root / "data", alignment)
+            command = ["cross-validate", "--data", str(root / "data"), "--output", str(root / "cv"),
+                       "--folds", "3", "--epochs", "1", "--max-steps", "1", "--batch-size", "2",
+                       "--window", "128", "--stages", "1", "--layers", "1", "--channels", "4", "--threads", "1"]
+            main(command)
+            expected = json.loads((root / "cv/report.json").read_text())
+            fold_one = root / "cv/fold_1"
+            saved = {p.relative_to(fold_one): p.read_bytes() for p in fold_one.rglob("*")
+                     if p.is_file() and not p.is_symlink() and "data" not in p.relative_to(fold_one).parts}
+            for index in (2, 3):
+                shutil.rmtree(root / f"cv/fold_{index}")
+            with patch.object(runner, "train", wraps=runner.train) as train:
+                main([*command, "--resume-completed"])
+            self.assertEqual([call.args[0].output.parent.name for call in train.call_args_list], ["fold_2", "fold_3"])
+            self.assertEqual(json.loads((root / "cv/report.json").read_text()), expected)
+            for name, content in saved.items():
+                self.assertEqual((fold_one / name).read_bytes(), content)
+            with self.assertRaises(FileExistsError):
+                main(command)
+            with self.assertRaisesRegex(ValueError, "Training configuration changed"):
+                main([*command, "--resume-completed", "--channels", "5"])
+            (root / "cv/fold_2/model/best.pt").unlink()
+            with self.assertRaisesRegex(FileExistsError, "Incomplete fold"):
+                main([*command, "--resume-completed"])
+
     def test_evaluation_decodes_once_and_reports_sides_at_each_tolerance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

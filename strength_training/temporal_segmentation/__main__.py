@@ -20,6 +20,8 @@ def main(argv=None):
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
     cv = sub.add_parser("cross-validate", help="Subject-wise folds with separate validation and pooled held-out scores")
     cv.add_argument("--folds", type=int, default=5)
+    cv.add_argument("--resume-completed", action="store_true",
+                    help="Reuse verified completed folds in an existing output; incomplete folds must be moved aside")
     for command in (train, cv):
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)

@@ -457,12 +457,59 @@ def run_pipeline(args):
     print(f"Wrist cross-validation complete. Report: {out / 'cross_validation' / 'report.json'}", flush=True)
 
 
+def completed_fold_report(args, fold, expected_manifest, tolerances):
+    """Verify a completed fold before reusing its held-out predictions."""
+    required = [fold / name for name in ("data/manifest.json", "model/best.pt", "model/history.json",
+                                         "decoder.json", "test/report.json")]
+    if any(not path.is_file() for path in required):
+        raise FileExistsError(f"Incomplete fold: {fold}. Move it aside before restarting this fold.")
+    saved_manifest = json.loads((fold / "data/manifest.json").read_text())
+    if saved_manifest != expected_manifest:
+        raise ValueError(f"Dataset, split or normalization changed for {fold}")
+    _, checkpoint = load_checkpoint(fold / "model/best.pt", "cpu", fold / "data")
+    head = args.repetition_head
+    if head == "auto":
+        head = "phase" if expected_manifest.get("reference_mode") == "labels" else "boundary"
+    expected_config = {"stages": args.stages, "layers": args.layers, "channels": args.channels,
+                       "repetition_head": head}
+    if (any(checkpoint["config"].get(key) != value for key, value in expected_config.items())
+            or checkpoint["seed"] != args.seed or checkpoint["station_only"]
+            or checkpoint["tolerance_ms"] != args.tolerance_ms
+            or checkpoint["partial_epoch_max_steps"] != args.max_steps):
+        raise ValueError(f"Training configuration changed for {fold}")
+    history = json.loads((fold / "model/history.json").read_text())
+    if (not history or [row["epoch"] for row in history] != list(range(1, len(history) + 1))
+            or history[-1]["epoch"] > args.epochs or not 1 <= checkpoint["epoch"] <= len(history)):
+        raise ValueError(f"Incompatible training history for {fold}")
+    _, tolerance, _ = decoder_config(fold / "decoder.json", fold / "model/best.pt")
+    decoder = json.loads((fold / "decoder.json").read_text())
+    if tolerance != args.tolerance_ms or decoder["sessions"] != expected_manifest["split"]["validation"]:
+        raise ValueError(f"Decoder selection changed for {fold}")
+    report = json.loads((fold / "test/report.json").read_text())
+    if (report.get("split") != "test" or report.get("report_scope") != "fold_test"
+            or report.get("decoder_selection") != "validation_selected"
+            or report.get("timing_tolerance_ms") != args.tolerance_ms
+            or report.get("report_tolerances_ms") != tolerances):
+        raise ValueError(f"Evaluation configuration changed for {fold}")
+    records = []
+    for name in expected_manifest["split"]["test"]:
+        record = json.loads((fold / "test" / f"{name}.json").read_text())["scoring"]
+        if record["session"] != name or set(record["repetition_scores"]) != set(map(str, tolerances)):
+            raise ValueError(f"Incomplete held-out scores for {fold}: {name}")
+        records.append(record)
+    pooled = grouped_stream_report(records, tolerances, args.tolerance_ms)
+    if any(report[key] != value for key, value in pooled.items()):
+        raise ValueError(f"Held-out scores differ from the saved report for {fold}")
+    return report
+
+
 def cross_validate(args):
     """Each subject is tested once; fitting and threshold tuning stay within folds."""
     from argparse import Namespace
 
     root, out = Path(args.data).resolve(), Path(args.output)
-    if out.exists():
+    resume_completed = getattr(args, "resume_completed", False)
+    if out.exists() and not resume_completed:
         raise FileExistsError(out)
     if args.station_only:
         raise ValueError("Repetition cross-validation requires a repetition head")
@@ -475,21 +522,27 @@ def cross_validate(args):
     for index, split in enumerate(splits):
         fold = out / f"fold_{index + 1}"
         data = fold / "data"
-        data.mkdir(parents=True)
-        # Immutable session arrays are shared. Each fold owns its manifest,
-        # training normalization, class weights, checkpoint and decoder.
-        for session in manifest["sessions"]:
-            (data / session["session"]).symlink_to(root / session["session"], target_is_directory=True)
         fold_manifest = {**manifest, "split": split, "seed": args.seed,
                          "cross_validation": {"fold": index + 1, "folds": args.folds}}
         fold_manifest.update(training_statistics(root, split["train"]))
-        write_json(data / "manifest.json", fold_manifest)
-        params = {**vars(args), "data": data, "output": fold / "model"}
-        checkpoint = train(Namespace(**params))
-        params.update(checkpoint=checkpoint, output=fold / "decoder.json")
-        tune(Namespace(**params))
-        params.update(decoder=fold / "decoder.json", split="test", output=fold / "test")
-        report = evaluate(Namespace(**params))
+        if fold.exists():
+            if not resume_completed:
+                raise FileExistsError(fold)
+            report = completed_fold_report(args, fold, fold_manifest, tolerances)
+            print(f"Fold {index + 1}/{args.folds}: reusing completed results", flush=True)
+        else:
+            print(f"Fold {index + 1}/{args.folds}: training from epoch 1", flush=True)
+            data.mkdir(parents=True)
+            # Immutable arrays are shared; normalization and fitting stay within this fold.
+            for session in manifest["sessions"]:
+                (data / session["session"]).symlink_to(root / session["session"], target_is_directory=True)
+            write_json(data / "manifest.json", fold_manifest)
+            params = {**vars(args), "data": data, "output": fold / "model"}
+            checkpoint = train(Namespace(**params))
+            params.update(checkpoint=checkpoint, output=fold / "decoder.json")
+            tune(Namespace(**params))
+            params.update(decoder=fold / "decoder.json", split="test", output=fold / "test")
+            report = evaluate(Namespace(**params))
         reports.append({"fold": index + 1, "split": split,
                         **{key: report[key] for key in ("repetitions", "segmentation", "by_tolerance", "per_side",
                                                        "streams", "subjects", "source_sessions")}})

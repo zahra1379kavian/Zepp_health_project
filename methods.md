@@ -8,7 +8,6 @@ Step	Goal	Method
 1	Baseline	RecoFit-style counter: band-pass → PCA → autocorrelation peaks. It needs no station label.
 2	Rep segmentation (main model)	Current causal MS-TCN with the phase1/phase2 head, plus three changes: add about 0.5 s of lookahead, test accelerometer + gyroscope only (no magnetometer), and add augmentation (small rotations, time-warp, scaling).
 3	Check unknown stations	Leave-one-exercise-out: train on 14 exercises, test rep segmentation on the 15th. If it fails, fall back to the step 1 counter whenever the station is "unknown".
-4	Only if step 2 plateaus	TS2Vec pretraining on all 88 hours, optionally adding public gym data (RecoFit, MM-Fit).
 5	Station recognition (later)	Contrastive embedding (Lee & Kim mixup triplets, or OOD-aware SupCon), averaged over each detected set, then nearest prototype with a distance threshold for "unknown".
 
 How to enhance RecoFit model to detect start and end of a repitition? Learn the edges from training data with a small regressor, or by matching a typical repetition shape for each exercise. This is likely the most accurate, but it is no longer RecoFit.

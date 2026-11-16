@@ -93,6 +93,16 @@ experiment, use a new output directory. `run` writes its main report under
 `cross_validation/report.json`; direct `cross-validate` writes `report.json` in
 its output directory. Use these cross-validation results for headline numbers.
 
+To continue after an interruption while retaining completed folds, stop the old
+process, move the incomplete `fold_N/` directory to a backup outside
+`cross_validation/`, and invoke `cross-validate` with the original settings and
+`--resume-completed --output strength_training/tas_runs/wrist_cv/cross_validation`.
+Completed folds are checked against the dataset, splits, model configuration,
+decoder and saved test scores before reuse. Missing folds train from epoch 1;
+incomplete folds are refused rather than overwritten. This resumes between folds,
+not within a fold: `best.pt` does not contain the optimizer state needed for an
+exact continuation of interrupted epochs.
+
 The entry point is `__main__.py`; run it as the module above so its imports work.
 You do not need to run `prepare_data.py`, the demographics analysis, or the
 synthetic demo before this experiment.
