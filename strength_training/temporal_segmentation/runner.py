@@ -485,7 +485,7 @@ def predict(args):
                "compute_ms_p95": float(np.percentile(latencies, 95)),
                "compute_ms_max": max(latencies), "maximum_buffer_delay_ms": (args.chunk - 1) * DT_MS,
                "decoder_confirmation_delay_ms": config.lag_frames * DT_MS,
-               "model_lookahead_ms": lag * DT_MS, "features": features,
+               "model_lookahead_ms": lag * DT_MS, "features": ckpt["features"],
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
     write_json(out / "predictions.json", summary)
     return summary

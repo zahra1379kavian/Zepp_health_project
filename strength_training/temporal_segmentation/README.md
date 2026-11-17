@@ -8,6 +8,22 @@ It uses wrist signals only. The authoritative targets are the matching wrist
 column of each reliable `label.csv` in `strength_training_data_clean`.
 No separate repetition-reference file is required for the default run.
 
+## Additional analyses
+
+Two independent pilot analyses are implemented in separate folders:
+
+- [Sensor and model ablations](analyses/sensor_ablation/README.md): baseline,
+  520 ms lookahead, accelerometer + gyroscope, training augmentation, their
+  combination, and paired wrist + waist fusion with a matched wrist control.
+- [Leave-one-exercise-out](analyses/leave_one_exercise_out/README.md): four
+  independently removed exercises on one subject fold, masked during fitting
+  and validation, then station-ignored repetition F1 in held-out subjects.
+
+Both commands use the existing prepared version-4 dataset, create separate
+output/data views, and keep every subject's wrists together. The descriptions
+below describe the default wrist-only experiment. These new pilots must be run
+to establish their real-data accuracy; passing pipeline tests is not a result.
+
 The default uses **every available wrist as its own stream**. Both wrists from
 the same subject always stay in the same training, validation, or test fold.
 Each stream uses its own wrist labels and sensor-availability mask, preserving
