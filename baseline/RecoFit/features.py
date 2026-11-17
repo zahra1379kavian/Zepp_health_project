@@ -113,8 +113,16 @@ def window_ends(valid, window, step):
     return np.concatenate(pieces) if pieces else np.empty(0, np.int64)
 
 
-def feature_batches(filtered, ends, window, batch_size=256):
+def feature_batches(filtered, ends, window, batch_size=256, *, waist_filtered=None):
+    """Concatenate per-device features; never mix wrist/waist axes in one PCA."""
+    if waist_filtered is not None and waist_filtered.shape != filtered.shape:
+        raise ValueError("Wrist and waist features need the same aligned time grid")
     for offset in range(0, len(ends), batch_size):
         batch = ends[offset:offset+batch_size]
-        windows = filtered[batch[:, None] + np.arange(1-window, 1)[None, :]]
-        yield batch, *extract(windows)
+        indices = batch[:, None] + np.arange(1-window, 1)[None, :]
+        seg, rec = extract(filtered[indices])
+        if waist_filtered is not None:
+            waist_seg, waist_rec = extract(waist_filtered[indices])
+            seg = np.concatenate((seg, waist_seg), axis=1)
+            rec = np.concatenate((rec, waist_rec), axis=1)
+        yield batch, seg, rec

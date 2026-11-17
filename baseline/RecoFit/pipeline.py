@@ -23,6 +23,7 @@ from strength_training.temporal_segmentation.metrics import (
 )
 from .counter import CounterConfig, bandpass, decode, peak_windows
 from .features import FS, feature_batches, filtered_inputs, window_ends
+from .sensors import DEFAULT_WAIST_STATIONS, SENSOR_MODES, aligned_waist, load_inputs
 
 
 def manifest_at(root):
@@ -56,7 +57,7 @@ def pure_targets(y, ends, window):
     return np.where(pure & (y[ends] != 0), y[ends], -1)
 
 
-def sampled_features(root, names, window, step, cap, seed):
+def sampled_features(root, names, window, step, cap, seed, *, sensors="wrist"):
     """Select windows before costly extraction; label-based sampling is fit-only.
 
     Caps are global per endpoint station and per pure recognition station, not per
@@ -64,7 +65,7 @@ def sampled_features(root, names, window, step, cap, seed):
     """
     candidates = []
     for stream_index, name in enumerate(names):
-        arrays = load_arrays(Path(root)/name)
+        arrays = load_inputs(Path(root)/name, sensors)
         ends = window_ends(arrays["valid"], window, step)
         if len(ends):
             candidates.append(np.column_stack((np.full(len(ends), stream_index), ends,
@@ -85,9 +86,11 @@ def sampled_features(root, names, window, step, cap, seed):
         rows = table[table[:, 0] == stream_index]
         if not len(rows):
             continue
-        arrays = load_arrays(Path(root)/name)
+        arrays = load_inputs(Path(root)/name, sensors)
         filtered = filtered_inputs(arrays["x"], arrays["valid"])
-        for _, seg, rec in feature_batches(filtered, rows[:, 1], window):
+        extra = ({"waist_filtered": filtered_inputs(arrays["waist_x"], arrays["valid"])}
+                 if sensors == "wrist-waist" else {})
+        for _, seg, rec in feature_batches(filtered, rows[:, 1], window, **extra):
             segmentation.append(seg)
             recognition.append(rec)
         targets.append(rows[:, 2])
@@ -101,12 +104,12 @@ def classifier(x, y, c, seed):
     return make_pipeline(StandardScaler(), estimator).fit(x, y)
 
 
-def fit_period_bounds(root, names):
+def fit_period_bounds(root, names, *, sensors="wrist"):
     """Fit cycle spacing, including pauses, within certified training bouts."""
     gaps = {name: [] for name in CLASSES[1:] if name != "plank"}
     references = Counter()
     for stream in names:
-        arrays = load_arrays(Path(root)/stream)
+        arrays = load_inputs(Path(root)/stream, sensors)
         ordered = sorted(json.loads((Path(root)/stream/"references.json").read_text()),
                          key=lambda r: r["start_ms"])
         references.update(r["station"] for r in ordered if r["station"] in gaps)
@@ -134,7 +137,8 @@ def fit_period_bounds(root, names):
     return result
 
 
-def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig(), *, step=5):
+def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig(), *, step=5,
+                         sensors="wrist", waist_stations=()):
     """Calibrate peak phase and active duration using training references only.
 
     Separate wrist/axis groups avoid averaging peaks at opposite motion phases.
@@ -149,19 +153,23 @@ def fit_boundary_offsets(root, names, period_bounds, config=CounterConfig(), *, 
     """
     if step < 1:
         raise ValueError("Invalid calibration step")
+    if waist_stations and sensors != "wrist-waist":
+        raise ValueError("Waist calibration requires wrist-waist inputs")
     root = Path(root)
     sides = {s["session"]: s["side"] for s in manifest_at(root)["sessions"]}
     samples = {}
     for stream in names:
-        arrays = load_arrays(root/stream)
+        arrays = load_inputs(root/stream, sensors)
         references = json.loads((root/stream/"references.json").read_text())
         filtered = bandpass(arrays["x"], arrays["valid"])
+        waist_filtered = bandpass(arrays["waist_x"], arrays["valid"]) if waist_stations else None
         seen = set()
         for name in sorted({r["station"] for r in references} & period_bounds.keys()):
             limits = period_bounds[name]
             station_references = [r for r in references if r["station"] == name]
+            counting_signal = waist_filtered if name in waist_stations else filtered
             for a, b in runs(arrays["valid"] & (arrays["y"] == CLASSES.index(name))):
-                for tick, left, peaks in peak_windows(filtered, a, b, limits["min_s"], limits["max_s"],
+                for tick, left, peaks in peak_windows(counting_signal, a, b, limits["min_s"], limits["max_s"],
                                                       step=step, config=config):
                     for i, reference in enumerate(station_references):
                         start, end = np.searchsorted(arrays["t"],
@@ -227,11 +235,21 @@ def uncalibrated_summary(records):
 
 def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         prediction_step_ms=200, max_windows_per_class=3000, c_values=(.1, 1., 10.),
-        seed=42, confirm_steps=3, counter_config=CounterConfig()):
+        seed=42, confirm_steps=3, counter_config=CounterConfig(), sensors="wrist",
+        waist_stations=None):
     root, output = Path(root), Path(output)
     manifest = manifest_at(root)
     split = split or manifest["split"]
     check_split(manifest, split)
+    if sensors not in SENSOR_MODES:
+        raise ValueError(f"Unknown sensor mode: {sensors}")
+    waist_stations = tuple(DEFAULT_WAIST_STATIONS if waist_stations is None and sensors == "wrist-waist"
+                           else waist_stations or ())
+    if (set(waist_stations) - (set(CLASSES[1:]) - {"plank"}) or
+            (waist_stations and sensors != "wrist-waist")):
+        raise ValueError("--waist-stations requires wrist-waist inputs and known dynamic exercises")
+    if sensors == "wrist-waist" and manifest.get("recofit_sensors", {}).get("mode") != sensors:
+        raise ValueError("Use prepare-waist or run --sensors wrist-waist before fitting paired inputs")
     if (not np.isfinite(window_seconds) or window_seconds < .5 or train_step_ms < DT_MS or train_step_ms % DT_MS or
             prediction_step_ms < DT_MS or prediction_step_ms % DT_MS or
             max_windows_per_class < 1 or confirm_steps < 1 or
@@ -242,13 +260,13 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         raise FileExistsError(f"Refusing to overwrite {output}")
     print("Extracting training features", flush=True)
     seg, rec, target, pure = sampled_features(root, split["train"], window,
-                                              train_step_ms//DT_MS, max_windows_per_class, seed)
+                                              train_step_ms//DT_MS, max_windows_per_class, seed, sensors=sensors)
     mask = pure > 0
     if not mask.any():
         raise ValueError("No complete exercise windows for recognition; reduce --window-seconds")
     print("Extracting validation features", flush=True)
     vs, vr, vy, _ = sampled_features(root, split["validation"], window,
-                                     train_step_ms//DT_MS, max_windows_per_class, seed+1)
+                                     train_step_ms//DT_MS, max_windows_per_class, seed+1, sensors=sensors)
     trials, best, best_f1 = [], None, -1.
     for c in c_values:
         binary = classifier(seg, (target > 0).astype(int), c, seed)
@@ -260,11 +278,15 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
         if score > best_f1:
             best_f1, best = score, (binary, recognition, c)
     binary, recognition, c = best
-    periods = fit_period_bounds(root, split["train"])
+    periods = fit_period_bounds(root, split["train"], sensors=sensors)
     print("Calibrating repetition boundaries on training subjects", flush=True)
     offsets = fit_boundary_offsets(root, split["train"], periods, counter_config,
-                                   step=prediction_step_ms//DT_MS)
-    model = {"format": "recofit_wrist_v2", "binary": binary, "recognition": recognition,
+                                   step=prediction_step_ms//DT_MS, sensors=sensors, waist_stations=waist_stations)
+    model = {"format": "recofit_wrist_waist_v3" if sensors == "wrist-waist" else "recofit_wrist_v2",
+             "sensors": sensors, "waist_stations": list(waist_stations),
+             "counting_sensors": {name: "waist" if name in waist_stations else "wrist"
+                                  for name in periods},
+             "binary": binary, "recognition": recognition,
              "window_samples": window, "prediction_step": prediction_step_ms//DT_MS,
              "confirm_steps": confirm_steps, "period_bounds": periods, "boundary_offsets": offsets,
              "sensor_sides": sorted({s["side"] for s in manifest["sessions"] if s["session"] in split["train"]}),
@@ -285,6 +307,9 @@ def fit(root, output, *, split=None, window_seconds=5., train_step_ms=1000,
                "confirm_steps": confirm_steps, "counter_config": asdict(counter_config),
                "period_bounds": model["period_bounds"], "split": split,
                "boundary_offsets": offsets, "sensor_sides": model["sensor_sides"],
+               "sensors": sensors, "counting_sensors": model["counting_sensors"],
+               "segmentation_features": seg.shape[1], "recognition_features": rec.shape[1],
+               "sensor_preparation": manifest.get("recofit_sensors"),
                "reference_convention": model["reference_convention"],
                "note": "Feature scaling, start-to-start period bounds and wrist/axis boundary offsets fit training subjects only; C selected on validation windows. No session exercise lists."})
     return output/"model.joblib"
@@ -294,15 +319,21 @@ def load_model(path):
     model = joblib.load(path)
     if model.get("format") == "recofit_wrist_v1":
         raise ValueError("Retrain this RecoFit model: v1 uses duration-based periods and uncalibrated symmetric boundaries")
-    if (model.get("format") != "recofit_wrist_v2" or "boundary_offsets" not in model or
+    if (model.get("format") not in ("recofit_wrist_v2", "recofit_wrist_waist_v3") or "boundary_offsets" not in model or
             "sensor_sides" not in model or
             model.get("classes") != CLASSES or
             model.get("features") != FEATURES or model.get("sample_period_ms") != DT_MS):
         raise ValueError("Unsupported RecoFit model")
+    paired = model["format"] == "recofit_wrist_waist_v3"
+    if (model.get("sensors", "wrist") != ("wrist-waist" if paired else "wrist") or
+            (paired and "waist_stations" not in model) or
+            set(model.get("waist_stations", [])) - (set(CLASSES[1:]) - {"plank"}) or
+            (not paired and model.get("waist_stations"))):
+        raise ValueError("Unsupported RecoFit sensor configuration")
     return model
 
 
-def classify(model, x, valid):
+def classify(model, x, valid, *, waist_x=None):
     """Trailing-window SVMs + causal binary and station smoothing.
 
     The accumulator's default is 3 decisions (600 ms), rather than the paper's
@@ -318,7 +349,8 @@ def classify(model, x, valid):
     window, step = model["window_samples"], model["prediction_step"]
     ends = window_ends(valid, window, step)
     decisions, stations = [], []
-    for _, seg, rec in feature_batches(filtered, ends, window):
+    extra = {"waist_filtered": filtered_inputs(waist_x, valid)} if waist_x is not None else {}
+    for _, seg, rec in feature_batches(filtered, ends, window, **extra):
         decisions.extend(model["binary"].predict(seg).tolist())
         stations.extend(model["recognition"].predict(rec).tolist())
     accumulator, active, previous = 0, False, None
@@ -363,7 +395,7 @@ def classify(model, x, valid):
     return prediction
 
 
-def infer(model, t, x, valid, mode="causal", *, side=None):
+def infer(model, t, x, valid, mode="causal", *, side=None, waist_x=None, waist_valid=None):
     if side is None and len(model["sensor_sides"]) == 1:
         side = model["sensor_sides"][0]
     if side not in ("left_wrist", "right_wrist"):
@@ -372,16 +404,36 @@ def infer(model, t, x, valid, mode="causal", *, side=None):
     if (not len(t) or x.shape != (len(t), len(FEATURES)) or valid.shape != t.shape or
             not np.isfinite(x[valid]).all() or np.any(np.diff(t) != DT_MS)):
         raise ValueError("Inference needs finite sensor inputs on the complete 40 ms grid, plus a validity mask")
+    paired = model.get("sensors", "wrist") == "wrist-waist"
+    waist_missing = 0
+    if paired:
+        if waist_x is None or waist_valid is None:
+            raise ValueError("This model requires aligned waist_x and waist_valid; provide --waist-input for CSV prediction")
+        waist_x, waist_valid = np.asarray(waist_x), np.asarray(waist_valid, bool)
+        if (waist_x.shape != (len(t), 6) or waist_valid.shape != t.shape or
+                not np.isfinite(waist_x[valid & waist_valid]).all()):
+            raise ValueError("Expected finite aligned (time,6) waist acceleration/gyro and a validity mask")
+        waist_missing = int((valid & ~waist_valid).sum())
+        valid &= waist_valid
+    elif waist_x is not None or waist_valid is not None:
+        raise ValueError("A wrist-only model cannot use waist input; retrain with --sensors wrist-waist")
     start = time.perf_counter()
-    labels = classify(model, x, valid)
+    labels = classify(model, x, valid, **({"waist_x": waist_x} if paired else {}))
     result = decode(t, x, labels, valid, model["period_bounds"], mode,
                     model["prediction_step"], CounterConfig(**model["counter_config"]),
-                    boundary_offsets=model["boundary_offsets"].get(side, {}))
+                    boundary_offsets=model["boundary_offsets"].get(side, {}),
+                    waist_acceleration=waist_x, waist_stations=model.get("waist_stations", []))
+    result["sensors"] = model.get("sensors", "wrist")
+    result["counting_sensors"] = model.get("counting_sensors", {name: "wrist" for name in model["period_bounds"]})
+    result["available_samples"] = int(valid.sum())
+    result["waist_unavailable_samples"] = waist_missing
+    for event in result["repetitions"] + result["offline_peaks"]:
+        event["counting_sensor"] = result["counting_sensors"][event["station"]]
     result["side"] = side
     result["mode"] = mode
     result["runtime"] = {"compute_seconds": time.perf_counter()-start,
                          "sensor_seconds": len(t)*DT_MS/1000}
-    result["boundary_note"] = "Start/end offsets from peaks are calibrated on training references per exercise, wrist and PCA polarity axis, then scaled by local period. Uncalibrated peaks have no interval estimate. Residual timing error and pauses still require held-out measurement."
+    result["boundary_note"] = "Start/end offsets from peaks use the configured counting sensor, calibrated on training references per exercise, reference wrist and PCA polarity axis, then scaled by local period. Uncalibrated peaks have no interval estimate. Residual timing error and pauses still require held-out measurement."
     result["latency_note"] = (
         "Causal sample-time replay; reported_at_ms includes classifier/counter waiting but excludes compute/transport. Deadline must be measured against reference ends."
         if mode == "causal" else "Offline full-session diagnostic; every event is marked available at the final observed timestamp.")
@@ -404,9 +456,14 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
     for name in model["split"][split_name]:
         arrays = load_arrays(root/name)
         info = metadata[name]
-        labels, result = infer(model, arrays["t"], arrays["x"], arrays["valid"], mode, side=info["side"])
+        extra = {}
+        if model.get("sensors") == "wrist-waist":
+            paired_arrays = load_inputs(root/name, "wrist-waist")
+            extra = {"waist_x": paired_arrays["waist_x"], "waist_valid": paired_arrays["waist_available"]}
+        labels, result = infer(model, arrays["t"], arrays["x"], arrays["valid"], mode, side=info["side"], **extra)
         record = {"session": name, "source_session": info["source_session"],
                   "subject": info["subject"], "side": info["side"],
+                  "waist_unavailable_samples": result["waist_unavailable_samples"],
                   "uncalibrated_stations": result["uncalibrated_stations"],
                   "uncalibrated_peak_counts_by_station": result["uncalibrated_peak_counts_by_station"],
                   "confusion_matrix": confusion_matrix(arrays["y"], labels, arrays["valid"]).tolist(),
@@ -427,7 +484,9 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
         print(f"Evaluated {name}: {len(result['repetitions'])} complete interval estimates", flush=True)
     report = {**grouped_stream_report(records, tolerances, tolerance_ms),
               **uncalibrated_summary(records),
-              "method": "RecoFit-style adapted to wrist IMUs at 25 Hz", "mode": mode,
+              "method": "RecoFit-style adapted to 25 Hz IMUs", "mode": mode,
+              "sensors": result["sensors"], "counting_sensors": result["counting_sensors"],
+              "waist_unavailable_samples": sum(r["waist_unavailable_samples"] for r in records),
               "split": split_name, "report_scope": "single_split_diagnostic",
               "timing_tolerance_ms": tolerance_ms, "report_tolerances_ms": tolerances,
               "offline_peak_counts": peak_count_summary(records),
@@ -441,7 +500,7 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
     return report, records
 
 
-def predict(model_path, input_path, output, *, mode="causal", side=None):
+def predict(model_path, input_path, output, *, mode="causal", side=None, waist_input=None):
     if Path(output).exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
     model = load_model(model_path)
@@ -452,7 +511,14 @@ def predict(model_path, input_path, output, *, mode="causal", side=None):
     indices = ((sensor_t-t[0])//DT_MS).astype(int)
     x, valid = np.zeros((len(t), len(FEATURES)), np.float32), np.zeros(len(t), bool)
     x[indices], valid[indices] = sensor_x, True
-    labels, result = infer(model, t, x, valid, mode, side=side)
+    extra = {}
+    if waist_input is not None:
+        waist_x, waist_valid = aligned_waist(waist_input, t)
+        extra = {"waist_x": waist_x, "waist_valid": waist_valid}
+    labels, result = infer(model, t, x, valid, mode, side=side, **extra)
+    if waist_input is not None:
+        valid &= waist_valid
+        result["waist_input"] = str(Path(waist_input).resolve())
     out = new_directory(output)
     result["input"] = str(Path(input_path).resolve())
     result["reference_scoring"] = "unscored_sensor_only_prediction"
@@ -489,11 +555,12 @@ def cross_validate(root, output, *, folds=5, seed=42, mode="causal", tolerance_m
     scores = [s["segmentation_f1"] for s in summaries if s["segmentation_f1"] is not None]
     pooled = {**grouped_stream_report(all_records, tolerances, tolerance_ms),
               **uncalibrated_summary(all_records),
+              "waist_unavailable_samples": sum(r["waist_unavailable_samples"] for r in all_records),
               "offline_peak_counts": peak_count_summary(all_records),
               "report_scope": "subject_wise_cross_validation", "folds": summaries,
               "fold_segmentation_f1_mean": float(np.mean(scores)) if scores else None,
               "fold_segmentation_f1_std": float(np.std(scores)) if scores else None,
-              **{key: report[key] for key in ("method", "mode", "timing_tolerance_ms", "report_tolerances_ms",
+              **{key: report[key] for key in ("method", "mode", "sensors", "counting_sensors", "timing_tolerance_ms", "report_tolerances_ms",
                                               "reference_convention", "phase_order_validated", "excluded_sessions",
                                               "coverage_note", "latency_note", "boundary_note", "limitations")}}
     write_json(out/"report.json", pooled)

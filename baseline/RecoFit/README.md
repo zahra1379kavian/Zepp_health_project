@@ -4,7 +4,9 @@ This implements the classical counter in Morris et al., [RecoFit: Using a
 Wearable Sensor to Find, Recognize, and Count Repetitive Exercises (CHI 2014)](
 https://dmorris.net/publications/Morris_Workout_CHI_2014.pdf), with a two-stage
 exercise/rest and exercise-type SVM pipeline adapted to this project's **25 Hz
-wrist data**. It needs no station ID or session exercise list at inference.
+wrist data**, with an optional synchronized **wrist + waist** extension for
+exercises with little wrist motion, such as leg raises. It needs no station ID
+or session exercise list at inference.
 
 The implementation lives under `baseline/RecoFit/`. It reuses the project's data
 preparation and metrics modules, which require NumPy, pandas and SciPy, but
@@ -42,6 +44,74 @@ eligible timestamp, without subsampling the held-out recordings.
 `prepare` defaults to `baseline/RecoFit/data`; `demo` defaults to
 `baseline/RecoFit/runs/demo`. Generated data, run outputs, models, and the local
 virtual environment under `baseline/RecoFit/` are ignored by Git.
+
+## Waist support for leg raises
+
+Run the extension on the same subjects and wrist references:
+
+```bash
+python -m baseline.RecoFit run \
+  --data strength_training/tas_data_both_wrists \
+  --output baseline/RecoFit/runs/recofit_waist_cv \
+  --sensors wrist-waist --waist-stations leg_raise --folds 5
+```
+
+`run` automatically creates a paired dataset under its output's `data/` directory.
+It copies the prepared wrist data and adds `waist_x.npy` and
+`waist_available.npy` per stream. Original recordings and prepared inputs are
+preserved. Waist acceleration and gyro are joined by exact `sync_timestamp` on
+the 40 ms grid. No waist labels or magnetometer channels are read. Where multiple
+`*waist*.csv` devices exist, the device with the most overlapping timestamps is
+selected, with filename as a tie-breaker; devices are never stitched together.
+The chosen filename and availability are recorded in the manifest. Missing or
+non-overlapping devices and off-grid clocks raise an error. Recording tails
+outside the wrist grid are ignored; missing internal samples are never interpolated.
+
+Both classifiers concatenate independent wrist and waist features: **448
+exercise/rest features and 120 recognition features**. This lets the detector
+observe activity even when the wrist is still. For predicted `leg_raise` bouts,
+the counter uses waist acceleration; other exercises use wrist acceleration.
+`--waist-stations leg_raise crunch hip_thrust`, for example, selects additional
+dynamic exercises for waist counting. This is a fixed configuration, not routing
+from reference labels at inference. Devices are filtered separately to avoid
+switching artifacts. Boundary offsets are fitted using the same configured
+sensor and causal replay cadence used at inference, separately for each exercise,
+reference wrist and PCA polarity axis. Training subjects alone supply calibration
+and scaling; validation selects SVM C. A fresh **v3 paired model** is required.
+Existing v2 wrist-only models and the default `--sensors wrist` remain supported.
+
+A gap in either required sensor resets classification and counting. Paired models
+require both sensors and have no wrist-only fallback. Evaluation keeps the
+original wrist validity and reference coverage, so missing waist samples do not
+remove difficult intervals from scoring. Reports include `sensors`,
+`counting_sensors`, and `waist_unavailable_samples`; repetition and offline-peak
+events include `counting_sensor`. Paired wrist streams still represent separate
+observations of the same workout, even when they share a waist device.
+
+For separate preparation and fitting:
+
+```bash
+python -m baseline.RecoFit prepare-waist \
+  --data strength_training/tas_data_both_wrists \
+  --output baseline/RecoFit/runs/paired_data
+python -m baseline.RecoFit train \
+  --data baseline/RecoFit/runs/paired_data --sensors wrist-waist \
+  --output baseline/RecoFit/runs/paired_model
+```
+
+`prepare-waist --source PATH` overrides the original recordings path from the
+manifest. `train` and `cross-validate` require an already paired dataset when
+`--sensors wrist-waist` is selected. For raw prediction, add
+`--waist-input path/to/S1_waist.csv` to the existing `predict` command; Python
+callers provide aligned `(time, 6)` `waist_x` and `waist_valid` to `infer`.
+Waist inputs are mandatory for paired models and rejected by wrist-only models.
+
+Compare the new held-out report with the wrist-only run using the same folds,
+seed and training settings, especially `leg_raise` recognition, repetition recall,
+count MAE and delay. Synthetic tests verify recognition and counting with flat
+wrist signals, but do not establish an improvement on real subjects. Waist motion
+can also be weak, and the existing classifier cold start and calibration limits
+still apply.
 
 ## Prepare from the cleaned recordings
 
@@ -84,6 +154,7 @@ counter does not produce repetition interval estimates.
 | --- | --- |
 | Exercise/rest features | 28 statistics for each of 8 acceleration/gyro signals: 224 features |
 | Exercise recognition features | 20 statistics for aX, aYZPC1 and gPC1: 60 features |
+| Optional waist extension | Concatenate independently extracted wrist/waist features (448 / 120); waist counter for configured exercises, default `leg_raise` |
 | Classifiers | StandardScaler + balanced L2 linear SVMs; a binary detector and a multiclass recognizer |
 | Counting signal | 0.15–11 Hz elliptic bandpass of raw acceleration, mean subtraction, first PCA component |
 | Candidate peaks | Amplitude-ranked rejection inside the minimum period |
@@ -272,7 +343,7 @@ predictions are not silently treated as incorrect reference repetitions.
 Run the regression and integration checks:
 
 ```bash
-python -m unittest baseline.RecoFit.tests.test_recofit -v
+python -m unittest discover -s baseline/RecoFit/tests -v
 python -m baseline.RecoFit demo --output baseline/RecoFit/runs/demo
 ```
 
@@ -290,6 +361,10 @@ preparation, subject separation, training-only period fitting, raw label leakage
 multiple timing tolerances, and separate offline count metrics. The demo runs
 three-fold cross-validation on synthetic data with paired wrists and then raw
 sensor-only prediction. Synthetic results do not establish real accuracy.
+The waist tests additionally cover exact-clock alignment, device selection without
+stitching, quiet-wrist leg raises, matching training/inference sensor calibration,
+held-out-target independence, causal prefixes, sensor gaps, raw paired prediction,
+and retention of dropout penalties in scoring.
 
 A capped fit was also checked on the existing real version-4 data, followed by
 180 seconds of held-out replay in both modes. Generated smoke-test artifacts

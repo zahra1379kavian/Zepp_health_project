@@ -123,7 +123,8 @@ def peak_windows(filtered, a, b, min_period_s, max_period_s, mode="causal", step
 
 
 def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
-           config=CounterConfig(), *, boundary_offsets=None):
+           config=CounterConfig(), *, boundary_offsets=None, waist_acceleration=None,
+           waist_stations=()):
     """Counter consumes predicted labels only. Causal events are never retracted.
 
     Labels are stabilized by classify; a committed station change ends the set.
@@ -142,6 +143,11 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
         raise ValueError("Invalid decode mode or step")
     t, labels, valid = np.asarray(t), np.asarray(labels), np.asarray(valid, bool)
     filtered = bandpass(acceleration, valid)
+    if waist_stations and waist_acceleration is None:
+        raise ValueError("Waist counting requires aligned waist acceleration")
+    # Filter devices independently before selecting a predicted exercise's signal.
+    # Splicing raw axes at station changes would introduce artificial peaks.
+    waist_filtered = bandpass(waist_acceleration, valid) if waist_stations else None
     repetitions, holds, peaks, uncalibrated = [], [], [], set()
     uncalibrated_counts = Counter()
     boundary_offsets = boundary_offsets or {}
@@ -163,7 +169,8 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
         minimum, maximum = period_bounds[name]["min_s"], period_bounds[name]["max_s"]
         last_peak, last_period = -np.inf, 0
         last_uncalibrated_peak, last_uncalibrated_period = -np.inf, 0
-        for tick, left, candidates in peak_windows(filtered, a, b, minimum, maximum, mode, step, config):
+        counting_signal = waist_filtered if name in waist_stations else filtered
+        for tick, left, candidates in peak_windows(counting_signal, a, b, minimum, maximum, mode, step, config):
             for row in candidates:
                 peak, period = left+row["index"], row["period_samples"]
                 if mode == "causal" and peak-last_peak < config.spacing_fraction*max(2, min(period, last_period)):

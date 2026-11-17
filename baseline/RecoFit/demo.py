@@ -9,7 +9,7 @@ from strength_training.temporal_segmentation.constants import DT_MS, FEATURES
 from strength_training.temporal_segmentation.data import prepare, write_json
 
 
-def synthetic_source(root, subjects=6):
+def synthetic_source(root, subjects=6, *, include_waist=False):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=False)
     rng, logs, alignments = np.random.default_rng(19), [], []
@@ -18,7 +18,7 @@ def synthetic_source(root, subjects=6):
         session = "20260101_"+subject_id
         folder = root/session
         folder.mkdir()
-        t = 1767225600000+np.arange(1400, dtype=np.int64)*DT_MS
+        t = 1767225600000+np.arange(2000 if include_waist else 1400, dtype=np.int64)*DT_MS
         labels = np.full(len(t), "rest", dtype="<U40")
         x = rng.normal(0, .015, (len(t), len(FEATURES)))
         for name, start, length, count, bias in (("squat", 100, 50, 8, 2.),
@@ -35,9 +35,26 @@ def synthetic_source(root, subjects=6):
                 x[a:b, 4] += .2*np.sin(phase)
         labels[1100:1200] = "plank"
         x[1100:1200, 2] += 4
+        if include_waist:
+            waist = x.copy()
+            # Leg raises with a stationary wrist and a periodic waist signal.
+            x[1300:1800, :6] = 0
+            for a in range(1300, 1800, 50):
+                phase = np.arange(50)*2*np.pi/50
+                labels[a:a+25] = "leg_raise_phase1"
+                labels[a+25:a+50] = "leg_raise_phase2"
+                waist[a:a+50, 0] += np.sin(phase)
+                waist[a:a+50, 3] += np.cos(phase)
+            frame = pd.DataFrame(waist[:, :6], columns=FEATURES[:6])
+            frame.insert(0, "sync_timestamp", t)
+            frame["labels"] = "ignored_waist_annotation"
+            frame.to_csv(folder/"S1_waist.csv", index=False)
         pd.DataFrame({"sync_timestamp": t, "left_wrist": labels, "right_wrist": labels}).to_csv(folder/"label.csv", index=False)
         for side in ("left_wrist", "right_wrist"):
-            frame = pd.DataFrame(x+rng.normal(0, .003, x.shape), columns=FEATURES)
+            values = x+rng.normal(0, .003, x.shape)
+            if include_waist:
+                values[1300:1800, :6] = 0
+            frame = pd.DataFrame(values, columns=FEATURES)
             frame.insert(0, "sync_timestamp", t)
             frame["timestamp"] = t+1234
             frame["labels"] = labels
