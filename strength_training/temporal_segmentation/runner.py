@@ -21,6 +21,7 @@ from .metrics import (aggregate_repetitions, classification_metrics, confusion_m
                       count_rows, covered_repetitions, false_exercise_events, repetition_metrics,
                       reporting_tolerances, score_stream, aggregate_streams, grouped_stream_report)
 from .model import DenseMSTCN, ModelConfig, configuration, dense_loss
+from .augmentation import augment
 
 
 def digest(path):
@@ -32,7 +33,8 @@ def digest(path):
 
 
 class Windows(Dataset):
-    def __init__(self, root, sessions, norm, history, width, repetition_head="boundary"):
+    def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
+                 lookahead=0, augmentation=False, features=None):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name) for name in sessions]
@@ -40,11 +42,15 @@ class Windows(Dataset):
         self.std = np.asarray(norm["std"], np.float32)
         self.history, self.width = history, width
         self.repetition_head = repetition_head
+        self.lookahead, self.augmentation = lookahead, augmentation
+        self.features = FEATURES if features is None else features
+        if augmentation and repetition_head != "phase":
+            raise ValueError("Time-warp augmentation requires dense phase targets")
         self.windows = []
         for i, arrays in enumerate(self.arrays):
             for a, b in runs(arrays["valid"]):
-                for start in range(a, b, width):
-                    self.windows.append((i, a, start, min(start + width, b)))
+                for start in range(a, b - lookahead, width):
+                    self.windows.append((i, a, start, min(start + width, b - lookahead)))
 
     def __len__(self):
         return len(self.windows)
@@ -52,25 +58,31 @@ class Windows(Dataset):
     def __getitem__(self, i):
         session, run_start, start, end = self.windows[i]
         arrays = self.arrays[session]
-        left, length = max(run_start, start - self.history), self.history + self.width
+        left, length = max(run_start, start - self.history), self.history + self.width + self.lookahead
         offset = self.history - (start - left)
-        stop = offset + end - left
-        x = np.zeros((length, len(FEATURES)), np.float32)
-        x[offset:stop] = (arrays["x"][left:end] - self.mean) / self.std
+        right = end + self.lookahead
+        stop = offset + right - left
+        values = {key: np.array(arrays[key][left:right], copy=True)
+                  for key in ("y", "boundary", "coverage", "phase", "phase_mask") if key in arrays}
+        raw_x = arrays["x"][left:right]
+        if self.augmentation:
+            raw_x, values = augment(raw_x, values, self.features)
+        x = np.zeros((length, len(self.mean)), np.float32)
+        x[offset:stop] = (raw_x - self.mean) / self.std
         mask = np.zeros((1, length), np.float32)
         mask[:, offset:stop] = 1
         target_mask = np.zeros(length, bool)
-        target_mask[self.history:stop] = True
+        target_mask[self.history:stop - self.lookahead] = True
         y = np.zeros(length, np.int64)
-        y[offset:stop] = arrays["y"][left:end]
+        y[offset:stop] = values["y"]
         boundary = np.zeros((length, 2), np.float32)
-        boundary[offset:stop] = arrays["boundary"][left:end]
+        boundary[offset:stop] = values["boundary"]
         reference = np.zeros(length, bool)
-        reference[offset:stop] = arrays["coverage"][left:end]
+        reference[offset:stop] = values["coverage"]
         if self.repetition_head == "phase":
             boundary = np.zeros(length, np.int64)
-            boundary[offset:stop] = arrays["phase"][left:end]
-            reference[offset:stop] = arrays["phase_mask"][left:end]
+            boundary[offset:stop] = values["phase"]
+            reference[offset:stop] = values["phase_mask"]
         return tuple(torch.from_numpy(a.copy()) for a in (x.T, mask, y, boundary, target_mask, reference))
 
 
@@ -101,10 +113,16 @@ def train(args):
         head = "phase" if manifest.get("reference_mode") == "labels" and not args.station_only else "boundary"
     if head == "phase" and not manifest.get("phase_order_validated"):
         raise ValueError("Dense phase training requires the validated phase convention; reprepare data")
-    config = ModelConfig(stages=args.stages, layers=args.layers, channels=args.channels, repetition_head=head)
+    lookahead_ms = getattr(args, "lookahead_ms", 0)
+    if lookahead_ms < 0:
+        raise ValueError("lookahead-ms must be nonnegative")
+    config = ModelConfig(inputs=len(manifest["features"]), stages=args.stages, layers=args.layers,
+                         channels=args.channels, repetition_head=head,
+                         lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)))
     model = DenseMSTCN(config).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
-                               model.history_samples, args.window, head)
+                               model.history_samples, args.window, head, config.lookahead_samples,
+                               split == "train" and getattr(args, "augment", False), manifest["features"])
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
@@ -169,7 +187,9 @@ def train(args):
         if best is None or key > best:
             best, stale = key, 0
             checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
-                          "normalization": manifest["normalization"], "classes": CLASSES, "features": FEATURES,
+                          "normalization": manifest["normalization"], "classes": CLASSES, "features": manifest["features"],
+                          "augmentation": getattr(args, "augment", False),
+                          "analysis": manifest.get("analysis"),
                           "location": manifest["location"], "station_only": args.station_only,
                           "sensor_policy": manifest.get("wrist_selection"),
                           "training_streams": [{key: row.get(key) for key in ("session", "source_session", "subject", "side")}
@@ -196,7 +216,9 @@ def load_checkpoint(path, device="cpu", data=None):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     if checkpoint["location"] not in WRIST_LOCATIONS:
         raise ValueError("This method now uses wrist signals only; retrain the old waist checkpoint")
-    if checkpoint["classes"] != CLASSES or checkpoint["features"] != FEATURES:
+    allowed_features = [FEATURES, FEATURES[:6],
+                        [f"{site}_{f}" for site in ("wrist", "waist") for f in FEATURES[:6]]]
+    if checkpoint["classes"] != CLASSES or checkpoint["features"] not in allowed_features:
         raise ValueError("Checkpoint vocabulary/features are incompatible")
     if data is not None and digest(Path(data) / "manifest.json") != checkpoint["data_manifest_sha256"]:
         raise ValueError("Dataset manifest differs from the checkpoint's training dataset")
@@ -213,15 +235,26 @@ def probabilities(model, x, valid, norm, device="cpu", chunk=512):
     p = np.zeros((len(x), len(CLASSES)), np.float32)
     q = np.zeros((len(x), model.config.repetition_classes), np.float32)
     mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
+    lag = model.config.lookahead_samples
     for a, b in runs(valid):
         state = None
         for left in range(a, b, chunk):
             right = min(b, left + chunk)
             features = torch.tensor(((x[left:right] - mean) / std).T[None], device=device)
             station, boundary, state = model.stream(features, state)
-            p[left:right] = station.softmax(1)[0].T.cpu().numpy()
-            q[left:right] = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
+            first = max(left, a + lag)
+            if first < right:
+                p[first-lag:right-lag] = station.softmax(1)[0, :, first-left:].T.cpu().numpy()
+                q[first-lag:right-lag] = model.repetition_probabilities(boundary)[0, :, first-left:].T.cpu().numpy()
     return p, q
+
+
+def prediction_mask(valid, lookahead):
+    result = np.array(valid, copy=True)
+    if lookahead:
+        for a, b in runs(valid):
+            result[max(a, b-lookahead):b] = False
+    return result
 
 
 def checkpoint_key(summary):
@@ -236,6 +269,8 @@ def validation_cache(model, root, manifest, device):
         if not a["coverage"].any():
             continue
         p, q = probabilities(model, a["x"], a["valid"], manifest["normalization"], device)
+        a["valid"] = prediction_mask(a["valid"], model.config.lookahead_samples)
+        a["lookahead_ms"] = model.config.lookahead_samples * DT_MS
         refs = json.loads((Path(root) / name / "references.json").read_text())
         cache.append((name, a, p, q, refs))
     return cache
@@ -244,7 +279,8 @@ def validation_cache(model, root, manifest, device):
 def score_cache(cache, config, tolerance, require_station=True):
     scores, rows = [], []
     for name, a, p, q, refs in cache:
-        result = decode_sequence(a["t"], p, q, a["valid"], config)
+        result = decode_sequence(a["t"], p, q, a["valid"], config,
+                                 lookahead_ms=a.get("lookahead_ms", 0))
         scored, _ = covered_repetitions(result["repetitions"], a["t"], a["coverage"],
                                         refs, tolerance, require_station)
         scores.append(repetition_metrics(scored, refs, tolerance, require_station))
@@ -277,14 +313,17 @@ def evaluate(args):
         p, q = probabilities(model, arrays["x"], arrays["valid"], ckpt["normalization"], args.device)
         if ckpt["station_only"]:
             q[:] = 0
-        decoded = decode_sequence(arrays["t"], p, q, arrays["valid"], config)
+        lag = ckpt.get("config", {}).get("lookahead_samples", 0)
+        infer_valid = prediction_mask(arrays["valid"], lag)
+        decoded = decode_sequence(arrays["t"], p, q, infer_valid, config, lookahead_ms=lag * DT_MS)
         predicted = p.argmax(1)
-        cm = confusion_matrix(arrays["y"], predicted, arrays["valid"])
+        cm = confusion_matrix(arrays["y"], predicted, infer_valid)
         info = metadata[name]
         record = {"session": name, "source_session": info.get("source_session", name),
                   "subject": info["subject"], "side": info.get("side", info["label_column"]),
                   "confusion_matrix": cm.tolist(), "repetition_scores": {},
-                  **false_exercise_events(arrays["y"], predicted, arrays["valid"]),
+                  **false_exercise_events(arrays["y"], predicted, infer_valid),
+                  "unavailable_lookahead_samples": int((arrays["valid"] & ~infer_valid).sum()),
                   "eligible_samples": int(arrays["valid"].sum()),
                   "reference_samples": int(arrays["coverage"].sum())}
         references = json.loads((root / name / "references.json").read_text())
@@ -311,6 +350,8 @@ def evaluate(args):
               "reference_convention": manifest.get("reference_convention"),
               "phase_order_validated": manifest.get("phase_order_validated", False),
               "sensor_policy": manifest.get("wrist_selection"),
+              "analysis": manifest.get("analysis"),
+              "model_lookahead_ms": ckpt.get("config", {}).get("lookahead_samples", 0) * DT_MS,
               "per_subject_session": sessions,
               "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
               "coverage_note": "Counts cover certified, available wrist streams. Paired wrists observe the same workout; pooled repetitions and stream-hours are not distinct workout totals. Both wrists stay in the same subject fold.",
@@ -369,13 +410,27 @@ def predict(args):
             input_side in ("left_wrist", "right_wrist") and input_side != ckpt["location"]):
         raise ValueError("Input wrist side differs from the checkpoint's training location")
     config, _, selection = decoder_config(args.decoder, args.checkpoint)
-    t, x = load_sensor(args.input)
+    features = ckpt["features"]
+    paired = features[0].startswith("wrist_")
+    t, x = load_sensor(args.input, FEATURES[:6] if paired else features)
+    if paired:
+        if not getattr(args, "waist_input", None):
+            raise ValueError("This checkpoint requires --waist-input in addition to --input wrist.csv")
+        waist_t, waist_x = load_sensor(args.waist_input, FEATURES[:6], allow_waist=True)
+        t, wrist_indices, waist_indices = np.intersect1d(t, waist_t, return_indices=True)
+        if not len(t):
+            raise ValueError("Wrist and waist have no exactly aligned samples")
+        x = np.concatenate((x[wrist_indices], waist_x[waist_indices]), axis=1)
+    elif getattr(args, "waist_input", None):
+        raise ValueError("--waist-input requires a paired wrist+waist checkpoint")
     norm = ckpt["normalization"]
     x = (x - np.array(norm["mean"], np.float32)) / np.array(norm["std"], np.float32)
     out.mkdir(parents=True)
     decoder, repetitions, latencies = RepDecoder(config), [], []
     all_p = np.zeros((len(t), len(CLASSES)), np.float32)
     all_q = np.zeros((len(t), model.config.repetition_classes), np.float32)
+    output_valid = np.zeros(len(t), bool)
+    lag = model.config.lookahead_samples
     # Break at actual missing clocks; no interpolation and no phantom cycles.
     edges = np.r_[0, np.flatnonzero(np.diff(t) != DT_MS) + 1, len(t)]
     with (out / "events.jsonl").open("w") as event_file:
@@ -393,16 +448,21 @@ def predict(args):
                 q = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
                 if ckpt["station_only"]:
                     q[:] = 0
-                all_p[left:right], all_q[left:right] = p, q
+                first = max(left, a + lag)
+                if first < right:
+                    all_p[first-lag:right-lag], all_q[first-lag:right-lag] = p[first-left:], q[first-left:]
+                    output_valid[first-lag:right-lag] = True
                 batch_events = []
-                for i in range(right-left):
-                    batch_events.extend(decoder.step(t[left+i], p[i], q[i], reported_at_ms=int(t[right-1])))
+                for i in range(first-left, right-left):
+                    batch_events.extend(decoder.step(t[left+i-lag], p[i], q[i], reported_at_ms=int(t[right-1])))
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 latencies.append(elapsed_ms)
                 for event in batch_events:
                     event["compute_ms"] = elapsed_ms
                     event["decoder_delay_ms"] = config.lag_frames * DT_MS
-                    event["buffer_delay_ms"] = event["reported_at_ms"] - event["end_ms"] - event["decoder_delay_ms"]
+                    event["model_lookahead_ms"] = lag * DT_MS
+                    event["buffer_delay_ms"] = (event["reported_at_ms"] - event["end_ms"]
+                                                 - event["decoder_delay_ms"] - lag * DT_MS)
                     event["report_delay_from_predicted_end_ms"] = event["reported_at_ms"] - event["end_ms"] + elapsed_ms
                     event_file.write(json.dumps(event) + "\n")
                 if batch_events:
@@ -412,10 +472,11 @@ def predict(args):
         writer = csv.writer(handle)
         rep_columns = (["phase_null_probability", "phase1_probability", "phase2_probability"]
                        if model.config.repetition_head == "phase" else ["start_probability", "end_probability"])
-        writer.writerow(["sync_timestamp", "predicted_station", "confidence", *rep_columns])
-        for clock, p, q in zip(t, all_p, all_q):
-            writer.writerow([int(clock), CLASSES[int(p.argmax())], float(p.max()), *map(float, q)])
-    holds = decode_sequence(t, all_p, np.zeros_like(all_q), np.ones(len(t), bool), config)["holds"]
+        writer.writerow(["sync_timestamp", "prediction_available", "predicted_station", "confidence", *rep_columns])
+        for clock, valid, p, q in zip(t, output_valid, all_p, all_q):
+            writer.writerow([int(clock), bool(valid), CLASSES[int(p.argmax())] if valid else "unavailable",
+                             float(p.max()), *map(float, q)])
+    holds = decode_sequence(t, all_p, np.zeros_like(all_q), output_valid, config)["holds"]
     summary = {"repetitions": repetitions, "counts": dict(Counter(r["station"] for r in repetitions)),
                "holds": holds, "sets": group_sets(repetitions, config.set_gap_ms),
                "station_only": ckpt["station_only"], "decoder_selection": selection,
@@ -424,6 +485,7 @@ def predict(args):
                "compute_ms_p95": float(np.percentile(latencies, 95)),
                "compute_ms_max": max(latencies), "maximum_buffer_delay_ms": (args.chunk - 1) * DT_MS,
                "decoder_confirmation_delay_ms": config.lag_frames * DT_MS,
+               "model_lookahead_ms": lag * DT_MS, "features": features,
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
     write_json(out / "predictions.json", summary)
     return summary
@@ -471,8 +533,11 @@ def completed_fold_report(args, fold, expected_manifest, tolerances):
     if head == "auto":
         head = "phase" if expected_manifest.get("reference_mode") == "labels" else "boundary"
     expected_config = {"stages": args.stages, "layers": args.layers, "channels": args.channels,
-                       "repetition_head": head}
-    if (any(checkpoint["config"].get(key) != value for key, value in expected_config.items())
+                       "repetition_head": head,
+                       "lookahead_samples": int(np.ceil(getattr(args, "lookahead_ms", 0) / DT_MS))}
+    if (any(checkpoint["config"].get(key, 0 if key == "lookahead_samples" else None) != value
+            for key, value in expected_config.items())
+            or checkpoint.get("augmentation", False) != getattr(args, "augment", False)
             or checkpoint["seed"] != args.seed or checkpoint["station_only"]
             or checkpoint["tolerance_ms"] != args.tolerance_ms
             or checkpoint["partial_epoch_max_steps"] != args.max_steps):

@@ -58,13 +58,14 @@ def runs(mask):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
-def load_sensor(path):
-    if "waist" in Path(path).stem.lower():
+def load_sensor(path, features=None, allow_waist=False):
+    if "waist" in Path(path).stem.lower() and not allow_waist:
         raise ValueError("This method uses wrist signals only; received a waist file")
+    features = FEATURES if features is None else features
     # Explicit usecols excludes every embedded label, including duplicate headers.
-    frame = pd.read_csv(path, usecols=["sync_timestamp", *FEATURES])
+    frame = pd.read_csv(path, usecols=["sync_timestamp", *features])
     t = frame.sync_timestamp.to_numpy(dtype=np.int64)
-    x = frame[FEATURES].to_numpy(dtype=np.float32)
+    x = frame[features].to_numpy(dtype=np.float32)
     if not len(t) or np.any(np.diff(t) <= 0) or not np.isfinite(x).all():
         raise ValueError(f"{path}: empty, nonfinite or unordered sensor input")
     if np.any((t - t[0]) % DT_MS):
@@ -395,7 +396,10 @@ def load_arrays(path):
 
 def training_statistics(root, sessions):
     """Fit normalization and all loss weights on this fold's training subjects."""
-    sums, squares, count = np.zeros(len(FEATURES)), np.zeros(len(FEATURES)), 0
+    if not sessions:
+        raise ValueError("No training sessions")
+    dimensions = load_arrays(Path(root) / sessions[0])["x"].shape[1]
+    sums, squares, count = np.zeros(dimensions), np.zeros(dimensions), 0
     class_counts, phase_counts = np.zeros(len(CLASSES), np.int64), np.zeros(3, np.int64)
     boundary_positives, boundary_frames = np.zeros(2), 0
     for name in sessions:

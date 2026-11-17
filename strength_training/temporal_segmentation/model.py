@@ -24,12 +24,15 @@ class ModelConfig:
     channels: int = 64
     dropout: float = .3
     repetition_head: str = "phase"
+    lookahead_samples: int = 0
 
     def __post_init__(self):
         if min(self.inputs, self.classes, self.stages, self.layers, self.channels) < 1:
             raise ValueError("Model dimensions must be positive")
         if self.repetition_head not in ("phase", "boundary"):
             raise ValueError("repetition_head must be phase or boundary")
+        if not isinstance(self.lookahead_samples, int) or self.lookahead_samples < 0:
+            raise ValueError("lookahead_samples must be a nonnegative integer")
 
     @property
     def repetition_classes(self):
@@ -98,14 +101,22 @@ class DenseMSTCN(nn.Module):
             station, boundary = stage(x, mask)
             results.append((station, boundary))
             x = torch.cat((station.softmax(1), self.repetition_probabilities(boundary)), dim=1) * mask
+        # A causal output acquired at t+L predicts the target at t. Shift only
+        # after all refinement stages so their lookaheads do not accumulate.
+        lag = self.config.lookahead_samples
+        if lag:
+            results = [(F.pad(p[:, :, lag:], (0, min(lag, p.shape[-1]))),
+                        F.pad(q[:, :, lag:], (0, min(lag, q.shape[-1])))) for p, q in results]
         return results
 
     @torch.no_grad()
     def stream(self, x, state=None):
         """Exact cached causal inference. Reset state at gaps/session changes.
 
-        Accepts [batch, channels, time]; predictions for a prefix are independent
-        of subsequent samples and of the caller's chunk boundaries.
+        Accepts [batch, channels, time]. Returns acquisition-clock outputs:
+        an output at sample i belongs to target i-lookahead_samples. Callers
+        discard the initial lookahead outputs after each reset; never flush
+        missing future samples at EOF. Chunk boundaries do not affect outputs.
         """
         if self.training:
             raise ValueError("Call model.eval() before streaming")

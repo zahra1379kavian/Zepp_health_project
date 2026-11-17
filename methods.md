@@ -5,9 +5,23 @@ TS2Vec is a sensible way to pretrain the encoder on all 88 hours before fine-tun
 
 
 Step	Goal	Method
-1	Baseline	RecoFit-style counter: band-pass → PCA → autocorrelation peaks. It needs no station label.
 2	Rep segmentation (main model)	Current causal MS-TCN with the phase1/phase2 head, plus three changes: add about 0.5 s of lookahead, test accelerometer + gyroscope only (no magnetometer), and add augmentation (small rotations, time-warp, scaling).
-3	Check unknown stations	Leave-one-exercise-out: train on 14 exercises, test rep segmentation on the 15th. If it fails, fall back to the step 1 counter whenever the station is "unknown".
-5	Station recognition (later)	Contrastive embedding (Lee & Kim mixup triplets, or OOD-aware SupCon), averaged over each detected set, then nearest prototype with a distance threshold for "unknown".
+Leave-one-exercise-out test. Train with one exercise removed, then score station-ignored rep F1 on it in held-out subjects.
+Mask the held-out exercise's frames during training; do not label them rest, or the model learns to ignore it.
+Start with three or four exercises on one fold, not all 15.
+No flag for this exists yet in temporal_segmentation/.
+
+Make RecoFit usable as the unknown-station fallback. Its boundary offsets are calibrated per exercise, so for an unknown station it emits no intervals. It needs a pooled, exercise-independent calibration.
+Decide whether a waist sensor is allowed at deployment. In leg raises and crunches the wrist barely moves, so a wrist-only model is unlikely to fix them. If the product is wrist-only, report these two as a sensor limit.
 
 How to enhance RecoFit model to detect start and end of a repitition? Learn the edges from training data with a small regressor, or by matching a typical repetition shape for each exercise. This is likely the most accurate, but it is no longer RecoFit.
+
+
+Where the MS-TCN loses reps
+Of the 3,066 missed reps:
+No prediction at all (47%):
+Exercises: leg raise has 72% of sets missed entirely, crunch 41%, pull-up 21%.
+Set edges: the first rep of a set is missed 52% of the time and the last 39%, against 24% for interior reps.
+Detected but wrong boundaries (53%): one rep split into two (26%), an endpoint off by more than 400 ms (15%), or two reps merged (12%).
+Phantom reps in rest: 605 over 21.6 stream-hours of rest, about 28 per hour.
+Generalisation gap: training loss is 0.23 against 0.51 on validation, with only 25 training subjects per fold.

@@ -130,7 +130,7 @@ def group_sets(repetitions, gap_ms=10000):
     return sets
 
 
-def decode_sequence(t, station_prob, boundary_prob, valid, config=None):
+def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahead_ms=0):
     decoder, reps, holds = RepDecoder(config), [], []
     hold_start = None
     previous = None
@@ -144,7 +144,8 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None):
             hold_start = None
         if is_hold and hold_start is None:
             hold_start = int(clock)
-        reps.extend(decoder.step(clock, station_prob[i], boundary_prob[i], bool(valid[i])))
+        reps.extend(decoder.step(clock, station_prob[i], boundary_prob[i], bool(valid[i]),
+                                 reported_at_ms=int(clock) + lookahead_ms))
         previous = int(clock)
     if hold_start is not None:
         end = int(t[-1] + DT_MS)
