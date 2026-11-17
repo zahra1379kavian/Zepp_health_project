@@ -36,17 +36,23 @@ def waist_on_grid(source, row, t):
     files = sorted((Path(source) / row["source_session"]).glob("*waist*.csv"))
     x, available = np.zeros((len(t), 6), np.float32), np.zeros(len(t), bool)
     if not files:
-        return x, available
-    if len(files) != 1:
-        raise ValueError(f"Ambiguous waist sensors for {row['source_session']}: {files}")
-    clocks, values = load_sensor(files[0], FEATURES[:6], allow_waist=True)
-    indices = np.searchsorted(t, clocks)
-    inside = indices < len(t)
-    inside[inside] &= t[indices[inside]] == clocks[inside]
-    if not inside.all():
-        raise ValueError(f"{files[0]}: waist clock does not exactly match the wrist label grid")
+        return x, available, {"selected": None, "candidates": []}
+    candidates, selected = [], None
+    for path in files:
+        clocks, values = load_sensor(path, FEATURES[:6], allow_waist=True)
+        indices = np.searchsorted(t, clocks)
+        inside = indices < len(t)
+        inside[inside] &= t[indices[inside]] == clocks[inside]
+        if not inside.all():
+            raise ValueError(f"{path}: waist clock does not exactly match the wrist label grid")
+        candidates.append({"file": path.name, "aligned_samples": len(clocks)})
+        # Clock availability only; never examine labels or model performance.
+        # Strict greater-than preserves lexicographic filename tie-breaking.
+        if selected is None or len(clocks) > len(selected[1]):
+            selected = path, indices, values
+    path, indices, values = selected
     x[indices], available[indices] = values, True
-    return x, available
+    return x, available, {"selected": path.name, "candidates": candidates}
 
 
 def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=False,
@@ -64,11 +70,15 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
     view["features"] = FEATURES[:] if sensor_set == "all" else FEATURES[:6]
     if waist:
         view["features"] = [f"{site}_{f}" for site in ("wrist", "waist") for f in FEATURES[:6]]
+    if waist or paired_control:
+        view["waist_source"] = str(Path(source or manifest["source"]).resolve())
+        view["waist_selection"] = "Most aligned samples per source session; filename breaks ties. Clock-only selection, no device stitching."
     view["wrist_selection"] = ("paired wrist + waist signals; wrist labels only" if waist else
                                 "wrist signals; matched waist availability" if paired_control else
                                 manifest["wrist_selection"])
     masked_names = set(split["train"] + split["validation"])
     audit = []
+    cached_waist = None
     for row in view["sessions"]:
         name = row["session"]
         original = root / name
@@ -78,8 +88,12 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
         if sensor_set == "acc_gyro":
             updates["x"] = np.array(arrays["x"][:, :6])
         waist_available = None
+        waist_info = None
         if waist or paired_control:
-            waist_x, waist_available = waist_on_grid(source or manifest["source"], row, arrays["t"])
+            if cached_waist is None or cached_waist[0] != row["source_session"]:
+                cached_waist = (row["source_session"],
+                                waist_on_grid(source or manifest["source"], row, arrays["t"]))
+            waist_x, waist_available, waist_info = cached_waist[1]
             valid &= waist_available
             if waist:
                 updates["x"] = np.concatenate((arrays["x"][:, :6], waist_x), axis=1)
@@ -109,6 +123,7 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
                       "held_out_masked_frames": int((removed & arrays["valid"]).sum()),
                       "waist_unavailable_frames": int((arrays["valid"] & ~waist_available).sum())
                       if waist_available is not None else 0,
+                      "waist_sensor": waist_info,
                       "eligible_frames": int(valid.sum()), "reference_repetitions": len(refs)})
     view.update(training_statistics(dest, split["train"]))
     write_json(dest / "mask_audit.json", audit)

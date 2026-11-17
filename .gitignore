@@ -1,6 +1,7 @@
 # Local sensor datasets
 /strength_training/strength_training_data_clean/
 /strength_training/strength_training_data_aligned/
+baseline/RecoFit/figures
 
 # Python and notebook caches
 __pycache__/

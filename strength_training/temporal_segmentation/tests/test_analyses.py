@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 from strength_training.temporal_segmentation.__main__ import main
-from strength_training.temporal_segmentation.analyses.common import make_view, exercise_predictions
+from strength_training.temporal_segmentation.analyses.common import make_view, exercise_predictions, waist_on_grid
 from strength_training.temporal_segmentation.augmentation import augment
 from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
 from strength_training.temporal_segmentation.data import load_arrays, prepare, subject_folds
@@ -176,6 +176,20 @@ class AnalysisTests(unittest.TestCase):
         t = np.arange(50) * 40
         coverage = (t >= 400) & (t < 1000)
         self.assertEqual(exercise_predictions(reps, refs, t, coverage, 200), reps[:2])
+
+    def test_multiple_waist_devices_selected_by_clock_coverage_only(self):
+        row = self.manifest["sessions"][0]
+        folder = self.root / "source" / row["source_session"]
+        frame = pd.read_csv(folder / "left_wrist.csv")
+        frame["labels"] = "not_an_exercise_label"
+        frame.to_csv(folder / "S2_waist.csv", index=False)
+        t = load_arrays(self.data / row["session"])["t"]
+        x, available, info = waist_on_grid(self.root / "source", row, t)
+        self.assertEqual(info["selected"], "S2_waist.csv")
+        self.assertTrue(available.all())
+        frame.to_csv(folder / "S1_waist.csv", index=False)
+        _, _, info = waist_on_grid(self.root / "source", row, t)
+        self.assertEqual(info["selected"], "S1_waist.csv")
 
     def test_both_cli_analyses_train_tune_score_and_fused_predict(self):
         common = ["--data", str(self.data), "--folds", "3", "--fold", "1", "--epochs", "1",

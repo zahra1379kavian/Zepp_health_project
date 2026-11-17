@@ -1,0 +1,165 @@
+{
+  "test_suite": {
+    "command": ".venv/bin/python -m unittest discover -s strength_training -p 'test_*.py' -v",
+    "passed": 83
+  },
+  "real_data_audit": {
+    "parent_manifest_sha256": "dfd4e0d7a536594770c2bb3e63bcfe630a51b9005106532e5e8c70a9dddb1dfc",
+    "fold": 1,
+    "folds": 5,
+    "seed": 42,
+    "streams_by_split": {
+      "train": 46,
+      "validation": 16,
+      "test": 15
+    },
+    "held_out_exercises": {
+      "leg_raise": {
+        "masked_frames_by_split": {
+          "train": 56480,
+          "validation": 29931,
+          "test": 0
+        },
+        "test_reference_repetitions": 504,
+        "remaining_training_frames": 7378323
+      },
+      "squat": {
+        "masked_frames_by_split": {
+          "train": 114538,
+          "validation": 34964,
+          "test": 0
+        },
+        "test_reference_repetitions": 575,
+        "remaining_training_frames": 7320265
+      },
+      "push-up": {
+        "masked_frames_by_split": {
+          "train": 74720,
+          "validation": 20385,
+          "test": 0
+        },
+        "test_reference_repetitions": 534,
+        "remaining_training_frames": 7360083
+      },
+      "biceps_curls": {
+        "masked_frames_by_split": {
+          "train": 79605,
+          "validation": 27119,
+          "test": 0
+        },
+        "test_reference_repetitions": 572,
+        "remaining_training_frames": 7355198
+      }
+    },
+    "waist": {
+      "streams": 77,
+      "features": [
+        "wrist_acc_x",
+        "wrist_acc_y",
+        "wrist_acc_z",
+        "wrist_gyro_x",
+        "wrist_gyro_y",
+        "wrist_gyro_z",
+        "waist_acc_x",
+        "waist_acc_y",
+        "waist_acc_z",
+        "waist_gyro_x",
+        "waist_gyro_y",
+        "waist_gyro_z"
+      ],
+      "matched_control_features": [
+        "acc_x",
+        "acc_y",
+        "acc_z",
+        "gyro_x",
+        "gyro_y",
+        "gyro_z"
+      ],
+      "unavailable_frames": 418443,
+      "training_frames": 7128660,
+      "matched_masks_and_references": true,
+      "selection_policy": "Most aligned samples per source session; filename breaks ties. Clock-only selection, no device stitching.",
+      "selected_devices": {
+        "20260602_LRFVFZEIVGAM__left_wrist": "S1_waist.csv",
+        "20260602_NHJIWTTAJCLQOGPA__left_wrist": "S4_waist.csv",
+        "20260602_VGFFFZEIOGPA__right_wrist": "S2_waist.csv",
+        "20260602_VGFFNHJIOGPA__left_wrist": "S1_waist.csv",
+        "20260603_DQTQVGAMJCLQ__left_wrist": "S4_waist.csv",
+        "20260603_FZEIDQTQVGAM__left_wrist": "S1_waist.csv",
+        "20260603_LRFVMGTN__right_wrist": "S2_waist.csv",
+        "20260603_OWZBNHJIXUUT__right_wrist": "S2_waist.csv",
+        "20260604_HOPKVVZPWTTA__left_wrist": "S2_waist.csv",
+        "20260604_HOPKVVZPWTTA__right_wrist": "S2_waist.csv",
+        "20260604_LRFVVGFFXLNK__left_wrist": "S4_waist.csv",
+        "20260604_LRFVVGFFXLNK__right_wrist": "S4_waist.csv",
+        "20260604_OWZBOWZBMGTN__right_wrist": "S1_waist.csv",
+        "20260605_EHFWVGAMXLNK__left_wrist": "S4_waist.csv",
+        "20260605_EHFWVGAMXLNK__right_wrist": "S4_waist.csv",
+        "20260605_INJJFZEI__left_wrist": "S5_waist.csv",
+        "20260605_INJJFZEI__right_wrist": "S5_waist.csv",
+        "20260605_SSCDVVZPKJMW__left_wrist": "S2_waist.csv",
+        "20260605_SSCDVVZPKJMW__right_wrist": "S2_waist.csv",
+        "20260608_DQTQEHFWOGPA__left_wrist": "S6_waist.csv",
+        "20260608_DQTQEHFWOGPA__right_wrist": "S6_waist.csv",
+        "20260608_HOPKDQTQJCLQOBWA__left_wrist": "S1_waist.csv",
+        "20260608_HOPKDQTQJCLQOBWA__right_wrist": "S1_waist.csv",
+        "20260608_INJJWTTA__left_wrist": "S2_waist.csv",
+        "20260608_INJJWTTA__right_wrist": "S2_waist.csv",
+        "20260608_OWZBWTTAJCLQ__left_wrist": "S4_waist.csv",
+        "20260608_OWZBWTTAJCLQ__right_wrist": "S4_waist.csv",
+        "20260609_DQTQVGFFNHJI__left_wrist": "S6_waist.csv",
+        "20260609_DQTQVGFFNHJI__right_wrist": "S6_waist.csv",
+        "20260609_LRFVWXWCKJMW__left_wrist": "S4_waist.csv",
+        "20260609_LRFVWXWCKJMW__right_wrist": "S4_waist.csv",
+        "20260609_OWZBREJQDQTQNHJI__left_wrist": "S1_waist.csv",
+        "20260609_OWZBREJQDQTQNHJI__right_wrist": "S1_waist.csv",
+        "20260609_WTTAFZEIJCLQOGPA__left_wrist": "S3_waist.csv",
+        "20260609_WTTAFZEIJCLQOGPA__right_wrist": "S3_waist.csv",
+        "20260609_XLNKZCGTTIXD__left_wrist": "S1_waist.csv",
+        "20260609_XLNKZCGTTIXD__right_wrist": "S1_waist.csv",
+        "20260610_DQTQWXWC__left_wrist": "S6_waist.csv",
+        "20260610_DQTQWXWC__right_wrist": "S6_waist.csv",
+        "20260610_FZEIDQTQ__left_wrist": "S2_waist.csv",
+        "20260610_FZEIDQTQ__right_wrist": "S2_waist.csv",
+        "20260610_HOPKVGFFNHJI__left_wrist": "S3_waist.csv",
+        "20260610_HOPKVGFFNHJI__right_wrist": "S3_waist.csv",
+        "20260610_MGTNLRFVOBWA__left_wrist": "S1_waist.csv",
+        "20260610_MGTNLRFVOBWA__right_wrist": "S1_waist.csv",
+        "20260610_VGFFNHJIXUUT__left_wrist": "S4_waist.csv",
+        "20260610_VGFFNHJIXUUT__right_wrist": "S4_waist.csv",
+        "20260610_VVZPVVZP__left_wrist": "S4_waist.csv",
+        "20260610_VVZPVVZP__right_wrist": "S4_waist.csv",
+        "20260611_DQTQJCLQKJMW__left_wrist": "S3_waist.csv",
+        "20260611_DQTQJCLQKJMW__right_wrist": "S3_waist.csv",
+        "20260611_JCLQNHJI__left_wrist": "S4_waist.csv",
+        "20260611_JCLQNHJI__right_wrist": "S4_waist.csv",
+        "20260611_LRFVXLNKOGPA__left_wrist": "S5_waist.csv",
+        "20260611_LRFVXLNKOGPA__right_wrist": "S5_waist.csv",
+        "20260611_OWZBZCGTOBWA__left_wrist": "S2_waist.csv",
+        "20260611_OWZBZCGTOBWA__right_wrist": "S2_waist.csv",
+        "20260611_WTTAFZEISYZS__left_wrist": "S1_waist.csv",
+        "20260611_WTTAFZEISYZS__right_wrist": "S1_waist.csv",
+        "20260612_HOPKXUUTOGPA__left_wrist": "S2_waist.csv",
+        "20260612_HOPKXUUTOGPA__right_wrist": "S2_waist.csv",
+        "20260612_WTTAJCLQJCLQQAKJ__left_wrist": "S4_waist.csv",
+        "20260612_WTTAJCLQJCLQQAKJ__right_wrist": "S4_waist.csv",
+        "20260612_WTTALRFVVGAM__left_wrist": "S3_waist.csv",
+        "20260612_WTTALRFVVGAM__right_wrist": "S3_waist.csv",
+        "20260612_XUUTFZEIKJMW__left_wrist": "S1_waist.csv",
+        "20260612_XUUTFZEIKJMW__right_wrist": "S1_waist.csv",
+        "20260615_LRFVDQTQKJMW__left_wrist": "S2_waist.csv",
+        "20260615_LRFVDQTQKJMW__right_wrist": "S2_waist.csv",
+        "20260615_LRFVHOPKKJMW__left_wrist": "S2_waist.csv",
+        "20260615_LRFVHOPKKJMW__right_wrist": "S2_waist.csv",
+        "20260615_WTTAFZEIFZEIOGPA__left_wrist": "S4_waist.csv",
+        "20260615_WTTAFZEIFZEIOGPA__right_wrist": "S4_waist.csv",
+        "20260615_WTTAOWZBLRFVOGPA__left_wrist": "S6_waist.csv",
+        "20260615_WTTAOWZBLRFVOGPA__right_wrist": "S6_waist.csv",
+        "20260616_LRFVJCLQWXWC__left_wrist": "S4_waist.csv",
+        "20260616_LRFVJCLQWXWC__right_wrist": "S4_waist.csv"
+      }
+    }
+  },
+  "full_real_data_training_run": false,
+  "synthetic_training_note": "Both commands complete train/tune/evaluate with tiny models; all 7 ablations and 2 exercise removals tested. Synthetic results are not accuracy evidence."
+}

@@ -42,9 +42,13 @@ always come from the matching wrist, never from the waist CSV. A separate
 station-ignored score for leg raises is highlighted in the summary, and all
 dynamic exercises appear in `exercise_scores.json`.
 
-Waist CSVs are loaded from each source session's unique `*waist*.csv` file
-(currently `S1_waist.csv`). `--source PATH` overrides the prepared manifest's
-raw-data root. Joins use exact `sync_timestamp` matches. Missing waist frames
+Waist CSVs are found as `*waist*.csv` in each source session. When there are
+multiple devices, select the one with the most aligned clock samples; filename
+order breaks ties. Selection uses availability only, never exercise labels or
+performance, and does not stitch devices together. The selected filename and
+all candidates' sample counts are recorded in `data/mask_audit.json`.
+`--source PATH` overrides the prepared manifest's raw-data root. Joins use exact
+`sync_timestamp` matches. Missing waist frames
 create gaps in both paired variants; there is no interpolation across gaps.
 Six-channel variants omit magnetometer inputs and fit six-channel statistics.
 They inherit the original prepared wrist availability/exclusion policy.
