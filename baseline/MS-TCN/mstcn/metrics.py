@@ -182,11 +182,21 @@ def aggregate_streams(records, tolerances, primary=400, station_metrics=True):
                                              [row for s in scores for row in s["repetitions"]["counts"]
                                               if row["station"] == name])
                 for name in CLASSES[1:] if name != "plank"}
+        baseline = [r["previous_end_scores"][str(tolerance)]["segmentation"] for r in records
+                    if str(tolerance) in r.get("previous_end_scores", {})]
+        if baseline:
+            summary["previous_end"] = aggregate_repetitions(
+                [s["metrics"] for s in baseline], [row for s in baseline for row in s["counts"]])
         by_tolerance[str(tolerance)] = summary
     result = {"streams": len(records), "subjects": len({r["subject"] for r in records}),
               "source_sessions": len({r["source_session"] for r in records}),
               "by_tolerance": by_tolerance, **by_tolerance[str(primary)]}
     if not station_metrics:
+        matrices = [r["station_presence_confusion"] for r in records if "station_presence_confusion" in r]
+        if matrices:
+            cm = np.sum(matrices, axis=0)
+            result["station_presence"] = {"classes": ["rest", "at_station"], "confusion_matrix": cm.tolist(),
+                                          "recall": float(cm[1, 1] / max(cm[1].sum(), 1))}
         return result
     cm = sum((np.array(r["confusion_matrix"], dtype=np.int64) for r in records),
              np.zeros((len(CLASSES), len(CLASSES)), np.int64))

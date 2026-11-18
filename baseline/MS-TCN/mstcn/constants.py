@@ -1,6 +1,8 @@
 """Fixed task vocabulary; model inputs never contain these labels."""
 
 DT_MS = 40
+START_HISTORY = 6000 // DT_MS
+STATION_STATES = ["rest", "at_station"]
 FEATURES = [f"{sensor}_{axis}" for sensor in ("acc", "gyro", "mag") for axis in "xyz"]
 CLASSES = ["NULL", "bench_press", "biceps_curls", "crunch", "deadlift", "dips",
            "hip_thrust", "lat_pulldown", "leg_raise", "lunges",

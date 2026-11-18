@@ -14,8 +14,8 @@ def main(argv=None):
     prepare.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
     prepare.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
     prepare.add_argument("--references", type=Path)
-    prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels",
-                         help="Default: validated phase1 then phase2 cycles from label.csv wrist phases")
+    prepare.add_argument("--reference-mode", choices=["labels", "none", "endpoints"], default="labels",
+                         help="endpoints uses --references and binary station presence, with no phase conversion")
     prepare.add_argument("--seed", type=int, default=42)
 
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
@@ -44,7 +44,8 @@ def main(argv=None):
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--station-only", action="store_true")
-        command.add_argument("--repetition-head", choices=["auto", "phase", "boundary"], default="auto")
+        heads = ["auto", "phase", "boundary", "complete"] if command in (train, cv) else ["auto", "phase", "boundary"]
+        command.add_argument("--repetition-head", choices=heads, default="auto")
         command.add_argument("--epochs", type=int, default=30)
         command.add_argument("--batch-size", type=int, default=8)
         command.add_argument("--window", type=int, default=256)
@@ -71,6 +72,12 @@ def main(argv=None):
         if name == "evaluate":
             command.add_argument("--split", choices=["validation", "test"], default="test")
             command.add_argument("--decoder", type=Path)
+            command.add_argument("--start-rule", choices=["learned", "previous_end"],
+                                 help="Override the start rule for complete-rep evaluation")
+    mine = sub.add_parser("mine-rest", help="Find runs of 3+ predicted reps in held-out, labeled rest for review")
+    mine.add_argument("--predictions", type=Path, required=True, help="Baseline cross-validation folder")
+    mine.add_argument("--data", type=Path, required=True)
+    mine.add_argument("--output", type=Path, required=True)
     predict = sub.add_parser("predict", help="Sensor-only CSV replay with online cached inference")
     predict.add_argument("--input", type=Path, required=True)
     predict.add_argument("--waist-input", type=Path, help="Required for a paired wrist+waist checkpoint")
@@ -83,6 +90,10 @@ def main(argv=None):
     run = sub.add_parser("run", help="Prepare every wrist stream → subject-wise cross-validation")
     run.add_argument("--output", type=Path, default=Path("baseline/MS-TCN/experiment_runs/wrist_cross_validation"))
     run.add_argument("--data", type=Path, help="Reuse a prepared wrist dataset instead of preparing it again")
+    run.add_argument("--references", type=Path, help="Validated full-rep references when preparing a new dataset")
+    run.add_argument("--repetition-head", choices=["auto", "phase", "boundary", "complete"], default="auto")
+    for command in (run, train, cv):
+        command.add_argument("--rest-reviews", type=Path, help="Complete mode: reviewed mine-rest JSON")
     run.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     run.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
     run.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
@@ -113,6 +124,9 @@ def main(argv=None):
     elif args.command == "run":
         from .runner import run_pipeline
         run_pipeline(args)
+    elif args.command == "mine-rest":
+        from .complete import mine_rest
+        mine_rest(args)
     elif args.command in ("sensor-ablation", "leave-one-exercise-out"):
         from .analyses import run_analysis
         run_analysis(args)

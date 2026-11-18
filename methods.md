@@ -1,16 +1,16 @@
 # Activity-agnostic rep detection from wrist motion
 ## 2. Train MS-TCN to find complete reps
 
-Feed the continuous wrist signal into the causal MS-TCN. Every 40 ms, train two outputs from its motion features: the probability that a rep just ended and the probability that the person is at a station.
+Feed the continuous wrist signal into the causal MS-TCN. Every 40 ms, train two outputs from its motion features: the probability that a rep just ended and the probability that the person is at a station. Use only the labeled start and end of each rep. Never use phase labels in training or testing, so the same model works for reps with one movement or with movements in either order.
 
 - **End output.** Rep ends are rare, about 1 frame in 300. Spread each end target over ±2 frames (±80 ms). Report an end only at a local peak above a threshold.
-- **Start output.** At each end, train a third output to choose the start from the previous 6 s, which covers 99.9% of reps, or to choose "no valid start". Include competing starts halfway through the rep and at the start of the previous rep. Train it at labeled ends, at ends shifted by up to ±2 frames, and at false ends. False ends are mid-rep turnarounds (`phase1` → `phase2`) and end peaks that the current model reports in rest. At a false end, the correct choice is "no valid start".
+- **Start output.** At each end, train a third output to choose the start from the previous 6 s, which covers 99.9% of reps, or to choose "no valid start". Include competing starts halfway through the rep and at the start of the previous rep. Train it at labeled ends, at ends shifted by up to ±2 frames, and at false ends. False ends are the midpoint of each labeled rep and end peaks that the current model reports in rest. At a false end, the correct choice is "no valid start".
 - **Hard negatives.** In the current model's held-out cross-validation predictions, find rest stretches with three or more reps in a row. Check a sample by hand. Mask stretches that contain real reps, and give the others extra weight in the loss.
 - **Station output.** Use it only to group reps into sets. Never let it block a rep, because an unseen exercise may look like rest.
 
 During replay, report a rep once, when its end peak is confirmed and a valid start is chosen. This rule can count the first rep without an exercise name or a previous example.
 
-**Baselines.** Compare with the current phase model, with the existing boundary head (`--repetition-head boundary`), and with the rule "start = previous end". That rule holds for 77% of consecutive reps in a set.
+**Baselines.** Compare with the existing boundary head (`--repetition-head boundary`), which also uses only start and end labels, and with the rule "start = previous end". That rule holds for 77% of consecutive reps in a set.
 
 ## 3. Test whether XRFMamba makes better use of history
 

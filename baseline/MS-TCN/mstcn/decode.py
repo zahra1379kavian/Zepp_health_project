@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from .constants import CLASSES, DT_MS
+from .constants import CLASSES, DT_MS, START_HISTORY, STATION_STATES
 
 
 @dataclass
@@ -20,8 +20,11 @@ class DecoderConfig:
     max_rep_ms: int = 30000
     refractory_ms: int = 200
     set_gap_ms: int = 10000
+    start_rule: str = "learned"
 
     def __post_init__(self):
+        if self.start_rule not in ("learned", "previous_end"):
+            raise ValueError("Unknown start rule")
         if not (0 < self.release_threshold < min(self.start_threshold, self.end_threshold)
                 and max(self.start_threshold, self.end_threshold) <= 1):
             raise ValueError("release threshold must be below both event thresholds")
@@ -47,6 +50,50 @@ class RepDecoder:
         self.frames = deque()
         self.phase = 0
         self.previous_boundary = np.zeros(2)
+        self.station_history = deque(maxlen=START_HISTORY + 1)
+        self.last_rest = None
+        self.previous_peak = None
+        self.previous_rep_end = None
+        self.previous_end_score = -1.
+
+    def complete_peak(self, t, station, prediction, future, reported):
+        c = self.config
+        if station[1] < c.station_threshold:
+            self.last_rest = t
+        self.station_history.append((t, self.last_rest))
+        end, distance, confidence, no_start = prediction
+        if 1 - no_start < c.start_threshold:
+            distance = 0
+        peak = (end >= c.end_threshold and end > self.previous_end_score
+                and all(end >= q[0] for _, _, q in future))
+        self.previous_end_score = end
+        if not peak:
+            return []
+        return self.close_peak(t, float(station[1]), end, distance, confidence, reported,
+                               len(self.station_history), lambda d: self.station_history[-d-1][1])
+
+    def close_peak(self, t, station_probability, end, distance, confidence, reported, history_length, rest_at):
+        c = self.config
+        if self.previous_peak is not None and t - self.previous_peak < c.refractory_ms:
+            return []
+        previous, self.previous_peak = self.previous_peak, t
+        if c.start_rule == "previous_end":
+            if previous is None:
+                return []
+            distance, confidence = (t - previous) // DT_MS, end
+        distance = int(distance)
+        if not 1 <= distance <= START_HISTORY or distance >= history_length:
+            return []
+        start, rest_at_start = t - distance * DT_MS, rest_at(distance)
+        if self.previous_rep_end is not None and start < self.previous_rep_end:
+            return []
+        new_set = (self.previous_rep_end is None or
+                   (start > self.previous_rep_end and rest_at_start is not None and rest_at_start >= self.previous_rep_end))
+        self.previous_rep_end = t
+        return [{"station": "unknown", "start_ms": start, "end_ms": t,
+                 "confidence": float(end * confidence) if c.start_rule == "learned" else float(end),
+                 "activity_probability": station_probability, "new_set": new_set,
+                 "reported_at_ms": reported}]
 
     def step(self, timestamp, station_prob, boundary_prob, valid=True, reported_at_ms=None):
         t, c = int(timestamp), self.config
@@ -66,6 +113,8 @@ class RepDecoder:
         t, station_prob, boundary_prob = self.frames[0]
         future = list(self.frames)[1:]
         self.frames.popleft()
+        if len(boundary_prob) == 4:
+            return self.complete_peak(t, station_prob, boundary_prob, future, reported)
         if self.active and t - self.active["start_ms"] > c.max_rep_ms:
             self.active = None
         events, fire = [], [False, False]
@@ -97,7 +146,7 @@ class RepDecoder:
                 probs = active["sum"] / max(active["samples"], 1)
                 activity = float(1 - probs[0])
                 name, confidence = "unknown", activity
-                if station_prob is not None:
+                if station_prob is not None and len(station_prob) != len(STATION_STATES):
                     label = 1 + int(np.argmax(probs[1:]))
                     confidence = float(probs[label])
                     name = CLASSES[label] if confidence >= c.station_threshold else "unknown"
@@ -124,7 +173,7 @@ class RepDecoder:
 def group_sets(repetitions, gap_ms=10000):
     sets = []
     for rep in repetitions:
-        if (not sets or sets[-1]["station"] != rep["station"] or
+        if (not sets or rep.get("new_set") or sets[-1]["station"] != rep["station"] or
                 rep["start_ms"] - sets[-1]["end_ms"] > gap_ms):
             sets.append({"station": rep["station"], "start_ms": rep["start_ms"],
                          "end_ms": rep["end_ms"], "count": 1})
@@ -136,6 +185,39 @@ def group_sets(repetitions, gap_ms=10000):
 
 def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahead_ms=0):
     decoder, reps, holds = RepDecoder(config), [], []
+    if len(boundary_prob) and len(boundary_prob[0]) == 4:
+        from .data import runs
+        t, station_prob, boundary_prob, valid = map(np.asarray, (t, station_prob, boundary_prob, valid))
+        c = decoder.config
+        # Replay the same peak rule in bulk when whole sessions are available.
+        # A time jump starts a fresh run even when its two samples are valid.
+        edges = np.r_[0, np.flatnonzero(np.diff(t) != DT_MS) + 1, len(t)]
+        for left, right in zip(edges[:-1], edges[1:]):
+            for a, b in runs(valid[left:right]):
+                a, b = a + left, b + left
+                decoder.reset()
+                end = boundary_prob[a:b, 0]
+                n = len(end) - c.lag_frames
+                if n <= 0:
+                    continue
+                peaks = (end[:n] >= c.end_threshold) & (end[:n] > np.r_[-1., end[:n-1]])
+                for lag in range(1, c.lag_frames + 1):
+                    peaks &= end[:n] >= end[lag:lag+n]
+                last_rest = np.maximum.accumulate(np.where(station_prob[a:b, 1] < c.station_threshold,
+                                                           np.arange(b-a), -1))
+                for i in np.flatnonzero(peaks):
+                    clock = int(t[a+i])
+                    _, distance, confidence, no_start = boundary_prob[a+i]
+                    if 1 - no_start < c.start_threshold:
+                        distance = 0
+                    def rest_at(d):
+                        j = last_rest[i-d]
+                        return int(t[a+j]) if j >= 0 else None
+                    reps.extend(decoder.close_peak(clock, float(station_prob[a+i, 1]), end[i], distance,
+                                                   confidence, clock + c.lag_frames * DT_MS + lookahead_ms,
+                                                   i+1, rest_at))
+        return {"repetitions": reps, "counts": dict(Counter(r["station"] for r in reps)), "holds": holds,
+                "sets": group_sets(reps, c.set_gap_ms), "decoder": asdict(c)}
     hold_start = None
     previous = None
     for i, clock in enumerate(t):

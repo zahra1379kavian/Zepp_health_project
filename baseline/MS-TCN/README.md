@@ -14,6 +14,85 @@ It uses wrist signals only. The authoritative targets are the matching wrist
 column of each reliable `label.csv` in `strength_training_data_clean`.
 No separate repetition-reference file is required for the default run.
 
+## Train MS-TCN to find complete reps
+
+Select `--repetition-head complete` for endpoint-only training and replay.
+Every 40 ms the model estimates the probability of a rep end and the probability
+of being at a station. At a confirmed end peak, it scores the preceding 150
+frames as possible starts and has a separate “no valid start” choice. Validation
+selects thresholds for the end peak and the probability that a valid start
+exists. The decoder emits the first rep as soon as it has both endpoints.
+Station presence is used only to group emitted reps into sets.
+
+These commands run both models on the prepared data from the repository root.
+
+```bash
+data=baseline/MS-TCN/prepared_datasets/separate_wrist_streams
+runs=baseline/MS-TCN/experiment_runs
+python -m baseline.mstcn run --data "$data" --repetition-head complete \
+  --rest-reviews "$runs/complete_rep_review/reviewed.json" --output "$runs/complete_rep_cv"
+python -m baseline.mstcn run --data "$data" --repetition-head boundary \
+  --output "$runs/boundary_rep_cv"
+```
+
+The review file is optional. Both commands use the same participant folds and
+endpoint tolerances. Compare `by_tolerance["400"].segmentation.f1` between the
+reports. The complete-rep report also scores `previous_end` on exactly the same
+end peaks. This baseline uses the preceding detected end as the start and needs
+two peaks to emit its first rep. Both 200 ms and 400 ms scores require both
+endpoints to match the same reference.
+
+**Labels.** On the existing version-4 dataset, training and evaluation read
+paired timestamps from each stream's `references.json`. Those references were
+originally extracted under the dataset's phase-order convention. To use
+independent endpoint annotations, run `prepare --reference-mode endpoints --references FILE --output DIR`
+and pass that directory as `--data`. Each repetition needs only `start_ms` and
+`end_ms`. The wrist column of `label.csv` supplies station presence and can contain just `rest` and
+`at_station`. This preparation path produces no phase targets.
+
+For example, a recording starting at 100000 ms could have this reference file.
+Replace the session ID, location, times and annotation provenance with the actual
+values. Coverage identifies intervals with exhaustive annotations, including
+rest. Each exclusive rep end must fall inside its coverage interval.
+
+```json
+{
+  "version": 1,
+  "sessions": {
+    "example_session": {
+      "validated": true,
+      "location": "left_wrist",
+      "source": "manually timestamped recording",
+      "convention": "first movement sample through exclusive completion time",
+      "coverage": [{"start_ms": 100000, "end_ms": 110000}],
+      "repetitions": [{"start_ms": 101200, "end_ms": 103600}]
+    }
+  }
+}
+```
+
+**Training.** The end target tapers over ±2 frames (±80 ms). The selector learns
+the labeled start at the true end and at nearby shifted ends. All starts within
+six seconds compete, including the midpoint and the previous rep's start when
+in range. Mid-rep false ends and the current model's peaks in certified rest
+teach the selector to reject an end. Sensor gaps reset the six-second history.
+The default decoder confirms peaks with two later frames (80 ms).
+
+**Review rest predictions.** This command generates a fresh review list from
+the original baseline's held-out predictions.
+
+```bash
+python -m baseline.mstcn mine-rest --data "$data" \
+  --predictions "$runs/wrist_cross_validation/cross_validation" \
+  --output "$runs/rest_candidates.json"
+```
+
+Review intervals containing at least three consecutive predictions in certified
+rest. Set `review` to `confirmed_rest`, `contains_reps`, or `uncertain`, then pass
+the file with `--rest-reviews`. Confirmed rest receives triple weight in the
+repetition losses. Unreviewed, uncertain and mislabeled intervals are masked.
+Each fold applies review decisions only to its training streams.
+
 ## Additional analyses
 
 Two independent analyses are implemented in separate folders:

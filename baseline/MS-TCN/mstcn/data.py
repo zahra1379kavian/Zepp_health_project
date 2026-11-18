@@ -11,7 +11,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 
-from .constants import CLASSES, DT_MS, EXCLUDED_SCENES, EXCLUDED_SESSIONS, FEATURES, station
+from .constants import CLASSES, DT_MS, EXCLUDED_SCENES, EXCLUDED_SESSIONS, FEATURES, STATION_STATES, station
 
 
 WRIST_LOCATIONS = ("wrist", "left_wrist", "right_wrist")
@@ -119,7 +119,7 @@ def log_masks(t, rows, alignment):
     return valid, probe, intervals
 
 
-def reference_targets(t, valid, entry, location):
+def reference_targets(t, valid, entry, location, endpoints_only=False):
     """Coverage certifies exhaustive dynamic-repetition annotations, including zeros.
 
     Intervals and repetitions use [start_ms, end_ms). End impulses are placed at
@@ -144,8 +144,9 @@ def reference_targets(t, valid, entry, location):
     ordered = sorted(entry.get("repetitions", []), key=lambda r: r["start_ms"])
     previous_end = -1
     for row in ordered:
-        a, b, name = int(row["start_ms"]), int(row["end_ms"]), row["station"]
-        if (name not in CLASSES[1:] or name == "plank" or b <= a or a < previous_end or
+        a, b = int(row["start_ms"]), int(row["end_ms"])
+        name = row.get("station", "unknown") if endpoints_only else row["station"]
+        if ((not endpoints_only and name not in CLASSES[1:]) or name == "plank" or b <= a or a < previous_end or
                 (a - t[0]) % DT_MS or (b - t[0]) % DT_MS):
             raise ValueError(f"Invalid or overlapping full repetition: {row}")
         previous_end = b
@@ -280,8 +281,11 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
             reference_mode="labels"):
     if location not in WRIST_LOCATIONS:
         raise ValueError("This method uses wrist signals only")
-    if reference_mode not in ("labels", "none"):
-        raise ValueError("reference_mode must be labels or none")
+    if reference_mode not in ("labels", "none", "endpoints"):
+        raise ValueError("Unknown reference mode")
+    endpoints_only = reference_mode == "endpoints"
+    if endpoints_only and not references_path:
+        raise ValueError("Endpoint-only preparation needs --references with validated start/end pairs")
     source, output = Path(source).resolve(), Path(output).resolve()
     if source == output or source in output.parents or output in source.parents:
         raise ValueError("Source and output must be separate, non-nested directories")
@@ -297,11 +301,11 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
     if refs.get("version") != 1:
         raise ValueError("Unsupported references schema")
     manifest = {"version": 4, "source": str(source), "location": location,
-                "classes": CLASSES, "features": FEATURES, "sample_period_ms": DT_MS,
+                "classes": STATION_STATES if endpoints_only else CLASSES, "features": FEATURES, "sample_period_ms": DT_MS,
                 "alignment_source": str(Path(alignment_path).resolve()),
                 "references_source": str(Path(references_path).resolve()) if references_path else
                 ("label.csv, corresponding selected wrist column" if reference_mode == "labels" else None),
-                "reference_mode": "external" if references_path else reference_mode,
+                "reference_mode": "external" if references_path and not endpoints_only else reference_mode,
                 "reference_convention": "See external reference entries" if references_path else
                 (PHASE_CONVENTION if reference_mode == "labels" else None),
                 "label_reliability": "User confirmed label.csv files are reliable references",
@@ -342,22 +346,26 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
                 x, available = np.zeros((len(t), len(FEATURES)), np.float32), np.zeros(len(t), bool)
                 x[idx], available[idx] = sensor_x, True
                 raw = labels[selected_location].to_numpy(dtype=str)
-                mapping = {value: CLASSES.index(station(str(value))) for value in np.unique(raw)}
-                y = np.array([mapping[value] for value in raw], dtype=np.int64)
+                if endpoints_only:
+                    y = (~np.isin(raw, ["rest", "NULL"])).astype(np.int64)
+                else:
+                    mapping = {value: CLASSES.index(station(str(value))) for value in np.unique(raw)}
+                    y = np.array([mapping[value] for value in raw], dtype=np.int64)
                 valid = eligible & available
                 if references_path or reference_mode == "none":
                     entry = wrist_reference(refs["sessions"].get(name), selected_location)
-                    boundary, coverage, reps, cut = reference_targets(t, valid, entry, selected_location)
+                    boundary, coverage, reps, cut = reference_targets(t, valid, entry, selected_location, endpoints_only)
                 else:
                     boundary, coverage, reps, cut = phase_label_targets(t, raw, valid)
-                phase, phase_mask = dense_phase_targets(t, raw, valid, coverage, reps)
                 stream = f"{name}__{selected_location}"
                 path = dest / stream
                 path.mkdir()
-                for key, array in dict(x=x, t=t, y=y, raw=raw, valid=valid, available=available,
-                                       eligible=eligible, probe=probe & available,
-                                       boundary=boundary, coverage=coverage,
-                                       phase=phase, phase_mask=phase_mask).items():
+                arrays = dict(x=x, t=t, y=y, valid=valid, available=available, eligible=eligible,
+                              probe=probe & available, boundary=boundary, coverage=coverage)
+                if not endpoints_only:
+                    arrays["raw"] = raw
+                    arrays["phase"], arrays["phase_mask"] = dense_phase_targets(t, raw, valid, coverage, reps)
+                for key, array in arrays.items():
                     np.save(path / f"{key}.npy", array, allow_pickle=False)
                 write_json(path / "references.json", reps)
                 write_json(path / "reference_audit.json", {"source": manifest["references_source"],
@@ -379,36 +387,37 @@ def prepare(source, output, alignment_path, location="wrist", references_path=No
         manifest["subjects"] = len({s["subject"] for s in manifest["sessions"]})
         manifest["source_sessions"] = len({s["source_session"] for s in manifest["sessions"]})
         manifest["streams_per_side"] = dict(Counter(s["side"] for s in manifest["sessions"]))
-        manifest.update(training_statistics(dest, manifest["split"]["train"]))
+        manifest.update(training_statistics(dest, manifest["split"]["train"], include_phase=not endpoints_only,
+                                            classes=manifest["classes"]))
         write_json(dest / "manifest.json", manifest)
         dest.rename(output)
     return manifest
 
 
-def load_arrays(path):
+def load_arrays(path, include_phase=True):
     arrays = {key: np.load(Path(path) / f"{key}.npy", mmap_mode="r", allow_pickle=False)
               for key in ("x", "t", "y", "valid", "boundary", "coverage", "probe")}
-    for key in ("phase", "phase_mask"):
+    for key in (("phase", "phase_mask") if include_phase else ()):
         if (Path(path) / f"{key}.npy").exists():
             arrays[key] = np.load(Path(path) / f"{key}.npy", mmap_mode="r", allow_pickle=False)
     return arrays
 
 
-def training_statistics(root, sessions):
+def training_statistics(root, sessions, include_phase=True, classes=CLASSES):
     """Fit normalization and all loss weights on this fold's training subjects."""
     if not sessions:
         raise ValueError("No training sessions")
-    dimensions = load_arrays(Path(root) / sessions[0])["x"].shape[1]
+    dimensions = load_arrays(Path(root) / sessions[0], include_phase)["x"].shape[1]
     sums, squares, count = np.zeros(dimensions), np.zeros(dimensions), 0
-    class_counts, phase_counts = np.zeros(len(CLASSES), np.int64), np.zeros(3, np.int64)
+    class_counts, phase_counts = np.zeros(len(classes), np.int64), np.zeros(3, np.int64)
     boundary_positives, boundary_frames = np.zeros(2), 0
     for name in sessions:
-        arrays = load_arrays(Path(root) / name)
+        arrays = load_arrays(Path(root) / name, include_phase)
         selected = arrays["x"][arrays["valid"]].astype(np.float64)
         sums += selected.sum(0)
         squares += (selected ** 2).sum(0)
         count += len(selected)
-        class_counts += np.bincount(arrays["y"][arrays["valid"]], minlength=len(CLASSES))
+        class_counts += np.bincount(arrays["y"][arrays["valid"]], minlength=len(classes))
         mask = arrays["coverage"]
         boundary_positives += arrays["boundary"][mask].sum(0)
         boundary_frames += int(mask.sum())
