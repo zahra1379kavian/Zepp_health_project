@@ -144,12 +144,13 @@ def reporting_tolerances(values=None, primary=400):
     return sorted(set([primary, *values]))
 
 
-def score_stream(predictions, references, t, coverage, metadata, tolerances):
+def score_stream(predictions, references, t, coverage, metadata, tolerances, station_metrics=True):
     """Score an unchanged decoded stream at several endpoint tolerances."""
     scores = {}
     for tolerance in tolerances:
         result = {}
-        for require_station, key in ((True, "repetitions"), (False, "segmentation")):
+        modes = ((True, "repetitions"), (False, "segmentation")) if station_metrics else ((False, "segmentation"),)
+        for require_station, key in modes:
             scored, _ = covered_repetitions(predictions, t, coverage, references, tolerance, require_station)
             rows = count_rows(scored, references, metadata["session"], require_station)
             for row in rows:
@@ -165,39 +166,44 @@ def score_stream(predictions, references, t, coverage, metadata, tolerances):
     return scores
 
 
-def aggregate_streams(records, tolerances, primary=400):
+def aggregate_streams(records, tolerances, primary=400, station_metrics=True):
     """Pool stream observations without treating paired wrists as extra subjects."""
     by_tolerance = {}
+    keys = ("repetitions", "segmentation") if station_metrics else ("segmentation",)
     for tolerance in tolerances:
         scores = [r["repetition_scores"][str(tolerance)] for r in records
                   if str(tolerance) in r["repetition_scores"]]
         summary = {key: aggregate_repetitions([s[key]["metrics"] for s in scores],
                                                [row for s in scores for row in s[key]["counts"]])
-                   for key in ("repetitions", "segmentation")}
-        summary["per_exercise"] = {
-            name: aggregate_repetitions([s["per_exercise"][name] for s in scores],
-                                         [row for s in scores for row in s["repetitions"]["counts"]
-                                          if row["station"] == name])
-            for name in CLASSES[1:] if name != "plank"}
+                   for key in keys}
+        if station_metrics:
+            summary["per_exercise"] = {
+                name: aggregate_repetitions([s["per_exercise"][name] for s in scores],
+                                             [row for s in scores for row in s["repetitions"]["counts"]
+                                              if row["station"] == name])
+                for name in CLASSES[1:] if name != "plank"}
         by_tolerance[str(tolerance)] = summary
+    result = {"streams": len(records), "subjects": len({r["subject"] for r in records}),
+              "source_sessions": len({r["source_session"] for r in records}),
+              "by_tolerance": by_tolerance, **by_tolerance[str(primary)]}
+    if not station_metrics:
+        return result
     cm = sum((np.array(r["confusion_matrix"], dtype=np.int64) for r in records),
              np.zeros((len(CLASSES), len(CLASSES)), np.int64))
     hours = sum(r["rest_hours"] for r in records)
     events = sum(r["false_exercise_events"] for r in records)
-    return {"streams": len(records), "subjects": len({r["subject"] for r in records}),
-            "source_sessions": len({r["source_session"] for r in records}),
-            "classification": classification_metrics(cm),
+    return {**result, "classification": classification_metrics(cm),
             "false_exercise_events": events, "rest_hours": hours,
-            "false_exercise_events_per_rest_hour": events / hours if hours else None,
-            "by_tolerance": by_tolerance, **by_tolerance[str(primary)]}
+            "false_exercise_events_per_rest_hour": events / hours if hours else None}
 
 
-def grouped_stream_report(records, tolerances, primary=400):
-    result = aggregate_streams(records, tolerances, primary)
-    result["per_side"] = {side: aggregate_streams([r for r in records if r["side"] == side], tolerances, primary)
+def grouped_stream_report(records, tolerances, primary=400, station_metrics=True):
+    result = aggregate_streams(records, tolerances, primary, station_metrics)
+    result["per_side"] = {side: aggregate_streams([r for r in records if r["side"] == side],
+                                                  tolerances, primary, station_metrics)
                           for side in ("left_wrist", "right_wrist")}
     result["per_subject"] = {subject: aggregate_streams([r for r in records if r["subject"] == subject],
-                                                         tolerances, primary)
+                                                         tolerances, primary, station_metrics)
                              for subject in sorted({r["subject"] for r in records})}
     for tolerance in tolerances:
         f1 = [r["by_tolerance"][str(tolerance)]["segmentation"]["f1"]

@@ -109,14 +109,18 @@ def train(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     head = getattr(args, "repetition_head", "auto")
+    phase_only = getattr(args, "phase_only", False)
     if head == "auto":
         head = "phase" if manifest.get("reference_mode") == "labels" and not args.station_only else "boundary"
+    if phase_only and (args.station_only or head != "phase"):
+        raise ValueError("Phase-only training requires dense phases and cannot be station-only")
     if head == "phase" and not manifest.get("phase_order_validated"):
         raise ValueError("Dense phase training requires the validated phase convention; reprepare data")
     lookahead_ms = getattr(args, "lookahead_ms", 0)
     if lookahead_ms < 0:
         raise ValueError("lookahead-ms must be nonnegative")
-    config = ModelConfig(inputs=len(manifest["features"]), stages=args.stages, layers=args.layers,
+    classes = [] if phase_only else CLASSES
+    config = ModelConfig(inputs=len(manifest["features"]), classes=len(classes), stages=args.stages, layers=args.layers,
                          channels=args.channels, repetition_head=head,
                          lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)))
     model = DenseMSTCN(config).to(args.device)
@@ -128,10 +132,12 @@ def train(args):
         raise ValueError("Training/validation partition has no eligible windows")
     loaders = {split: DataLoader(data, batch_size=args.batch_size, shuffle=split == "train", num_workers=0)
                for split, data in datasets.items()}
-    counts = np.asarray(manifest["train_class_counts"], dtype=float)
-    weights = np.where(counts > 0, 1 / np.sqrt(np.maximum(counts, 1)), 0)
-    weights /= weights[weights > 0].mean()
-    weights = torch.tensor(weights, dtype=torch.float32, device=args.device)
+    weights = None
+    if not phase_only:
+        counts = np.asarray(manifest["train_class_counts"], dtype=float)
+        weights = np.where(counts > 0, 1 / np.sqrt(np.maximum(counts, 1)), 0)
+        weights /= weights[weights > 0].mean()
+        weights = torch.tensor(weights, dtype=torch.float32, device=args.device)
     positives = np.asarray(manifest["train_boundary_positives"])
     positive_weights = np.clip((manifest["train_boundary_frames"] - positives) / np.maximum(positives, 1), 1, 100)
     positive_weights = torch.tensor(positive_weights, dtype=torch.float32, device=args.device)
@@ -187,7 +193,7 @@ def train(args):
         if best is None or key > best:
             best, stale = key, 0
             checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
-                          "normalization": manifest["normalization"], "classes": CLASSES, "features": manifest["features"],
+                          "normalization": manifest["normalization"], "classes": classes, "features": manifest["features"],
                           "augmentation": getattr(args, "augment", False),
                           "analysis": manifest.get("analysis"),
                           "location": manifest["location"], "station_only": args.station_only,
@@ -218,11 +224,12 @@ def load_checkpoint(path, device="cpu", data=None):
         raise ValueError("This method now uses wrist signals only; retrain the old waist checkpoint")
     allowed_features = [FEATURES, FEATURES[:6],
                         [f"{site}_{f}" for site in ("wrist", "waist") for f in FEATURES[:6]]]
-    if checkpoint["classes"] != CLASSES or checkpoint["features"] not in allowed_features:
+    configuration = dict(checkpoint["config"])
+    classes = [] if configuration.get("classes") == 0 else CLASSES
+    if checkpoint["classes"] != classes or checkpoint["features"] not in allowed_features:
         raise ValueError("Checkpoint vocabulary/features are incompatible")
     if data is not None and digest(Path(data) / "manifest.json") != checkpoint["data_manifest_sha256"]:
         raise ValueError("Dataset manifest differs from the checkpoint's training dataset")
-    configuration = dict(checkpoint["config"])
     configuration.setdefault("repetition_head", "boundary")
     model = DenseMSTCN(ModelConfig(**configuration)).to(device).eval()
     model.load_state_dict(checkpoint["model"])
@@ -232,7 +239,7 @@ def load_checkpoint(path, device="cpu", data=None):
 @torch.no_grad()
 def probabilities(model, x, valid, norm, device="cpu", chunk=512):
     """Offline replay of exact causal outputs, resetting all caches at each gap."""
-    p = np.zeros((len(x), len(CLASSES)), np.float32)
+    p = np.zeros((len(x), model.config.classes), np.float32) if model.config.classes else None
     q = np.zeros((len(x), model.config.repetition_classes), np.float32)
     mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
     lag = model.config.lookahead_samples
@@ -244,7 +251,8 @@ def probabilities(model, x, valid, norm, device="cpu", chunk=512):
             station, boundary, state = model.stream(features, state)
             first = max(left, a + lag)
             if first < right:
-                p[first-lag:right-lag] = station.softmax(1)[0, :, first-left:].T.cpu().numpy()
+                if station is not None:
+                    p[first-lag:right-lag] = station.softmax(1)[0, :, first-left:].T.cpu().numpy()
                 q[first-lag:right-lag] = model.repetition_probabilities(boundary)[0, :, first-left:].T.cpu().numpy()
     return p, q
 
@@ -302,6 +310,7 @@ def evaluate(args):
     if out.exists():
         raise FileExistsError(f"Refusing to overwrite {out}")
     model, ckpt = load_checkpoint(args.checkpoint, args.device, root)
+    station_metrics = bool(ckpt.get("classes", CLASSES))
     config, tolerance, selection = decoder_config(args.decoder, args.checkpoint, args.tolerance_ms)
     tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), tolerance)
     manifest = json.loads((root / "manifest.json").read_text())
@@ -316,25 +325,27 @@ def evaluate(args):
         lag = ckpt.get("config", {}).get("lookahead_samples", 0)
         infer_valid = prediction_mask(arrays["valid"], lag)
         decoded = decode_sequence(arrays["t"], p, q, infer_valid, config, lookahead_ms=lag * DT_MS)
-        predicted = p.argmax(1)
-        cm = confusion_matrix(arrays["y"], predicted, infer_valid)
         info = metadata[name]
         record = {"session": name, "source_session": info.get("source_session", name),
                   "subject": info["subject"], "side": info.get("side", info["label_column"]),
-                  "confusion_matrix": cm.tolist(), "repetition_scores": {},
-                  **false_exercise_events(arrays["y"], predicted, infer_valid),
+                  "repetition_scores": {},
                   "unavailable_lookahead_samples": int((arrays["valid"] & ~infer_valid).sum()),
                   "eligible_samples": int(arrays["valid"].sum()),
                   "reference_samples": int(arrays["coverage"].sum())}
+        if station_metrics:
+            predicted = p.argmax(1)
+            record["confusion_matrix"] = confusion_matrix(arrays["y"], predicted, infer_valid).tolist()
+            record.update(false_exercise_events(arrays["y"], predicted, infer_valid))
         references = json.loads((root / name / "references.json").read_text())
         scored, unscored = covered_repetitions(decoded["repetitions"], arrays["t"], arrays["coverage"],
-                                               references, tolerance)
+                                               references, tolerance, require_station=station_metrics)
         if arrays["coverage"].any() and not ckpt["station_only"]:
             record["repetition_scores"] = score_stream(decoded["repetitions"], references,
-                                                        arrays["t"], arrays["coverage"], record, tolerances)
+                                                        arrays["t"], arrays["coverage"], record, tolerances,
+                                                        station_metrics=station_metrics)
         result = {key: record[key] for key in ("session", "source_session", "subject", "side",
                                               "eligible_samples", "reference_samples")}
-        result.update(aggregate_streams([record], tolerances, tolerance))
+        result.update(aggregate_streams([record], tolerances, tolerance, station_metrics))
         if ckpt["station_only"]:
             result["repetitions"] = {"status": "station_only"}
         decoded["scored_repetitions"], decoded["unscored_repetitions"] = scored, unscored
@@ -342,7 +353,7 @@ def evaluate(args):
         records.append(record)
         sessions.append(result)
         print(f"Evaluated {name}", flush=True)
-    report = {**grouped_stream_report(records, tolerances, tolerance),
+    report = {**grouped_stream_report(records, tolerances, tolerance, station_metrics),
               "split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
               "report_tolerances_ms": tolerances,
               "report_scope": "fold_test" if "cross_validation" in manifest else "single_split_diagnostic",
@@ -355,7 +366,9 @@ def evaluate(args):
               "per_subject_session": sessions,
               "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
               "coverage_note": "Counts cover certified, available wrist streams. Paired wrists observe the same workout; pooled repetitions and stream-hours are not distinct workout totals. Both wrists stay in the same subject fold.",
-              "limitations": "One session per subject; uneven exercise and demographic coverage. NULL is category-relative rest, not a learned unknown-exercise class.",
+              "limitations": ("One session per subject; uneven exercise and demographic coverage. "
+                              + ("NULL is category-relative rest, not a learned unknown-exercise class."
+                                 if station_metrics else "Phase NULL denotes frames outside a repetition.")),
               "excluded_sessions": manifest["excluded"]}
     write_json(out / "report.json", report)
     return report
@@ -373,20 +386,28 @@ def tune(args):
     if not cache or not sum(len(c[-1]) for c in cache):
         raise ValueError("No validated validation repetitions available for threshold selection")
     trials, best_key, best_config = [], None, None
+    station_metrics = bool(model.config.classes)
+    station_thresholds = (.3, .5, .7) if station_metrics else (DecoderConfig().station_threshold,)
     for event in (.35, .5, .65):
-        for station in (.3, .5, .7):
+        for station in station_thresholds:
             config = DecoderConfig(start_threshold=event, end_threshold=event,
                                    phase_threshold=event, station_threshold=station)
             summary = score_cache(cache, config, args.tolerance_ms, require_station=False)
-            labelled = score_cache(cache, config, args.tolerance_ms)
-            key = (*checkpoint_key(summary), labelled["f1"])
-            trials.append({"event_threshold": event, "station_threshold": station,
-                           "f1": summary["f1"], "count_mae": -key[1], "station_labelled_f1": labelled["f1"]})
+            key = checkpoint_key(summary)
+            trial = {"event_threshold": event, "f1": summary["f1"], "count_mae": -key[1]}
+            if station_metrics:
+                labelled_f1 = score_cache(cache, config, args.tolerance_ms)["f1"]
+                key += (labelled_f1,)
+                trial.update(station_threshold=station, station_labelled_f1=labelled_f1)
+            trials.append(trial)
             if best_key is None or key > best_key:
                 best_key, best_config = key, config
+    selection_rule = "maximize station-independent repetition F1, then session count MAE"
+    if station_metrics:
+        selection_rule += ", then station-labelled F1"
     result = {"selected_on": "validation", "checkpoint_sha256": digest(args.checkpoint),
               "sessions": ckpt["split"]["validation"], "tolerance_ms": args.tolerance_ms,
-              "selection_rule": "maximize station-independent repetition F1, then session count MAE, then station-labelled F1; fixed tolerance",
+              "selection_rule": selection_rule + "; fixed tolerance",
               "config": asdict(best_config), "trials": trials}
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     write_json(args.output, result)
@@ -427,7 +448,7 @@ def predict(args):
     x = (x - np.array(norm["mean"], np.float32)) / np.array(norm["std"], np.float32)
     out.mkdir(parents=True)
     decoder, repetitions, latencies = RepDecoder(config), [], []
-    all_p = np.zeros((len(t), len(CLASSES)), np.float32)
+    all_p = np.zeros((len(t), model.config.classes), np.float32) if model.config.classes else None
     all_q = np.zeros((len(t), model.config.repetition_classes), np.float32)
     output_valid = np.zeros(len(t), bool)
     lag = model.config.lookahead_samples
@@ -444,17 +465,20 @@ def predict(args):
                     torch.cuda.synchronize()
                 started = time.perf_counter()
                 station, boundary, state = model.stream(features, state)
-                p = station.softmax(1)[0].T.cpu().numpy()
+                p = station.softmax(1)[0].T.cpu().numpy() if station is not None else None
                 q = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
                 if ckpt["station_only"]:
                     q[:] = 0
                 first = max(left, a + lag)
                 if first < right:
-                    all_p[first-lag:right-lag], all_q[first-lag:right-lag] = p[first-left:], q[first-left:]
+                    if p is not None:
+                        all_p[first-lag:right-lag] = p[first-left:]
+                    all_q[first-lag:right-lag] = q[first-left:]
                     output_valid[first-lag:right-lag] = True
                 batch_events = []
                 for i in range(first-left, right-left):
-                    batch_events.extend(decoder.step(t[left+i-lag], p[i], q[i], reported_at_ms=int(t[right-1])))
+                    batch_events.extend(decoder.step(t[left+i-lag], None if p is None else p[i], q[i],
+                                                     reported_at_ms=int(t[right-1])))
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 latencies.append(elapsed_ms)
                 for event in batch_events:
@@ -472,11 +496,15 @@ def predict(args):
         writer = csv.writer(handle)
         rep_columns = (["phase_null_probability", "phase1_probability", "phase2_probability"]
                        if model.config.repetition_head == "phase" else ["start_probability", "end_probability"])
-        writer.writerow(["sync_timestamp", "prediction_available", "predicted_station", "confidence", *rep_columns])
-        for clock, valid, p, q in zip(t, output_valid, all_p, all_q):
-            writer.writerow([int(clock), bool(valid), CLASSES[int(p.argmax())] if valid else "unavailable",
-                             float(p.max()), *map(float, q)])
-    holds = decode_sequence(t, all_p, np.zeros_like(all_q), output_valid, config)["holds"]
+        station_columns = ["predicted_station", "confidence"] if all_p is not None else []
+        writer.writerow(["sync_timestamp", "prediction_available", *station_columns, *rep_columns])
+        for i, (clock, valid, q) in enumerate(zip(t, output_valid, all_q)):
+            station_values = []
+            if all_p is not None:
+                p = all_p[i]
+                station_values = [CLASSES[int(p.argmax())] if valid else "unavailable", float(p.max())]
+            writer.writerow([int(clock), bool(valid), *station_values, *map(float, q)])
+    holds = [] if all_p is None else decode_sequence(t, all_p, np.zeros_like(all_q), output_valid, config)["holds"]
     summary = {"repetitions": repetitions, "counts": dict(Counter(r["station"] for r in repetitions)),
                "holds": holds, "sets": group_sets(repetitions, config.set_gap_ms),
                "station_only": ckpt["station_only"], "decoder_selection": selection,

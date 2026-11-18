@@ -74,6 +74,11 @@ class LookaheadTests(unittest.TestCase):
         valid = np.ones(80, bool)
         base = decode_sequence(t, p, q, valid)["repetitions"][0]
         delayed = decode_sequence(t, p, q, valid, lookahead_ms=520)["repetitions"][0]
+        phase_only = decode_sequence(t, None, q, valid)
+        self.assertEqual(phase_only["counts"], {"unknown": 1})
+        self.assertEqual(phase_only["holds"], [])
+        self.assertEqual(phase_only["repetitions"][0]["start_ms"], base["start_ms"])
+        self.assertEqual(phase_only["repetitions"][0]["end_ms"], base["end_ms"])
         self.assertEqual(delayed["start_ms"], base["start_ms"])
         self.assertEqual(delayed["end_ms"], base["end_ms"])
         self.assertEqual(delayed["reported_at_ms"] - base["reported_at_ms"], 520)
@@ -195,11 +200,35 @@ class AnalysisTests(unittest.TestCase):
         common = ["--data", str(self.data), "--folds", "3", "--fold", "1", "--epochs", "1",
                   "--max-steps", "1", "--batch-size", "2", "--window", "128", "--stages", "1",
                   "--layers", "2", "--channels", "4", "--threads", "1"]
-        main(["leave-one-exercise-out", *common, "--exercises", "squat", "push-up",
+        main(["leave-one-exercise-out", *common, "--stages", "2", "--lookahead-ms", "80",
+              "--exercises", "squat", "push-up",
               "--output", str(self.root / "loeo")])
         report = json.loads((self.root / "loeo/report.json").read_text())
         self.assertEqual(set(report["results"]), {"squat", "push-up"})
-        self.assertEqual(report["results"]["squat"]["segmentation"]["status"], "scored")
+        self.assertEqual(report["exercise_fold_count"], 2)
+        self.assertEqual(report["subject_fold"], 1)
+        exercise = report["results"]["squat"]
+        self.assertEqual(exercise["segmentation"]["status"], "scored")
+        folder = self.root / "loeo/squat"
+        seen = json.loads((folder / "seen_exercise_report.json").read_text())
+        comparison = exercise["seen_exercise_comparison"]["400"]
+        self.assertEqual(comparison["unseen_minus_seen_f1"],
+                         exercise["segmentation"]["f1"] - seen["segmentation"]["f1"])
+        self.assertEqual(exercise["subjects"], seen["subjects"])
+        model, checkpoint = load_checkpoint(folder / "model/best.pt")
+        self.assertEqual(checkpoint["classes"], [])
+        self.assertTrue(all(stage.station is None for stage in model.stages))
+        self.assertEqual(len(json.loads((folder / "decoder.json").read_text())["trials"]), 3)
+        test_report = json.loads((folder / "test/report.json").read_text())
+        self.assertEqual(test_report["segmentation"]["status"], "scored")
+        self.assertNotIn("classification", test_report)
+        source = self.root / "source/20260101_DEMO000"
+        main(["predict", "--input", str(source / "left_wrist.csv"),
+              "--checkpoint", str(folder / "model/best.pt"), "--decoder", str(folder / "decoder.json"),
+              "--chunk", "7", "--threads", "1", "--output", str(self.root / "phase_prediction")])
+        phase_frames = pd.read_csv(self.root / "phase_prediction/frames.csv")
+        self.assertIn("phase1_probability", phase_frames)
+        self.assertNotIn("predicted_station", phase_frames)
         main(["sensor-ablation", *common, "--output", str(self.root / "ablations")])
         report = json.loads((self.root / "ablations/report.json").read_text())
         self.assertEqual(len(report["results"]), 7)
@@ -208,7 +237,6 @@ class AnalysisTests(unittest.TestCase):
         model, checkpoint = load_checkpoint(folder / "model/best.pt")
         self.assertEqual(model.config.inputs, 12)
         self.assertTrue(checkpoint["augmentation"])
-        source = self.root / "source/20260101_DEMO000"
         main(["predict", "--input", str(source / "left_wrist.csv"),
               "--waist-input", str(source / "S1_waist.csv"), "--checkpoint", str(folder / "model/best.pt"),
               "--decoder", str(folder / "decoder.json"), "--chunk", "7", "--threads", "1",

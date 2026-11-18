@@ -58,7 +58,8 @@ class RepDecoder:
         self.previous_time = t
         # Delay decisions by two frames (80 ms by default), but retain the
         # original boundary timestamp. Never flush unconfirmed events at EOF.
-        self.frames.append((t, np.array(station_prob, copy=True), np.array(boundary_prob, copy=True)))
+        station_prob = None if station_prob is None else np.array(station_prob, copy=True)
+        self.frames.append((t, station_prob, np.array(boundary_prob, copy=True)))
         if len(self.frames) <= c.lag_frames:
             return []
         reported = t if reported_at_ms is None else max(t, int(reported_at_ms))
@@ -94,14 +95,16 @@ class RepDecoder:
             active = self.active
             if t - active["start_ms"] >= c.min_rep_ms:
                 probs = active["sum"] / max(active["samples"], 1)
-                label = 1 + int(np.argmax(probs[1:]))
-                # Station uncertainty must not veto a complete cycle. Weak
-                # known-class evidence is labelled unknown and still counted.
-                name = CLASSES[label] if probs[label] >= c.station_threshold else "unknown"
+                activity = float(1 - probs[0])
+                name, confidence = "unknown", activity
+                if station_prob is not None:
+                    label = 1 + int(np.argmax(probs[1:]))
+                    confidence = float(probs[label])
+                    name = CLASSES[label] if confidence >= c.station_threshold else "unknown"
                 if name != "plank":
                     events.append({"station": name, "start_ms": active["start_ms"],
-                                   "end_ms": t, "confidence": float(probs[label]),
-                                   "activity_probability": float(1 - probs[0]),
+                                   "end_ms": t, "confidence": confidence,
+                                   "activity_probability": activity,
                                    "reported_at_ms": reported})
                 self.active = None
             elif len(boundary_prob) == 3:
@@ -109,10 +112,11 @@ class RepDecoder:
                 # open and later absorb an orphan phase2.
                 self.active = None
         # An unmatched new start replaces an incomplete cycle; no guessed end.
+        evidence = boundary_prob if station_prob is None else station_prob
         if fire[0]:
-            self.active = {"start_ms": t, "sum": np.zeros(len(CLASSES)), "samples": 0}
+            self.active = {"start_ms": t, "sum": np.zeros(len(evidence)), "samples": 0}
         if self.active:
-            self.active["sum"] += station_prob
+            self.active["sum"] += evidence
             self.active["samples"] += 1
         return events
 
@@ -136,7 +140,9 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
     previous = None
     for i, clock in enumerate(t):
         gap = previous is not None and clock - previous != DT_MS
-        is_hold = bool(valid[i]) and int(station_prob[i].argmax()) == CLASSES.index("plank")
+        station = None if station_prob is None else station_prob[i]
+        is_hold = (station is not None and bool(valid[i])
+                   and int(station.argmax()) == CLASSES.index("plank"))
         if hold_start is not None and (not is_hold or gap):
             end = int(previous + DT_MS)
             holds.append({"station": "plank", "start_ms": hold_start,
@@ -144,7 +150,7 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
             hold_start = None
         if is_hold and hold_start is None:
             hold_start = int(clock)
-        reps.extend(decoder.step(clock, station_prob[i], boundary_prob[i], bool(valid[i]),
+        reps.extend(decoder.step(clock, station, boundary_prob[i], bool(valid[i]),
                                  reported_at_ms=int(clock) + lookahead_ms))
         previous = int(clock)
     if hold_start is not None:

@@ -1,4 +1,4 @@
-"""MS-TCN-inspired causal refinement with station and dense phase heads.
+"""MS-TCN-inspired causal refinement with an optional station head.
 
 Original MS-TCN uses symmetric convolutions and one action head. Here left-only
 padding enables online use. The repetition head predicts NULL/phase1/phase2;
@@ -27,10 +27,12 @@ class ModelConfig:
     lookahead_samples: int = 0
 
     def __post_init__(self):
-        if min(self.inputs, self.classes, self.stages, self.layers, self.channels) < 1:
-            raise ValueError("Model dimensions must be positive")
+        if min(self.inputs, self.stages, self.layers, self.channels) < 1 or self.classes < 0:
+            raise ValueError("Model dimensions must be positive; use zero classes for phase-only models")
         if self.repetition_head not in ("phase", "boundary"):
             raise ValueError("repetition_head must be phase or boundary")
+        if self.classes == 0 and self.repetition_head != "phase":
+            raise ValueError("Models without a station head require dense phases")
         if not isinstance(self.lookahead_samples, int) or self.lookahead_samples < 0:
             raise ValueError("lookahead_samples must be a nonnegative integer")
 
@@ -65,21 +67,23 @@ class Stage(nn.Module):
         self.project = nn.Conv1d(inputs, config.channels, 1)
         self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout)
                                      for i in range(config.layers)])
-        self.station = nn.Conv1d(config.channels, config.classes, 1)
+        self.station = nn.Conv1d(config.channels, config.classes, 1) if config.classes else None
         self.boundary = nn.Conv1d(config.channels, config.repetition_classes, 1)
 
     def forward(self, x, mask):
         h = self.project(x) * mask
         for layer in self.layers:
             h = layer(h, mask)
-        return self.station(h) * mask, self.boundary(h) * mask
+        station = self.station(h) * mask if self.station is not None else None
+        return station, self.boundary(h) * mask
 
     def stream(self, x, state):
         h, new_state = self.project(x), []
         for i, layer in enumerate(self.layers):
             h, cache = layer.stream(h, None if state is None else state[i])
             new_state.append(cache)
-        return self.station(h), self.boundary(h), new_state
+        station = self.station(h) if self.station is not None else None
+        return station, self.boundary(h), new_state
 
 
 class DenseMSTCN(nn.Module):
@@ -100,12 +104,12 @@ class DenseMSTCN(nn.Module):
         for stage in self.stages:
             station, boundary = stage(x, mask)
             results.append((station, boundary))
-            x = torch.cat((station.softmax(1), self.repetition_probabilities(boundary)), dim=1) * mask
+            x = self._refinement_input(station, boundary) * mask
         # A causal output acquired at t+L predicts the target at t. Shift only
         # after all refinement stages so their lookaheads do not accumulate.
         lag = self.config.lookahead_samples
         if lag:
-            results = [(F.pad(p[:, :, lag:], (0, min(lag, p.shape[-1]))),
+            results = [(F.pad(p[:, :, lag:], (0, min(lag, p.shape[-1]))) if p is not None else None,
                         F.pad(q[:, :, lag:], (0, min(lag, q.shape[-1])))) for p, q in results]
         return results
 
@@ -124,8 +128,12 @@ class DenseMSTCN(nn.Module):
         for i, stage in enumerate(self.stages):
             station, boundary, cache = stage.stream(x, None if state is None else state[i])
             caches.append(cache)
-            x = torch.cat((station.softmax(1), self.repetition_probabilities(boundary)), dim=1)
+            x = self._refinement_input(station, boundary)
         return station, boundary, caches
+
+    def _refinement_input(self, station, boundary):
+        phases = self.repetition_probabilities(boundary)
+        return phases if station is None else torch.cat((station.softmax(1), phases), dim=1)
 
     def repetition_probabilities(self, logits):
         return logits.softmax(1) if self.config.repetition_head == "phase" else logits.sigmoid()
@@ -134,20 +142,22 @@ class DenseMSTCN(nn.Module):
 def dense_loss(outputs, y, boundary, valid, reference_mask, class_weights=None,
                positive_weights=None, boundary_weight=1., smoothing_weight=.15,
                phase_weights=None):
-    """Station CE + truncated smoothing + masked phase CE (or boundary BCE).
+    """Masked repetition loss and, when present, station CE and smoothing.
 
     Smoothing uses both adjacent eligibility flags and detaches the preceding
     prediction, following the authors' MS-TCN implementation. Repetition logits
     are not smoothed: boundaries and phase transitions must remain sharp.
     """
-    total = outputs[0][0].sum() * 0
+    total = outputs[0][1].sum() * 0
     for station, events in outputs:
-        ce = F.cross_entropy(station, y, weight=class_weights, reduction="none")
-        cls = (ce * valid).sum() / valid.sum().clamp_min(1)
-        logp = station.log_softmax(1)
-        pair = valid[:, 1:] & valid[:, :-1]
-        smooth = (logp[:, :, 1:] - logp[:, :, :-1].detach()).square().clamp(max=16).mean(1)
-        smooth = (smooth * pair).sum() / pair.sum().clamp_min(1)
+        if station is not None:
+            ce = F.cross_entropy(station, y, weight=class_weights, reduction="none")
+            cls = (ce * valid).sum() / valid.sum().clamp_min(1)
+            logp = station.log_softmax(1)
+            pair = valid[:, 1:] & valid[:, :-1]
+            smooth = (logp[:, :, 1:] - logp[:, :, :-1].detach()).square().clamp(max=16).mean(1)
+            smooth = (smooth * pair).sum() / pair.sum().clamp_min(1)
+            total = total + cls + smoothing_weight * smooth
         refs = reference_mask & valid
         if events.shape[1] == 3:
             phase_ce = F.cross_entropy(events, boundary, weight=phase_weights, reduction="none")
@@ -156,7 +166,7 @@ def dense_loss(outputs, y, boundary, valid, reference_mask, class_weights=None,
             bce = F.binary_cross_entropy_with_logits(events.transpose(1, 2), boundary,
                                                     pos_weight=positive_weights, reduction="none")
             rep_loss = (bce * refs[..., None]).sum() / (2 * refs.sum()).clamp_min(1)
-        total = total + cls + smoothing_weight * smooth + boundary_weight * rep_loss
+        total = total + boundary_weight * rep_loss
     return total / len(outputs)
 
 

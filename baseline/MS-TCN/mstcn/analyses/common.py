@@ -25,7 +25,7 @@ def pilot(args):
     if manifest["features"] != FEATURES or manifest.get("analysis"):
         raise ValueError("Start these analyses from the original nine-channel wrist dataset")
     if args.station_only or args.repetition_head not in ("auto", "phase"):
-        raise ValueError("These analyses require the station + phase1/phase2 model")
+        raise ValueError("These analyses require dense phase1/phase2 targets")
     splits = subject_folds(manifest["sessions"], args.folds, args.seed)
     if not 1 <= args.fold <= len(splits):
         raise ValueError("fold must be between 1 and folds")
@@ -131,7 +131,7 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
     return view
 
 
-def fit_and_score(args, folder, **overrides):
+def fit_and_score(args, folder, report_scope="single_fold_analysis_pilot", **overrides):
     params = {**vars(args), **overrides, "repetition_head": "phase",
               "data": folder / "data", "output": folder / "model"}
     checkpoint = train(Namespace(**params))
@@ -139,7 +139,7 @@ def fit_and_score(args, folder, **overrides):
     tune(Namespace(**params))
     params.update(decoder=folder / "decoder.json", split="test", output=folder / "test")
     report = evaluate(Namespace(**params))
-    report["report_scope"] = "single_fold_analysis_pilot"
+    report["report_scope"] = report_scope
     write_json(folder / "test/report.json", report)
     return report
 

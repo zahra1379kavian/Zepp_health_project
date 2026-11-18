@@ -21,17 +21,22 @@ def main(argv=None):
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
     cv = sub.add_parser("cross-validate", help="Subject-wise folds with separate validation and pooled held-out scores")
     ablation = sub.add_parser("sensor-ablation", help="One-fold lookahead, inertial augmentation and waist comparisons")
-    loeo = sub.add_parser("leave-one-exercise-out", help="Mask an exercise from fitting; score it in held-out subjects")
-    for command in (ablation, loeo):
-        command.add_argument("--folds", type=int, default=5)
-        command.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
+    loeo = sub.add_parser("leave-one-exercise-out", help="Train and score a phase-only model per held-out exercise")
+    ablation.add_argument("--folds", type=int, default=5)
+    ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
+    loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
+                      help="Number of groups used to define the fixed participant split")
+    loeo.add_argument("--subject-fold", "--fold", dest="fold", type=int, default=1,
+                      help="Participant split shared by every exercise holdout")
     ablation.add_argument("--source", type=Path, help="Raw sensor root for waist fusion; defaults to dataset source")
     ablation.add_argument("--variants", nargs="+", default=["baseline", "lookahead", "acc_gyro", "augmentation",
                                                            "combined", "combined_paired_wrist", "combined_waist"],
                           choices=["baseline", "lookahead", "acc_gyro", "augmentation", "combined",
                                    "combined_paired_wrist", "combined_waist"])
-    loeo.add_argument("--exercises", nargs="+", default=["leg_raise", "squat", "push-up", "biceps_curls"],
-                     help="Independent held-out exercises; default is a four-exercise pilot")
+    loeo.add_argument("--exercises", nargs="+", default=["leg_raise", "squat", "push-up", "biceps_curls", "crunch"],
+                     help="One fold per listed exercise; default is five exercises. Use 'all' for all dynamic exercises.")
+    train.add_argument("--phase-only", action="store_true",
+                       help="Train a repetition model on phase targets without an exercise classification head")
     cv.add_argument("--folds", type=int, default=5)
     cv.add_argument("--resume-completed", action="store_true",
                     help="Reuse verified completed folds in an existing output; incomplete folds must be moved aside")
