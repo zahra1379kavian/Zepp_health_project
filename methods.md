@@ -1,28 +1,32 @@
-classical counter as a baseline:
-temporal action segmentation with a NULL class, as in MS-TCN (Farha and Gall, 2019) and the WEAR inertial work by Bock et al..and the dense two-head design above is a direct fit. 
-Classical rep counting from RecoFit (Morris et al., 2014) .
-TS2Vec is a sensible way to pretrain the encoder on all 88 hours before fine-tuning, but with 36,000 labeled reps I would try plain supervised training first and add pretraining only if cross-subject results plateau. The open-set papers stay in phase 2.
+# Activity-agnostic rep detection from wrist motion
+## 2. Train MS-TCN to find complete reps
 
+Feed the continuous wrist signal into the causal MS-TCN. Every 40 ms, train two outputs from its motion features: the probability that a rep just ended and the probability that the person is at a station.
 
-Make RecoFit usable as the unknown-station fallback. Its boundary offsets are calibrated per exercise, so for an unknown station it emits no intervals. It needs a pooled, exercise-independent calibration.
-How to enhance RecoFit model to detect start and end of a repitition? Learn the edges from training data with a small regressor, or by matching a typical repetition shape for each exercise. This is likely the most accurate, but it is no longer RecoFit.
+- **End output.** Rep ends are rare, about 1 frame in 300. Spread each end target over ±2 frames (±80 ms). Report an end only at a local peak above a threshold.
+- **Start output.** At each end, train a third output to choose the start from the previous 6 s, which covers 99.9% of reps, or to choose "no valid start". Include competing starts halfway through the rep and at the start of the previous rep. Train it at labeled ends, at ends shifted by up to ±2 frames, and at false ends. False ends are mid-rep turnarounds (`phase1` → `phase2`) and end peaks that the current model reports in rest. At a false end, the correct choice is "no valid start".
+- **Hard negatives.** In the current model's held-out cross-validation predictions, find rest stretches with three or more reps in a row. Check a sample by hand. Mask stretches that contain real reps, and give the others extra weight in the loss.
+- **Station output.** Use it only to group reps into sets. Never let it block a rep, because an unseen exercise may look like rest.
 
+During replay, report a rep once, when its end peak is confirmed and a valid start is chosen. This rule can count the first rep without an exercise name or a previous example.
 
-Where the MS-TCN loses reps
-Of the 3,066 missed reps:
-No prediction at all (47%):
-Exercises: leg raise has 72% of sets missed entirely, crunch 41%, pull-up 21%.
-Set edges: the first rep of a set is missed 52% of the time and the last 39%, against 24% for interior reps.
-Detected but wrong boundaries (53%): one rep split into two (26%), an endpoint off by more than 400 ms (15%), or two reps merged (12%).
-Phantom reps in rest: 605 over 21.6 stream-hours of rest, about 28 per hour.
-Generalisation gap: training loss is 0.23 against 0.51 on validation, with only 25 training subjects per fold.
+**Baselines.** Compare with the current phase model, with the existing boundary head (`--repetition-head boundary`), and with the rule "start = previous end". That rule holds for 77% of consecutive reps in a set.
 
+## 3. Test whether XRFMamba makes better use of history
 
-####################
-Step	Goal	Method
-2	Rep segmentation (main model)	Current causal MS-TCN with the phase1/phase2 head, plus three changes: add about 0.5 s of lookahead, test accelerometer + gyroscope only (no magnetometer), and add augmentation (small rotations, time-warp, scaling).
-Leave-one-exercise-out test. Train with one exercise removed, then score station-ignored rep F1 on it in held-out subjects.
-Mask the held-out exercise's frames during training; do not label them rest, or the model learns to ignore it.
-Start with three or four exercises on one fold, not all 15.
-No flag for this exists yet in `baseline/MS-TCN/mstcn/`.
-Decide whether a waist sensor is allowed at deployment. In leg raises and crunches the wrist barely moves, so a wrist-only model is unlikely to fix them. If the product is wrist-only, report these two as a sensor limit.
+Replace the MS-TCN encoder with forward-only XRFMamba blocks. Keep the same labels, outputs, and counting rule. Retain one feature vector every 40 ms for locating boundaries. Give the station output both the current vector and a summary of earlier motion from the encoder. This lets it use context such as walking between stations, stopping to set up, and beginning a set.
+
+## 4. Add OnPoint’s teacher–student training
+
+Train a bidirectional XRFMamba **teacher** on the labeled training sessions. It can look ahead and use later reps to interpret an ambiguous first rep. Freeze the teacher and save its station and end probabilities at each timestamp and its start scores at each labeled end. Train a fresh copy of the streaming model from step 3 to match both the human labels and these teacher scores. Deploy only the streaming model. Comparing steps 3 and 4 isolates the effect of this extra training signal.
+
+## 5. Compare all three models on unseen exercises
+
+- **Replay.** Hold out entire exercises and participants from training and tuning. Replay full test sessions at 0, 160, and 320 ms of lookahead. For a decision about time `t`, the encoder and decoder together may use at most 0, 4, or 8 additional 40 ms samples. Log when both final timestamps are emitted.
+- **Score.** Match predictions to labeled reps one-to-one. Report rep F1 twice, requiring both endpoints to fall within ±200 ms and then ±400 ms. Also report station recall on unseen exercises, first-rep recall, false reps per hour of walking and warm-up, and delay from the true rep end to the final report. Compare first-rep recall at a similar false-count rate, with thresholds chosen on validation sessions.
+
+## References
+
+- [MS-TCN: Multi-Stage Temporal Convolutional Network for Action Segmentation](https://arxiv.org/abs/1903.01945). CVPR, 2019.
+- [XRF V2: A Dataset for Action Summarization with Wi-Fi Signals, and IMUs in Phones, Watches, Earbuds, and Glasses](https://doi.org/10.1145/3749521). ACM IMWUT, 2025. Introduces XRFMamba.
+- [OnPoint: Offline-to-Online Multi-Level Distillation for Point-Supervised Online Temporal Action Localization](https://arxiv.org/abs/2607.00289). ECCV, 2026.
