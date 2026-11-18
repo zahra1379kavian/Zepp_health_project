@@ -11,18 +11,18 @@ import numpy as np
 import pandas as pd
 import torch
 
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, EXCLUDED_SESSIONS, FEATURES
-from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, log_masks,
+from baseline.mstcn.constants import CLASSES, DT_MS, EXCLUDED_SESSIONS, FEATURES
+from baseline.mstcn.data import (load_arrays, load_sensor, log_masks,
                                                          phase_label_targets, prepare, reference_targets,
                                                          select_wrists, subject_split, subject_folds,
                                                          dense_phase_targets, training_statistics)
-from strength_training.temporal_segmentation.decode import DecoderConfig, RepDecoder, decode_sequence
-from strength_training.temporal_segmentation.demo import synthetic_source
-from strength_training.temporal_segmentation.metrics import (covered_repetitions, match_repetitions,
+from baseline.mstcn.decode import DecoderConfig, RepDecoder, decode_sequence
+from baseline.mstcn.demo import synthetic_source
+from baseline.mstcn.metrics import (covered_repetitions, match_repetitions,
                                                             repetition_metrics, score_stream,
                                                             grouped_stream_report, reporting_tolerances)
-from strength_training.temporal_segmentation.model import DenseMSTCN, ModelConfig, dense_loss
-from strength_training.temporal_segmentation.runner import Windows, checkpoint_key, score_cache, run_pipeline, evaluate
+from baseline.mstcn.model import DenseMSTCN, ModelConfig, dense_loss
+from baseline.mstcn.runner import Windows, checkpoint_key, score_cache, run_pipeline, evaluate
 
 
 class ModelTests(unittest.TestCase):
@@ -625,8 +625,8 @@ class MetricsTests(unittest.TestCase):
 
 class ReportingTests(unittest.TestCase):
     def test_completed_fold_resume_preserves_results_and_restarts_only_missing_folds(self):
-        from strength_training.temporal_segmentation.__main__ import main
-        from strength_training.temporal_segmentation import runner
+        from baseline.mstcn.__main__ import main
+        from baseline.mstcn import runner
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -676,9 +676,9 @@ class ReportingTests(unittest.TestCase):
             args = Namespace(data=root / "data", output=root / "evaluation", checkpoint="unused", device="cpu",
                              decoder=None, tolerance_ms=400, report_tolerances_ms=[200, 400], split="test")
             ckpt = {"normalization": manifest["normalization"], "station_only": False}
-            with patch("strength_training.temporal_segmentation.runner.load_checkpoint", return_value=(None, ckpt)), \
-                    patch("strength_training.temporal_segmentation.runner.probabilities", side_effect=predicted_probabilities), \
-                    patch("strength_training.temporal_segmentation.runner.decode_sequence", wraps=decode_sequence) as decode:
+            with patch("baseline.mstcn.runner.load_checkpoint", return_value=(None, ckpt)), \
+                    patch("baseline.mstcn.runner.probabilities", side_effect=predicted_probabilities), \
+                    patch("baseline.mstcn.runner.decode_sequence", wraps=decode_sequence) as decode:
                 report = evaluate(args)
             self.assertEqual(decode.call_count, 2)
             self.assertEqual(len(calls), 2)
@@ -699,7 +699,7 @@ class ReportingTests(unittest.TestCase):
             (data / "manifest.json").write_text(json.dumps({"version": 4, "location": "wrist", "reference_mode": "labels"}))
             args = Namespace(data=data, output=root / "run", location="wrist", epochs=1, batch_size=4,
                              tolerance_ms=400, report_tolerances_ms=[200, 400], folds=5, device="cpu", threads=1, seed=42)
-            with patch("strength_training.temporal_segmentation.__main__.main") as main:
+            with patch("baseline.mstcn.__main__.main") as main:
                 run_pipeline(args)
             self.assertEqual(main.call_count, 1)
             command = main.call_args.args[0]

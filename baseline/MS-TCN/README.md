@@ -1,4 +1,10 @@
-# Wrist-only temporal action segmentation and repetition counting
+# MS-TCN for strength training
+
+- `mstcn/` contains the causal segmentation model, command-line entry point, tests, and analysis code.
+- `prepared_datasets/` contains `separate_wrist_streams/` (version 4), `single_wrist_per_session/` (version 2), and the historical `waist_sensor/` dataset (version 1).
+- `experiment_runs/` contains `wrist_cross_validation/`, `sensor_ablation_fold_1/`, `leave_one_exercise_out_fold_1/`, and `job_launches/`.
+
+The `baseline/mstcn` symlink provides the Python package name for `python -m baseline.mstcn`.
 
 The default method uses a **station/NULL head + dense NULL/phase1/phase2 head**.
 The user has validated **phase1 → phase2** as one complete repetition. Boundaries
@@ -12,10 +18,10 @@ No separate repetition-reference file is required for the default run.
 
 Two independent pilot analyses are implemented in separate folders:
 
-- [Sensor and model ablations](analyses/sensor_ablation/README.md): baseline,
+- [Sensor and model ablations](mstcn/analyses/sensor_ablation/README.md): baseline,
   520 ms lookahead, accelerometer + gyroscope, training augmentation, their
   combination, and paired wrist + waist fusion with a matched wrist control.
-- [Leave-one-exercise-out](analyses/leave_one_exercise_out/README.md): four
+- [Leave-one-exercise-out](mstcn/analyses/leave_one_exercise_out/README.md): four
   independently removed exercises on one subject fold, masked during fitting
   and validation, then station-ignored repetition F1 in held-out subjects.
 
@@ -40,23 +46,24 @@ cd /home/arjun/zahra
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -r strength_training/temporal_segmentation/requirements.txt
+python -m pip install -r baseline/MS-TCN/mstcn/requirements.txt
 ```
 
-The version-4 dataset is prepared at `strength_training/tas_data_both_wrists` in
-this workspace. To prepare it on a fresh checkout, run:
+This workspace has the version-4 dataset at
+`baseline/MS-TCN/prepared_datasets/separate_wrist_streams`. To prepare it on a
+fresh checkout, run:
 
 ```bash
-python -m strength_training.temporal_segmentation prepare \
-  --output strength_training/tas_data_both_wrists
+python -m baseline.mstcn prepare \
+  --output baseline/MS-TCN/prepared_datasets/separate_wrist_streams
 ```
 
 Run the full five-fold experiment:
 
 ```bash
-python -m strength_training.temporal_segmentation run \
-  --data strength_training/tas_data_both_wrists \
-  --output strength_training/tas_runs/wrist_cv \
+python -m baseline.mstcn run \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
+  --output baseline/MS-TCN/experiment_runs/wrist_cross_validation \
   --folds 5 --epochs 30 --device cpu \
   --tolerance-ms 400 --report-tolerances-ms 200 400
 ```
@@ -81,9 +88,9 @@ selection always decodes the complete validation sessions.
 To invoke cross-validation directly on prepared data, use:
 
 ```bash
-python -m strength_training.temporal_segmentation cross-validate \
-  --data strength_training/tas_data_both_wrists \
-  --output strength_training/tas_runs/wrist_cv_direct \
+python -m baseline.mstcn cross-validate \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
+  --output baseline/MS-TCN/experiment_runs/wrist_cross_validation_direct \
   --folds 5 --epochs 30 --tolerance-ms 400 --report-tolerances-ms 200 400
 ```
 
@@ -98,8 +105,8 @@ Five folds with 43 subjects gives 8–9 test subjects per fold and tests all 43.
 On a fresh checkout without prepared data, omit `--data`:
 
 ```bash
-python -m strength_training.temporal_segmentation run \
-  --output strength_training/tas_runs/wrist_cv_fresh \
+python -m baseline.mstcn run \
+  --output baseline/MS-TCN/experiment_runs/wrist_cross_validation_fresh \
   --epochs 30 --device cpu
 ```
 
@@ -112,7 +119,7 @@ its output directory. Use these cross-validation results for headline numbers.
 To continue after an interruption while retaining completed folds, stop the old
 process, move the incomplete `fold_N/` directory to a backup outside
 `cross_validation/`, and invoke `cross-validate` with the original settings and
-`--resume-completed --output strength_training/tas_runs/wrist_cv/cross_validation`.
+`--resume-completed --output baseline/MS-TCN/experiment_runs/wrist_cross_validation/cross_validation`.
 Completed folds are checked against the dataset, splits, model configuration,
 decoder and saved test scores before reuse. Missing folds train from epoch 1;
 incomplete folds are refused rather than overwritten. This resumes between folds,
@@ -125,7 +132,7 @@ synthetic demo before this experiment.
 
 ## Outputs
 
-| File under `strength_training/tas_runs/wrist_cv/cross_validation/` | Contents |
+| File under `baseline/MS-TCN/experiment_runs/wrist_cross_validation/cross_validation/` | Contents |
 | --- | --- |
 | `report.json` | Main pooled cross-validation report, per side and at 200/400 ms |
 | `folds.json` | Fold membership and fold metrics |
@@ -208,7 +215,7 @@ The 72-test regression suite passed. A three-fold synthetic experiment with
 16 streams from eight subjects verified training, tuning, pooled evaluation,
 per-side metrics, both timing tolerances, and sensor-only prediction. Synthetic
 training was deliberately short and does not establish model accuracy. Prior real
-training checks in `verification.json` describe the historical boundary model.
+training checks in `mstcn/verification.json` describe the historical boundary model.
 Full held-out repetition performance and the <1 second true reporting-delay goal
 still need to be measured by the full experiment.
 
@@ -227,25 +234,25 @@ publish numbers from `run` or `cross-validate` above. A standalone `evaluate`
 report is explicitly marked `single_split_diagnostic`:
 
 ```bash
-python -m strength_training.temporal_segmentation prepare \
+python -m baseline.mstcn prepare \
   --location wrist --reference-mode labels \
-  --output strength_training/tas_data_wrist_new
+  --output baseline/MS-TCN/prepared_datasets/wrist_manual
 
-python -m strength_training.temporal_segmentation train \
-  --data strength_training/tas_data_wrist_new \
-  --output strength_training/tas_runs/wrist_manual/model --epochs 30
+python -m baseline.mstcn train \
+  --data baseline/MS-TCN/prepared_datasets/wrist_manual \
+  --output baseline/MS-TCN/experiment_runs/wrist_manual/model --epochs 30
 
-python -m strength_training.temporal_segmentation tune \
-  --data strength_training/tas_data_wrist_new \
-  --checkpoint strength_training/tas_runs/wrist_manual/model/best.pt \
+python -m baseline.mstcn tune \
+  --data baseline/MS-TCN/prepared_datasets/wrist_manual \
+  --checkpoint baseline/MS-TCN/experiment_runs/wrist_manual/model/best.pt \
   --tolerance-ms 400 \
-  --output strength_training/tas_runs/wrist_manual/decoder.json
+  --output baseline/MS-TCN/experiment_runs/wrist_manual/decoder.json
 
-python -m strength_training.temporal_segmentation evaluate \
-  --data strength_training/tas_data_wrist_new \
-  --checkpoint strength_training/tas_runs/wrist_manual/model/best.pt \
-  --decoder strength_training/tas_runs/wrist_manual/decoder.json \
-  --split test --output strength_training/tas_runs/wrist_manual/test
+python -m baseline.mstcn evaluate \
+  --data baseline/MS-TCN/prepared_datasets/wrist_manual \
+  --checkpoint baseline/MS-TCN/experiment_runs/wrist_manual/model/best.pt \
+  --decoder baseline/MS-TCN/experiment_runs/wrist_manual/decoder.json \
+  --split test --output baseline/MS-TCN/experiment_runs/wrist_manual/test
 ```
 
 The default **selection tolerance** is 400 ms at each endpoint. Declare it before
@@ -282,11 +289,11 @@ head because they need not certify phase labels. Their schema is implemented in
 After the full run, replay a wrist CSV without supplying any labels:
 
 ```bash
-python -m strength_training.temporal_segmentation predict \
-  --checkpoint strength_training/tas_runs/wrist_cv/cross_validation/fold_1/model/best.pt \
-  --decoder strength_training/tas_runs/wrist_cv/cross_validation/fold_1/decoder.json \
+python -m baseline.mstcn predict \
+  --checkpoint baseline/MS-TCN/experiment_runs/wrist_cross_validation/cross_validation/fold_1/model/best.pt \
+  --decoder baseline/MS-TCN/experiment_runs/wrist_cross_validation/cross_validation/fold_1/decoder.json \
   --input strength_training/strength_training_data_clean/20260602_LRFVFZEIVGAM/left_wrist.csv \
-  --chunk 1 --output strength_training/tas_runs/wrist_prediction
+  --chunk 1 --output baseline/MS-TCN/experiment_runs/wrist_prediction
 ```
 
 This writes `events.jsonl`, `frames.csv`, and `predictions.json`. The example
@@ -354,12 +361,12 @@ remain duration-only.
 ## Tests and source files
 
 ```bash
-python -m unittest discover -s strength_training -p 'test_*.py' -v
-python -m strength_training.temporal_segmentation demo \
-  --output strength_training/tas_runs/my_wrist_demo
+python -m unittest discover -s baseline/MS-TCN/mstcn/tests -v
+python -m baseline.mstcn demo \
+  --output baseline/MS-TCN/experiment_runs/my_wrist_demo
 ```
 
-| File | Responsibility |
+| File under `mstcn/` | Responsibility |
 | --- | --- |
 | `__main__.py` | CLI, including the single `run` entry point |
 | `data.py` | Wrist selection, joins, masks, phase conversion, splits, normalization |

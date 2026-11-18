@@ -13,8 +13,8 @@ from baseline.RecoFit.features import extract, filtered_inputs, pc1, window_ends
 from baseline.RecoFit.pipeline import (check_split, classify, cross_validate, evaluate, fit, fit_period_bounds,
                                       fit_boundary_offsets, infer, load_model, predict)
 from baseline.RecoFit.demo import synthetic_source
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import prepare, subject_folds
+from baseline.mstcn.constants import CLASSES, DT_MS, FEATURES
+from baseline.mstcn.data import prepare, subject_folds
 
 
 # Explicit boundary calibration for the positive-X sine fixtures.

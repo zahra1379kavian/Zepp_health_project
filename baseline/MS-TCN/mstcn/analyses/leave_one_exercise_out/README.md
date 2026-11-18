@@ -6,9 +6,9 @@ initial pilot removes `leg_raise`, `squat`, `push-up`, and `biceps_curls`, one a
 time, using fold 1 of the existing five-part subject partition.
 
 ```bash
-.venv/bin/python -m strength_training.temporal_segmentation leave-one-exercise-out \
-  --data strength_training/tas_data_both_wrists \
-  --output strength_training/tas_runs/leave_one_exercise_out_fold1 \
+.venv/bin/python -m baseline.mstcn leave-one-exercise-out \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
+  --output baseline/MS-TCN/experiment_runs/leave_one_exercise_out_fold_1 \
   --exercises leg_raise squat push-up biceps_curls \
   --folds 5 --fold 1 --epochs 30 --device cpu \
   --tolerance-ms 400 --report-tolerances-ms 200 400

@@ -11,15 +11,15 @@ import numpy as np
 import pandas as pd
 import torch
 
-from strength_training.temporal_segmentation.__main__ import main
-from strength_training.temporal_segmentation.analyses.common import make_view, exercise_predictions, waist_on_grid
-from strength_training.temporal_segmentation.augmentation import augment
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import load_arrays, prepare, subject_folds
-from strength_training.temporal_segmentation.decode import decode_sequence
-from strength_training.temporal_segmentation.demo import synthetic_source
-from strength_training.temporal_segmentation.model import DenseMSTCN, ModelConfig
-from strength_training.temporal_segmentation.runner import Windows, prediction_mask, probabilities, load_checkpoint
+from baseline.mstcn.__main__ import main
+from baseline.mstcn.analyses.common import make_view, exercise_predictions, waist_on_grid
+from baseline.mstcn.augmentation import augment
+from baseline.mstcn.constants import CLASSES, DT_MS, FEATURES
+from baseline.mstcn.data import load_arrays, prepare, subject_folds
+from baseline.mstcn.decode import decode_sequence
+from baseline.mstcn.demo import synthetic_source
+from baseline.mstcn.model import DenseMSTCN, ModelConfig
+from baseline.mstcn.runner import Windows, prediction_mask, probabilities, load_checkpoint
 
 
 class LookaheadTests(unittest.TestCase):

@@ -1,11 +1,12 @@
-"""Run with python -m strength_training.temporal_segmentation --help."""
+"""Run with python -m baseline.mstcn --help."""
 
 import argparse
 from pathlib import Path
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Causal MS-TCN: station/NULL + dense repetition phases")
+    parser = argparse.ArgumentParser(prog="python -m baseline.mstcn",
+                                     description="Causal MS-TCN: station/NULL + dense repetition phases")
     sub = parser.add_subparsers(dest="command", required=True)
     prepare = sub.add_parser("prepare", help="Exact-clock joins, exclusions, references and subject splits")
     prepare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
@@ -73,9 +74,9 @@ def main(argv=None):
     predict.add_argument("--decoder", type=Path)
     predict.add_argument("--chunk", type=int, default=1, help="1..20 samples; default is one sample (40 ms)")
     demo = sub.add_parser("demo", help="Run the whole pipeline with generated, validated synthetic boundaries")
-    demo.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/demo"))
+    demo.add_argument("--output", type=Path, default=Path("baseline/MS-TCN/experiment_runs/demo"))
     run = sub.add_parser("run", help="Prepare every wrist stream → subject-wise cross-validation")
-    run.add_argument("--output", type=Path, default=Path("strength_training/tas_runs/wrist_cv"))
+    run.add_argument("--output", type=Path, default=Path("baseline/MS-TCN/experiment_runs/wrist_cross_validation"))
     run.add_argument("--data", type=Path, help="Reuse a prepared wrist dataset instead of preparing it again")
     run.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     run.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))

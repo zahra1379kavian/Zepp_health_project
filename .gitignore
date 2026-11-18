@@ -17,14 +17,14 @@ plan.md
 .DS_Store
 
 # Generated temporal segmentation datasets, checkpoints, and run outputs
-/strength_training/tas_data*/
-/strength_training/tas_runs/
+/baseline/MS-TCN/prepared_datasets/
+/baseline/MS-TCN/experiment_runs/
 /.venv/
 
 # Method workflow is a maintained documentation asset
-!/strength_training/temporal_segmentation/figures/*.png
-!/strength_training/temporal_segmentation/requirements.txt
-!/strength_training/temporal_segmentation/figures/workflow.prompt.txt
+!/baseline/MS-TCN/mstcn/figures/*.png
+!/baseline/MS-TCN/mstcn/requirements.txt
+!/baseline/MS-TCN/mstcn/figures/workflow.prompt.txt
 
 # RecoFit workflow is a maintained documentation asset
 !/baseline/RecoFit/workflow.png

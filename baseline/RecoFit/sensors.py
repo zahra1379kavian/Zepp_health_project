@@ -6,8 +6,8 @@ import tempfile
 
 import numpy as np
 
-from strength_training.temporal_segmentation.constants import DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import load_arrays, load_sensor, write_json
+from baseline.mstcn.constants import DT_MS, FEATURES
+from baseline.mstcn.data import load_arrays, load_sensor, write_json
 
 
 SENSOR_MODES = ("wrist", "wrist-waist")

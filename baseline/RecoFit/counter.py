@@ -37,7 +37,7 @@ class PCAState:
 
 def bandpass(x, valid):
     """Causal 0.15--11 Hz accelerometer bandpass, initialized per valid run."""
-    from strength_training.temporal_segmentation.data import runs
+    from baseline.mstcn.data import runs
     output = np.zeros((len(x), 3), np.float64)
     sos = ellip(4, .1, 60, [.15, 11.], btype="bandpass", fs=FS, output="sos")
     zi = sosfilt_zi(sos)[:, :, None]
@@ -138,7 +138,7 @@ def decode(t, acceleration, labels, valid, period_bounds, mode="causal", step=5,
     rule, independently of calibrated events, and include no interval validation.
     Emit only when that full interval has been observed. No artificial EOF cycle.
     """
-    from strength_training.temporal_segmentation.constants import CLASSES, DT_MS
+    from baseline.mstcn.constants import CLASSES, DT_MS
     if mode not in ("causal", "offline") or step < 1:
         raise ValueError("Invalid decode mode or step")
     t, labels, valid = np.asarray(t), np.asarray(labels), np.asarray(valid, bool)

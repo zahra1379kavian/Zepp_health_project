@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strength_training.temporal_segmentation.constants import DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import prepare, write_json
+from baseline.mstcn.constants import DT_MS, FEATURES
+from baseline.mstcn.data import prepare, write_json
 
 
 def synthetic_source(root, subjects=6, *, include_waist=False):

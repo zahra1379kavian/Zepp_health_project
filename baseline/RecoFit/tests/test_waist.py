@@ -12,8 +12,8 @@ from baseline.RecoFit.demo import synthetic_source
 from baseline.RecoFit.features import feature_batches, filtered_inputs
 from baseline.RecoFit.pipeline import evaluate, fit, fit_boundary_offsets, infer, load_model, predict
 from baseline.RecoFit.sensors import aligned_waist, load_inputs, prepare_waist, select_waist
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import prepare
+from baseline.mstcn.constants import CLASSES, DT_MS, FEATURES
+from baseline.mstcn.data import prepare
 
 
 class AlignmentTests(unittest.TestCase):

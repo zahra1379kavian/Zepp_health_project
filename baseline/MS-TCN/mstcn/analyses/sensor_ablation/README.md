@@ -9,9 +9,9 @@ subjects. Test performance does not select a variant automatically.
 From the repository root:
 
 ```bash
-.venv/bin/python -m strength_training.temporal_segmentation sensor-ablation \
-  --data strength_training/tas_data_both_wrists \
-  --output strength_training/tas_runs/sensor_ablation_fold1 \
+.venv/bin/python -m baseline.mstcn sensor-ablation \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
+  --output baseline/MS-TCN/experiment_runs/sensor_ablation_fold_1 \
   --folds 5 --fold 1 --epochs 30 --device cpu \
   --tolerance-ms 400 --report-tolerances-ms 200 400
 ```
@@ -87,12 +87,12 @@ again using only that variant's training frames.
 For a fused checkpoint, sensor-only replay requires both files:
 
 ```bash
-.venv/bin/python -m strength_training.temporal_segmentation predict \
-  --checkpoint strength_training/tas_runs/sensor_ablation_fold1/combined_waist/model/best.pt \
-  --decoder strength_training/tas_runs/sensor_ablation_fold1/combined_waist/decoder.json \
+.venv/bin/python -m baseline.mstcn predict \
+  --checkpoint baseline/MS-TCN/experiment_runs/sensor_ablation_fold_1/combined_waist/model/best.pt \
+  --decoder baseline/MS-TCN/experiment_runs/sensor_ablation_fold_1/combined_waist/decoder.json \
   --input strength_training/strength_training_data_clean/20260602_LRFVFZEIVGAM/left_wrist.csv \
   --waist-input strength_training/strength_training_data_clean/20260602_LRFVFZEIVGAM/S1_waist.csv \
-  --output strength_training/tas_runs/fused_prediction
+  --output baseline/MS-TCN/experiment_runs/fused_prediction
 ```
 
 These are one-fold exploratory comparisons. Pooled repetitions are wrist-stream

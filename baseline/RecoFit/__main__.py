@@ -3,6 +3,8 @@
 import argparse
 from pathlib import Path
 
+from baseline.mstcn import WRIST_DATASET
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m baseline.RecoFit",
@@ -17,7 +19,7 @@ def main(argv=None):
     prepare.add_argument("--references", type=Path)
     prepare.add_argument("--reference-mode", choices=["labels", "none"], default="labels")
     paired = sub.add_parser("prepare-waist", help="Add exact-clock waist inputs to an existing wrist dataset")
-    paired.add_argument("--data", type=Path, default=Path("strength_training/tas_data_both_wrists"))
+    paired.add_argument("--data", type=Path, default=WRIST_DATASET)
     paired.add_argument("--source", type=Path, help="cleaned recordings; defaults to the prepared manifest's source")
     paired.add_argument("--output", type=Path, required=True)
 
@@ -25,7 +27,7 @@ def main(argv=None):
     cv = sub.add_parser("cross-validate", help="Disjoint subject folds and pooled test metrics")
     run = sub.add_parser("run", help="Prepare if needed, then run subject-wise cross-validation")
     for p in (train, cv, run):
-        p.add_argument("--data", type=Path, default=Path("strength_training/tas_data_both_wrists"))
+        p.add_argument("--data", type=Path, default=WRIST_DATASET)
         p.add_argument("--output", type=Path, required=True)
         p.add_argument("--window-seconds", type=float, default=5.)
         p.add_argument("--train-step-ms", type=int, default=1000)
@@ -47,7 +49,7 @@ def main(argv=None):
     run.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
 
     evaluate = sub.add_parser("evaluate", help="Score all eligible samples and validated references")
-    evaluate.add_argument("--data", type=Path, default=Path("strength_training/tas_data_both_wrists"))
+    evaluate.add_argument("--data", type=Path, default=WRIST_DATASET)
     evaluate.add_argument("--split", choices=["test", "validation"], default="test")
     prediction = sub.add_parser("predict", help="Sensor-only wrist CSV prediction; embedded labels ignored")
     prediction.add_argument("--input", type=Path, required=True)
@@ -68,7 +70,7 @@ def main(argv=None):
     demo.add_argument("--output", type=Path, default=Path("baseline/RecoFit/runs/demo"))
     args = parser.parse_args(argv)
     if args.command == "prepare":
-        from strength_training.temporal_segmentation.data import prepare as prepare_data
+        from baseline.mstcn.data import prepare as prepare_data
         prepare_data(args.source, args.output, args.alignment, args.location, args.references,
                      args.seed, args.reference_mode)
     elif args.command == "prepare-waist":
@@ -95,7 +97,7 @@ def main(argv=None):
                     if args.output.exists():
                         raise FileExistsError(f"Refusing to overwrite {args.output}")
                     if not args.data.exists():
-                        from strength_training.temporal_segmentation.data import prepare as prepare_data
+                        from baseline.mstcn.data import prepare as prepare_data
                         dest = args.output/("wrist_data" if args.sensors == "wrist-waist" else "data")
                         source = args.source or Path("strength_training/strength_training_data_clean")
                         prepare_data(source, dest, args.alignment, args.location, seed=args.seed)

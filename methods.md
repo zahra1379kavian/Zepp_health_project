@@ -24,5 +24,5 @@ Step	Goal	Method
 Leave-one-exercise-out test. Train with one exercise removed, then score station-ignored rep F1 on it in held-out subjects.
 Mask the held-out exercise's frames during training; do not label them rest, or the model learns to ignore it.
 Start with three or four exercises on one fold, not all 15.
-No flag for this exists yet in temporal_segmentation/.
+No flag for this exists yet in `baseline/MS-TCN/mstcn/`.
 Decide whether a waist sensor is allowed at deployment. In leg raises and crunches the wrist barely moves, so a wrist-only model is unlikely to fix them. If the product is wrist-only, report these two as a sensor limit.

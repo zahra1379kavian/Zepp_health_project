@@ -22,7 +22,7 @@ source baseline/RecoFit/.venv/bin/activate
 python -m pip install -r baseline/requirements.txt
 
 python -m baseline.RecoFit run \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --output baseline/RecoFit/runs/recofit_cv \
   --folds 5
 ```
@@ -51,7 +51,7 @@ Run the extension on the same subjects and wrist references:
 
 ```bash
 python -m baseline.RecoFit run \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --output baseline/RecoFit/runs/recofit_waist_cv \
   --sensors wrist-waist --waist-stations leg_raise --folds 5
 ```
@@ -92,7 +92,7 @@ For separate preparation and fitting:
 
 ```bash
 python -m baseline.RecoFit prepare-waist \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --output baseline/RecoFit/runs/paired_data
 python -m baseline.RecoFit train \
   --data baseline/RecoFit/runs/paired_data --sensors wrist-waist \
@@ -125,7 +125,7 @@ python -m baseline.RecoFit prepare \
 python -m baseline.RecoFit run --data baseline/RecoFit/data --output baseline/RecoFit/runs/recofit_cv
 ```
 
-Preparation reuses `strength_training.temporal_segmentation.data.prepare`:
+Preparation reuses `baseline.mstcn.data.prepare`:
 
 - Join by `sync_timestamp`; retain missing-sample and exclusion masks.
 - Read targets from each wrist's corresponding `label.csv` column; ignore
@@ -272,7 +272,7 @@ For an offline counter comparison using the same trained classifiers:
 
 ```bash
 python -m baseline.RecoFit evaluate \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --model baseline/RecoFit/runs/recofit_cv/cross_validation/fold_1/model/model.joblib \
   --mode offline \
   --output baseline/RecoFit/runs/recofit_fold1_offline
@@ -297,11 +297,11 @@ For a diagnostic single subject split:
 
 ```bash
 python -m baseline.RecoFit train \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --output baseline/RecoFit/runs/recofit_single/model
 
 python -m baseline.RecoFit evaluate \
-  --data strength_training/tas_data_both_wrists \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
   --model baseline/RecoFit/runs/recofit_single/model/model.joblib \
   --output baseline/RecoFit/runs/recofit_single/test
 
@@ -333,12 +333,13 @@ category-relative rest class; this is not an unknown-exercise detector.
 ## Reports and verification
 
 The scoring routines are shared with the temporal baseline: station/rest macro
-F1 and confusion matrices, false exercise events per rest hour, one-to-one
+F1 and confusion matrices, false alarms during annotated rest, one-to-one
 repetition detection, start/end errors, count MAE and exact-count accuracy,
 per-exercise/subject/side metrics, and delay fractions at 200/400 ms endpoint
 tolerances. `segmentation` ignores station agreement; `repetitions` requires it.
 Missing and extra detections accompany timing errors. Reference-uncovered
 predictions are not silently treated as incorrect reference repetitions.
+The overview reports the percentage of annotated rest frames predicted as exercise.
 
 Run the regression and integration checks:
 
@@ -373,4 +374,20 @@ The v2 period/boundary corrections were also checked with a new capped fit on
 the 57 training streams and 180-second excerpts from two held-out streams in
 both modes. This checks integration, not timing accuracy; some polarity axes
 absent from calibration correctly produced no interval estimates.
-The full five-fold real-data experiment has not been run as part of implementation.
+
+## Five-fold results
+
+The saved wrist-only and wrist + waist runs completed all five held-out folds
+on the same 43 subjects and 77 wrist streams. The comparison bundle includes
+the overview, recognition confusion matrices, exercise-level repetition scores,
+and counting and reporting-time diagnostics. See the local
+[figure index](figures/folds_1-5/README.md) and [PDF report](figures/folds_1-5/recofit_report.pdf).
+
+From the repository root, regenerate the figures from the saved predictions.
+
+```bash
+.venv/bin/python -m baseline.RecoFit.plot_results \
+  --compare-run baseline/RecoFit/runs/recofit_waist_cv/cross_validation \
+  --compare-data baseline/RecoFit/runs/recofit_waist_cv/data \
+  --folds 1 2 3 4 5 --output baseline/RecoFit/figures/folds_1-5
+```

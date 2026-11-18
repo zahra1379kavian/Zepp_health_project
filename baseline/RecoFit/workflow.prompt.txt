@@ -1,6 +1,6 @@
 Use case: infographic-diagram
 Asset type: scientific workflow image documenting the current RecoFit-style wrist baseline.
-Primary request: Create a NEW pipeline figure matching the visual style of strength_training/temporal_segmentation/figures/workflow.png. Show all implementation stages in baseline/RecoFit, including preparation, fitting, sensor-only inference, peak counting, calibrated boundary estimation, and evaluation.
+Primary request: Create a NEW pipeline figure matching the visual style of baseline/MS-TCN/mstcn/figures/workflow.png. Show all implementation stages in baseline/RecoFit, including preparation, fitting, sensor-only inference, peak counting, calibrated boundary estimation, and evaluation.
 Input image: style reference only. Replace all original workflow content; do not retain the temporal-model steps.
 
 Style: crisp, readable Times New Roman-style serif typography; teal rounded cards with dark teal title bands, white title text, green check badges, pale backgrounds, teal connectors, simple scientific mini-diagrams. Closely follow the reference's palette and visual hierarchy. Keep all text sharp and legible, with correct spelling. A check means an implemented stage, never validated real-world performance. Apply a small soft shadow only behind the final Evaluate + export card.

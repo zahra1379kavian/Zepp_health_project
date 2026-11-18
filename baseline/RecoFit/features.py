@@ -26,7 +26,7 @@ def pc1(x, *, return_axis=False):
 
 def filtered_inputs(x, valid, cutoff=8.):
     """Causal low-pass, initialized from the first sample of each valid run."""
-    from strength_training.temporal_segmentation.data import runs
+    from baseline.mstcn.data import runs
     result = np.zeros((len(x), 6), np.float64)
     sos = butter(4, cutoff, fs=FS, output="sos")
     zi = sosfilt_zi(sos)[:, :, None]
@@ -107,7 +107,7 @@ def extract(windows):
 
 
 def window_ends(valid, window, step):
-    from strength_training.temporal_segmentation.data import runs
+    from baseline.mstcn.data import runs
     pieces = [np.arange(a+window-1, b, step, dtype=np.int64)
               for a, b in runs(valid) if b-a >= window]
     return np.concatenate(pieces) if pieces else np.empty(0, np.int64)

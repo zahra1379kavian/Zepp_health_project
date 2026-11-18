@@ -14,10 +14,10 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 
-from strength_training.temporal_segmentation.constants import CLASSES, DT_MS, FEATURES
-from strength_training.temporal_segmentation.data import (load_arrays, load_sensor, runs,
-                                                         subject_folds, write_json)
-from strength_training.temporal_segmentation.metrics import (
+from baseline.mstcn import WRIST_DATASET
+from baseline.mstcn.constants import CLASSES, DT_MS, FEATURES
+from baseline.mstcn.data import load_arrays, load_sensor, runs, subject_folds, write_json
+from baseline.mstcn.metrics import (
     confusion_matrix, count_rows, false_exercise_events, grouped_stream_report, score_stream,
     reporting_tolerances,
 )
@@ -446,7 +446,12 @@ def evaluate(root, model_path, output, *, split_name="test", mode="causal", tole
     manifest = manifest_at(root)
     model = load_model(model_path) if model is None else model
     check_split(manifest, model["split"])
-    if Path(model["training_source"]).resolve() != root.resolve():
+    training_source = Path(model["training_source"]).resolve()
+    repo = Path(__file__).resolve().parents[2]
+    legacy_wrist_dataset = repo / "strength_training/tas_data_both_wrists"
+    if training_source == legacy_wrist_dataset and not legacy_wrist_dataset.exists():
+        training_source = (repo / WRIST_DATASET).resolve()
+    if training_source != root.resolve():
         raise ValueError("Evaluation must use the same prepared dataset as the fitted split")
     if split_name not in ("test", "validation"):
         raise ValueError("Evaluate validation or test only")
