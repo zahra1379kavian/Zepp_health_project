@@ -209,6 +209,43 @@ The entry point is `__main__.py`; run it as the module above so its imports work
 You do not need to run `prepare_data.py`, the demographics analysis, or the
 synthetic demo before this experiment.
 
+## Repetition diagnostics
+
+Read `by_tolerance["400"]["segmentation"]` for station-independent results.
+Extras and misses use the same one-to-one endpoint matching as F1. An extra's
+midpoint places it inside a real rep, in a gap within a reference set, or in
+labeled rest. Other labeled activity, such as a hold or setup outside a set, has
+its own count. An unmatched reference is an overlap miss if any emitted
+prediction overlaps it by a positive amount, even if that
+prediction was matched to another rep or excluded from extra-rep scoring.
+
+Reference sets group consecutive certified reps of the same exercise with gaps
+of at most 10 seconds and no intervening rest, station change or coverage break.
+A singleton counts as first and last. In a two-rep set the second rep also counts
+as last. Middle covers the third through the penultimate rep. Duration bands
+have cutoffs at 1, 2 and 3 seconds. The report includes the denominator of each
+recall and missed-set rate. Delay is measured from the reference end to the
+announcement for matched reps, in milliseconds. The p95 is the earliest observed
+delay by which at least 95% were reported. Negative delays indicate early reports.
+
+Regenerate diagnostics for a completed cross-validation run using its saved test
+predictions and fold-local reference data.
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+python -m baseline.mstcn rescore \
+  --predictions "$runs/wrist_cross_validation/cross_validation" \
+  --output "$runs/wrist_cross_validation/report_with_rep_diagnostics.json"
+```
+
+For a single evaluation, pass its `test/` directory as `--predictions` and the
+original prepared dataset as `--data` if the fold has no `data/` directory.
+Complete-rep runs that started before this update saved the previous-end scores
+but omitted that rule's decoded predictions. To get its full breakdown, run
+`evaluate` with each fold's `data/`, `model/best.pt` and `decoder.json`,
+writing to a fresh output directory. The learned start rule's evaluation also
+reports the previous-end comparison.
+
 ## Outputs
 
 | File under `baseline/MS-TCN/experiment_runs/wrist_cross_validation/cross_validation/` | Contents |

@@ -21,7 +21,8 @@ from .data import (WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json,
 from .decode import DecoderConfig, RepDecoder, decode_sequence, group_sets
 from .metrics import (aggregate_repetitions, classification_metrics, confusion_matrix,
                       count_rows, covered_repetitions, false_exercise_events, repetition_metrics,
-                      reporting_tolerances, score_stream, aggregate_streams, grouped_stream_report)
+                      report_delay_percentiles, reporting_tolerances, score_stream, aggregate_streams,
+                      grouped_stream_report)
 from .model import DenseMSTCN, ModelConfig, configuration, dense_loss
 from .augmentation import augment
 
@@ -456,6 +457,10 @@ def rescore_evaluation(predictions, data):
                 record["previous_end_scores"] = score_stream(
                     decoded["previous_end_repetitions"], references, t, coverage, record,
                     tolerances, False, station_targets=y)
+            else:
+                for score in record.get("previous_end_scores", {}).values():
+                    metrics = score["segmentation"]["metrics"]
+                    metrics.update(report_delay_percentiles(metrics["report_delays_ms"]))
         records.append(record)
         sessions.append({**session, **aggregate_streams([record], tolerances, tolerance, station_metrics)})
     updated = grouped_stream_report(records, tolerances, tolerance, station_metrics)
@@ -474,7 +479,7 @@ def rescore(args):
             path = predictions / f"fold_{fold['fold']}"
             report, held_out = rescore_evaluation(path / "test", args.data or path / "data")
             records.extend(held_out)
-            folds.append({**fold, **{key: report[key] for key in fold if key in report}})
+            folds.append({**fold, **{key: report[key] for key in fold if key in report and key != "split"}})
         updated = grouped_stream_report(records, original["report_tolerances_ms"],
                                         original["timing_tolerance_ms"], "classification" in original)
         for old, new in [(original, updated), *((original["per_side"][side], row)
@@ -493,7 +498,7 @@ def rescore(args):
             "Replay the complete-rep checkpoint with the saved validation decoder to recover previous-end predictions.")
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x") as handle:
-        json.dump(report, handle, indent=2)
+        json.dump(report, handle, indent=2, allow_nan=False)
         handle.write("\n")
     return report
 

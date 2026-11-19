@@ -600,6 +600,42 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(scores["200"]["segmentation"]["counts"], scores["400"]["segmentation"]["counts"])
         self.assertEqual(json.dumps(predictions), original)
 
+    def test_rep_diagnostics_use_reference_sets_and_sample_time(self):
+        refs = [self.rep(400, 1200), self.rep(1600, 2800), self.rep(3200, 5200),
+                self.rep(5600, 8800), self.rep(11200, 12400), self.rep(14800, 16400, "deadlift")]
+        preds = [refs[0] | {"reported_at_ms": 1280}, self.rep(440, 1240),
+                 self.rep(1240, 1560), self.rep(1640, 2200),
+                 refs[3] | {"reported_at_ms": 9440}, self.rep(8400, 9400), refs[5],
+                 self.rep(16800, 17200)]
+        t = np.arange(0, 24000, 40)
+        labels = np.zeros(len(t), dtype=int)
+        labels[(t >= 400) & (t < 8800) | (t >= 11200) & (t < 12400)] = CLASSES.index("squat")
+        labels[(t >= 14800) & (t < 16400)] = CLASSES.index("deadlift")
+        labels[(t >= 16800) & (t < 17200)] = CLASSES.index("deadlift")
+        metadata = {"session": "s", "source_session": "s", "subject": "p", "side": "left_wrist"}
+        scores = score_stream(preds, refs, t, np.ones(len(t), bool), metadata, [200],
+                              station_targets=labels)
+        result = scores["200"]["segmentation"]["metrics"]
+        self.assertEqual(result["extra_breakdown"],
+                         {"inside_real_rep": 2, "during_rest": 1, "between_reps": 1,
+                          "other_labeled_activity": 1})
+        self.assertEqual(result["missed_breakdown"],
+                         {"overlapped_prediction": 1, "no_overlapping_prediction": 2})
+        self.assertEqual(result["recall"], 0.5)
+        self.assertEqual(result["detection_by_position"], {
+            "first": {"matched": 2, "total": 3, "recall": 2/3},
+            "second": {"matched": 0, "total": 1, "recall": 0},
+            "middle": {"matched": 0, "total": 1, "recall": 0},
+            "last": {"matched": 2, "total": 3, "recall": 2/3},
+        })
+        self.assertEqual(result["detection_by_duration"]["1_to_under_2s"],
+                         {"matched": 1, "total": 3, "recall": 1/3})
+        self.assertEqual(result["detection_by_duration"]["2_to_under_3s"]["total"], 1)
+        self.assertEqual(result["entire_sets_missed_by_exercise"]["squat"],
+                         {"missed": 1, "total": 2, "rate": 0.5})
+        self.assertEqual([result[f"report_delay_{stat}_ms"] for stat in ("median", "p95", "max")],
+                         [80, 640, 640])
+
     def test_reporting_tolerances_keep_primary_and_reject_invalid_values(self):
         self.assertEqual(reporting_tolerances([400, 200, 400], 300), [200, 300, 400])
         for values in ([], [0], [-200]):
@@ -637,6 +673,9 @@ class ReportingTests(unittest.TestCase):
                        "--window", "128", "--stages", "1", "--layers", "1", "--channels", "4", "--threads", "1"]
             main(command)
             expected = json.loads((root / "cv/report.json").read_text())
+            with patch.object(runner, "probabilities", side_effect=AssertionError("Unexpected inference")):
+                main(["rescore", "--predictions", str(root / "cv"), "--output", str(root / "rescored.json")])
+            self.assertEqual(json.loads((root / "rescored.json").read_text()), expected)
             fold_one = root / "cv/fold_1"
             saved = {p.relative_to(fold_one): p.read_bytes() for p in fold_one.rglob("*")
                      if p.is_file() and not p.is_symlink() and "data" not in p.relative_to(fold_one).parts}

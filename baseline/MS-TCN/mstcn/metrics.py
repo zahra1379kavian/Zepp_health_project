@@ -1,5 +1,6 @@
 """Classification and one-to-one repetition scoring on certified coverage only."""
 
+from bisect import bisect_right
 from collections import Counter
 
 import numpy as np
@@ -12,7 +13,7 @@ from .data import runs
 POSITIONS = ("first", "second", "middle", "last")
 DURATION_BINS_MS = (1000, 2000, 3000)
 DURATION_BUCKETS = ("under_1s", "1_to_under_2s", "2_to_under_3s", "3s_and_over")
-EXTRA_TYPES = ("inside_real_rep", "during_rest", "between_reps")
+EXTRA_TYPES = ("inside_real_rep", "during_rest", "between_reps", "other_labeled_activity")
 MISS_TYPES = ("overlapped_prediction", "no_overlapping_prediction")
 
 
@@ -76,11 +77,13 @@ class ReferenceTimeline:
     """Set and rest context from certified reference data on a single wrist."""
 
     def __init__(self, references, t, coverage, station_targets=None):
-        self.references = references
+        ordered = sorted(references, key=lambda row: row["start_ms"])
+        self.starts = [rep["start_ms"] for rep in ordered]
+        self.ends = [rep["end_ms"] for rep in ordered]
         self.t = t
         self.station_targets = station_targets
         self.sets = []
-        for rep in sorted(references, key=lambda row: row["start_ms"]):
+        for rep in ordered:
             if self.sets:
                 prior = self.sets[-1][-1]
                 lo, hi = np.searchsorted(t, [prior["end_ms"], rep["start_ms"]])
@@ -95,11 +98,16 @@ class ReferenceTimeline:
 
     def extra_type(self, rep):
         midpoint = (rep["start_ms"] + rep["end_ms"]) // 2
+        index = bisect_right(self.starts, midpoint) - 1
+        if index >= 0 and midpoint < self.ends[index]:
+            return "inside_real_rep"
+        if any(group[0]["start_ms"] <= midpoint < group[-1]["end_ms"] for group in self.sets):
+            return "between_reps"
         if self.station_targets is not None:
             frame = self.t.searchsorted(midpoint, side="right") - 1
-            return "during_rest" if self.station_targets[frame] == 0 else "between_reps"
-        active = any(group[0]["start_ms"] <= midpoint < group[-1]["end_ms"] for group in self.sets)
-        return "between_reps" if active else "during_rest"
+            if self.station_targets[frame] != 0:
+                return "other_labeled_activity"
+        return "during_rest"
 
 
 def has_overlap(rows, intervals):
@@ -121,8 +129,7 @@ def repetition_diagnostics(predictions, references, pairs, timeline, observed_pr
     matched_references = {r for _, r in pairs}
     extras = [row for i, row in enumerate(predictions) if i not in matched_predictions]
     misses = [row for i, row in enumerate(references) if i not in matched_references]
-    extra_counts = Counter("inside_real_rep" if overlap else timeline.extra_type(rep)
-                           for rep, overlap in zip(extras, has_overlap(extras, timeline.references)))
+    extra_counts = Counter(timeline.extra_type(rep) for rep in extras)
     overlap_count = int(has_overlap(misses, observed_predictions).sum())
 
     detected = {rep["start_ms"]: i in matched_references for i, rep in enumerate(references)}
