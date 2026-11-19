@@ -1,5 +1,106 @@
 # Activity-agnostic rep detection from wrist motion
-## 2. Train MS-TCN to find complete reps
+
+Step 1 — Finish the complete-rep model and break down its errors
+Let complete_rep_cv finish all 5 folds; it's on fold 1 now. At the same time, run the boundary baseline using the command in the README (--repetition-head boundary --output .../boundary_rep_cv). Both use the same seed and folds, so you can compare them fold by fold.
+Add the error breakdown to metrics.py so every report includes it:
+extra reps, split into inside a real rep / in rest / between reps;
+missed reps, split into overlapped by a prediction / not detected;
+recall by position in the set (1st, 2nd, middle, last);
+recall by rep duration;
+share of sets missed entirely, per exercise;
+reporting delay at the median, 95th percentile and maximum, instead of only the mean.
+Compare four versions fold by fold: the phase model (your existing run), the boundary model, the complete-rep model, and the complete-rep model with the start-equals-previous-end rule.
+Adopt the complete-rep model as the default if it wins F1@400 in at least 4 of 5 folds and cuts extras inside real reps (now 7,964) by at least 30%.
+If split reps are still the biggest error group, add this decoder rule. It needs no retraining; tune it on validation:
+Within a set, reject a rep shorter than f × the median duration of the last 3 reported reps, trying f = 0.5, 0.6 and 0.7. Reset the rule after 10 s with no reps.
+It adapts to each person's own pace, so it doesn't depend on the exercise. It is a streaming version of the duration and confidence post-processing in OnlineTAS (NeurIPS 2024). That paper shows models that see only past input break one action into fragments more often than offline models.
+If start/end error stays above about 100 ms, which drags down the ±200 ms score, refine the end time as a weighted average over ±4 frames around each peak. This is the boundary-as-distribution idea from TriDet (CVPR 2023); your start selector already works this way.
+Fallback: Bock et al. (IMWUT 2024) found that action-localization models of the ActionFormer type, trained on raw IMU signals, beat standard activity-recognition models on 4 of 6 datasets. They are offline models and would need to be made causal.
+
+## Step 2 — Make the rep detector work for any exercise
+2.0 Set up the evaluation first (no new model yet)
+
+Let the leave-one-exercise-out analysis accept --repetition-head complete. It currently has phase_only=True hard-coded in analyses/leave_one_exercise_out/__init__.py.
+Test with exercises that score well when seen, one or more per movement group. Choose checkpoints using a second held-out exercise (E′) from a different group. This is the "leave-one-domain-out" selection rule from Gulrajani & Lopez-Paz (ICLR 2021).
+Test exercise	Selection exercise E′ (also removed from training)
+biceps_curls	bench_press
+lat_pulldown	lunges
+push-up	rowing
+overhead_press	deadlift
+squat	pull-up
+hip_thrust	dips
+Main metric: average F1@400 over the unseen exercises.
+Guard rails: F1 on seen exercises, crunch F1 (seen), false reps per rest hour, and first-rep recall.
+Screen variants cheaply: use subject fold 1 and biceps / push-up / squat, which already have baselines (0.01 / 0.49 / 0.40). Confirm the winner on all 6 exercises and at least 2 subject folds.
+Free diagnostic first: re-score the existing biceps-curl leave-one-out model across a range of decoder thresholds. This is a diagnostic only; never report it as a result.
+If F1 jumps, the collapse is mostly a threshold problem, and selecting on E′ fixes it.
+If F1 stays near zero, the model's learned features are the problem.
+2.1 Make the rep inputs independent of wrist orientation
+
+Estimate the gravity direction causally: low-pass the accelerometer at about 0.3 Hz and normalize it.
+Feed the rep model 6 channels:
+overall accelerometer magnitude;
+movement acceleration along gravity, and its magnitude across gravity;
+overall gyroscope magnitude;
+gyroscope rotation about gravity, and its magnitude across gravity.
+Optionally add a 7th: the projection onto the main movement axis of the last 5 s. This is the classic exercise-independent counting signal from RecoFit (CHI 2014).
+Drop the magnetometer from the rep inputs. It encodes compass heading and the magnetic field near steel machines, which identifies the station. Keep it in the 15-class station classifier: in fold 1, dropping it raised false exercise events from 159 to 262 per rest hour.
+Compare against raw accelerometer + gyroscope with fully random 3-D rotation of each training window (Um et al., ICMI 2017; see also TRI-HAR, ISWC 2026). Your current augmentation rotates by only ±10°, which leaves the orientation cue intact. So your earlier augmentation ablation didn't actually test this.
+2.2 Add a causal check for repeated motion (RepNet, CVPR 2020; TransRAC, CVPR 2022)
+
+After stage 1, compute a 32-dimensional normalized embedding z_t for each frame.
+At each frame, compute s_t(k) = z_t · z_{t−k} for k = 1…150 (the last 6 s). This is one row of RepNet's self-similarity matrix, computed using only the past.
+Use it in two places:
+(a) Pass it through a 1×1 conv (150→64) into stages 2–3.
+(b) Add α·s_t(k) to the start selector's score for "start = t−k", with α learned and starting at 1. A rep ends when the wrist returns to its starting pose, which holds for nearly every strength exercise and also works for the first rep.
+In RepNet's ablation, this similarity layer was what let training on synthetic videos carry over to real ones: error on the QUVA benchmark fell from 1.29 to 0.10.
+Later option: use the first detected rep of a set as a template and add the current window's similarity to it as an input (ESCounts, ACCV 2024; CaRaCount, IEEE TPAMI 2025, which is wearable-specific).
+2.3 Train on synthetic repetitions (RepNet; CaRaCount)
+In CaRaCount's AAAI 2024 version, pretraining on synthetic data was the largest single gain (counting error 10.05 → 7.66).
+
+Take a 0.6–2 s piece of real training signal that starts in a still pose (a local minimum of gyroscope magnitude). Never take it from E or E′.
+Append its time reversal to make one cycle that returns to the start pose:
+accelerometer: reversed in time;
+gyroscope: reversed in time and sign-flipped, which is what playing the motion backward produces.
+Repeat the cycle 3–15 times, varying each cycle's speed by ×0.85–1.15 and amplitude by ×0.9–1.1. Add occasional 0–1 s pauses.
+Apply one random 3-D rotation to the whole sequence, and pad each side with 5–30 s of real rest.
+Label a start and end at every cycle boundary. Make 25% of each batch synthetic.
+Risk: walking is also periodic. Keep real rest as negatives, with your reviewed hard-negative weights. Don't take source pieces whose accelerometer repeats at 0.4–0.7 s (step rhythm), and watch false reps per rest hour.
+2.4 Only if a large gap remains: add a head that tries to predict the exercise from stage-1 features, trained with reversed gradients (DANN, JMLR 2016), ramping its weight from 0 to 0.1.
+
+Add these one at a time (2.1 → 2.2 → 2.3). Keep a change only if:
+
+unseen F1 rises by at least 0.05,
+seen F1 drops by no more than 0.02, and
+false reps per rest hour rise by no more than 20%.
+## Step 3 — Check the teacher's best case, then lookahead, then distillation
+3.1 Teacher ceiling
+
+Add an --acausal flag: in Residual, pad (d, d) instead of (2d, 0). Use the step-2 inputs.
+Train one teacher per fold, on that fold's training subjects only.
+Run it on whole sessions offline and measure first-rep recall, last-rep recall, F1, and unseen-exercise F1.
+Continue to 3.3 only if the teacher's first-rep recall beats the student's by at least 0.15, or its unseen F1 by at least 0.05. If not, the future signal doesn't contain the missing information, and distillation can't add it.
+3.2 Lookahead sweep (existing --lookahead-ms)
+
+Run 0 / 160 / 320 / 480 / 640 ms on fold 1. Score first- and last-rep recall and the 95th-percentile delay from true end to report, which must stay under 1000 ms.
+Pick the smallest lookahead that captures at least 80% of the teacher's first/last-rep gain, then confirm it on 5 folds.
+3.3 Distillation
+
+Loss:
+the usual label loss;
+λ₁ × a term matching the student's end probability to the teacher's (temperature 2), applied on all valid frames, including masked-reference frames where only the teacher gives a signal;
+λ₂ × the KL divergence between the teacher's and student's 151-way start choice at labeled ends and at teacher-detected ends.
+Try λ ∈ {0.3, 1, 3} and pick on validation.
+From OnPoint (ECCV 2026): also turn the teacher's confident reps (>0.9) inside currently masked intervals into extra training reps.
+If the student can't keep up with a teacher that sees the whole session, first use a teacher limited to 2 s of future. This follows the curriculum of increasingly future-aware teachers in Privileged Knowledge Distillation (Zhao et al., arXiv 2020).
+Later option: Dual-mode ASR (ICLR 2021) trains one network, with shared weights, in both streaming and full-context modes, with distillation inside the same model. It improved both accuracy and latency of the streaming mode.
+## Step 4 — Report leg raise separately as sensor-limited
+Put the motion table above in the paper. State the rule as data-based, not F1-based: both wrist motion ratios below about 0.3× rest. Only leg raise qualifies.
+Headline results: the other 12 dynamic exercises. Then a separate leg-raise row, then all 13 pooled for transparency. Report plank as hold duration. Crunch stays in the headline.
+When sensor_ablation_five_folds finishes, check leg-raise F1 with the waist sensor across all 5 folds. Offer wrist+waist as a secondary setup only if the gain holds in at least 4 folds. In fold 1, waist also dropped pull-up from 0.66 to 0.43.
+Optional: CaRaCount evaluated on the public RecoFit and MM-Fit datasets. These could serve as external unseen-exercise tests if their labels fit your scoring; count-only labels would give count error but not boundary F1.
+###########################
+<!-- ## 2. Train MS-TCN to find complete reps
 
 Feed the continuous wrist signal into the causal MS-TCN. Every 40 ms, train two outputs from its motion features: the probability that a rep just ended and the probability that the person is at a station. Use only the labeled start and end of each rep. Never use phase labels in training or testing, so the same model works for reps with one movement or with movements in either order.
 
@@ -10,9 +111,9 @@ Feed the continuous wrist signal into the causal MS-TCN. Every 40 ms, train two 
 
 During replay, report a rep once, when its end peak is confirmed and a valid start is chosen. This rule can count the first rep without an exercise name or a previous example.
 
-**Baselines.** Compare with the existing boundary head (`--repetition-head boundary`), which also uses only start and end labels, and with the rule "start = previous end". That rule holds for 77% of consecutive reps in a set.
+**Baselines.** Compare with the existing boundary head (`--repetition-head boundary`), which also uses only start and end labels, and with the rule "start = previous end". That rule holds for 77% of consecutive reps in a set. -->
 
-## 3. Test whether XRFMamba makes better use of history
+<!-- ## 3. Test whether XRFMamba makes better use of history
 
 Replace the MS-TCN encoder with forward-only XRFMamba blocks. Keep the same labels, outputs, and counting rule. Retain one feature vector every 40 ms for locating boundaries. Give the station output both the current vector and a summary of earlier motion from the encoder. This lets it use context such as walking between stations, stopping to set up, and beginning a set.
 
@@ -29,4 +130,4 @@ Train a bidirectional XRFMamba **teacher** on the labeled training sessions. It 
 
 - [MS-TCN: Multi-Stage Temporal Convolutional Network for Action Segmentation](https://arxiv.org/abs/1903.01945). CVPR, 2019.
 - [XRF V2: A Dataset for Action Summarization with Wi-Fi Signals, and IMUs in Phones, Watches, Earbuds, and Glasses](https://doi.org/10.1145/3749521). ACM IMWUT, 2025. Introduces XRFMamba.
-- [OnPoint: Offline-to-Online Multi-Level Distillation for Point-Supervised Online Temporal Action Localization](https://arxiv.org/abs/2607.00289). ECCV, 2026.
+- [OnPoint: Offline-to-Online Multi-Level Distillation for Point-Supervised Online Temporal Action Localization](https://arxiv.org/abs/2607.00289). ECCV, 2026. -->

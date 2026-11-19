@@ -2,6 +2,7 @@
 
 DT_MS = 40
 START_HISTORY = 6000 // DT_MS
+SET_GAP_MS = 10000
 STATION_STATES = ["rest", "at_station"]
 FEATURES = [f"{sensor}_{axis}" for sensor in ("acc", "gyro", "mag") for axis in "xyz"]
 CLASSES = ["NULL", "bench_press", "biceps_curls", "crunch", "deadlift", "dips",

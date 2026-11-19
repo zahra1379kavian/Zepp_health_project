@@ -10,7 +10,7 @@ import numpy as np
 from ..constants import CLASSES, DT_MS, FEATURES
 from ..data import (dense_phase_targets, load_arrays, load_sensor, phase_label_targets,
                     runs, subject_folds, training_statistics, write_json)
-from ..metrics import aggregate_repetitions, count_rows, match_repetitions, repetition_metrics
+from ..metrics import ReferenceTimeline, aggregate_repetitions, count_rows, match_repetitions, repetition_metrics
 from ..runner import digest, evaluate, train, tune
 
 
@@ -164,18 +164,20 @@ def score_exercise(data, predictions, exercise, tolerances, primary):
     for name in manifest["split"]["test"]:
         a = load_arrays(Path(data) / name)
         coverage = a["coverage"] & a["valid"] & (a["y"] == CLASSES.index(exercise))
-        refs = [r for r in json.loads((Path(data) / name / "references.json").read_text())
-                if r["station"] == exercise]
+        all_refs = json.loads((Path(data) / name / "references.json").read_text())
+        refs = [r for r in all_refs if r["station"] == exercise]
         if not coverage.any() and not refs:
             continue
         reps = json.loads((Path(predictions) / f"{name}.json").read_text())["repetitions"]
+        timeline = ReferenceTimeline(all_refs, a["t"], a["coverage"], a["y"])
         row = {k: metadata[name][k] for k in ("session", "subject", "side", "source_session")}
         row["scores"] = {}
         for tolerance in tolerances:
             scored = exercise_predictions(reps, refs, a["t"], coverage, tolerance)
             counts = count_rows(scored, refs, name, require_station=False)
             row["scores"][str(tolerance)] = {
-                "metrics": repetition_metrics(scored, refs, tolerance, require_station=False), "counts": counts}
+                "metrics": repetition_metrics(scored, refs, tolerance, require_station=False,
+                                               timeline=timeline, observed_predictions=reps), "counts": counts}
         records.append(row)
 
     def pool(rows):

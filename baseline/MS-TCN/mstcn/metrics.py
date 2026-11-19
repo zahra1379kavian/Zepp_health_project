@@ -5,8 +5,15 @@ from collections import Counter
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .constants import CLASSES, DT_MS
+from .constants import CLASSES, DT_MS, SET_GAP_MS
 from .data import runs
+
+
+POSITIONS = ("first", "second", "middle", "last")
+DURATION_BINS_MS = (1000, 2000, 3000)
+DURATION_BUCKETS = ("under_1s", "1_to_under_2s", "2_to_under_3s", "3s_and_over")
+EXTRA_TYPES = ("inside_real_rep", "during_rest", "between_reps")
+MISS_TYPES = ("overlapped_prediction", "no_overlapping_prediction")
 
 
 def classification_metrics(confusion):
@@ -65,7 +72,98 @@ def match_repetitions(predictions, references, tolerance_ms=400, require_station
     return matches
 
 
-def repetition_metrics(predictions, references, tolerance_ms=400, require_station=True):
+class ReferenceTimeline:
+    """Set and rest context from certified reference data on a single wrist."""
+
+    def __init__(self, references, t, coverage, station_targets=None):
+        self.references = references
+        self.t = t
+        self.station_targets = station_targets
+        self.sets = []
+        for rep in sorted(references, key=lambda row: row["start_ms"]):
+            if self.sets:
+                prior = self.sets[-1][-1]
+                lo, hi = np.searchsorted(t, [prior["end_ms"], rep["start_ms"]])
+                same_bout = coverage[lo:hi].all()
+                if station_targets is not None:
+                    same_bout &= np.all(station_targets[lo:hi] == station_targets[lo - 1])
+                if (rep["station"] == prior["station"] and same_bout
+                        and rep["start_ms"] - prior["end_ms"] <= SET_GAP_MS):
+                    self.sets[-1].append(rep)
+                    continue
+            self.sets.append([rep])
+
+    def extra_type(self, rep):
+        midpoint = (rep["start_ms"] + rep["end_ms"]) // 2
+        if self.station_targets is not None:
+            frame = self.t.searchsorted(midpoint, side="right") - 1
+            return "during_rest" if self.station_targets[frame] == 0 else "between_reps"
+        active = any(group[0]["start_ms"] <= midpoint < group[-1]["end_ms"] for group in self.sets)
+        return "between_reps" if active else "during_rest"
+
+
+def has_overlap(rows, intervals):
+    """Return whether each half-open interval overlaps any interval in the other list."""
+    if not rows or not intervals:
+        return np.zeros(len(rows), dtype=bool)
+    starts, ends = np.array(sorted((r["start_ms"], r["end_ms"]) for r in intervals)).T
+    first, last = np.array([(r["start_ms"], r["end_ms"]) for r in rows]).T
+    preceding = np.searchsorted(starts, last, side="left") - 1
+    return (preceding >= 0) & (np.maximum.accumulate(ends)[preceding] > first)
+
+
+def tally(matched, total, count="matched", rate="recall"):
+    return {count: matched, "total": total, rate: matched / total if total else None}
+
+
+def repetition_diagnostics(predictions, references, pairs, timeline, observed_predictions):
+    matched_predictions = {p for p, _ in pairs}
+    matched_references = {r for _, r in pairs}
+    extras = [row for i, row in enumerate(predictions) if i not in matched_predictions]
+    misses = [row for i, row in enumerate(references) if i not in matched_references]
+    extra_counts = Counter("inside_real_rep" if overlap else timeline.extra_type(rep)
+                           for rep, overlap in zip(extras, has_overlap(extras, timeline.references)))
+    overlap_count = int(has_overlap(misses, observed_predictions).sum())
+
+    detected = {rep["start_ms"]: i in matched_references for i, rep in enumerate(references)}
+    positions = {key: [] for key in POSITIONS}
+    durations = {key: [] for key in DURATION_BUCKETS}
+    sets = {}
+    for group in timeline.sets:
+        # All members of a reference set share the exercise used for filtering.
+        if group[0]["start_ms"] not in detected:
+            continue
+        hits = [detected[rep["start_ms"]] for rep in group]
+        positions["first"].append(hits[0])
+        positions["second"].extend(hits[1:2])
+        positions["middle"].extend(hits[2:-1])
+        positions["last"].append(hits[-1])
+        sets.setdefault(group[0]["station"], []).append(not any(hits))
+        for rep, hit in zip(group, hits):
+            duration = rep["end_ms"] - rep["start_ms"]
+            bucket = np.searchsorted(DURATION_BINS_MS, duration, side="right")
+            durations[DURATION_BUCKETS[bucket]].append(hit)
+
+    return {
+        "extra_breakdown": {key: extra_counts[key] for key in EXTRA_TYPES},
+        "missed_breakdown": dict(zip(MISS_TYPES, (overlap_count, len(misses) - overlap_count))),
+        "detection_by_position": {key: tally(sum(hits), len(hits)) for key, hits in positions.items()},
+        "detection_by_duration": {key: tally(sum(hits), len(hits)) for key, hits in durations.items()},
+        "entire_sets_missed_by_exercise": {key: tally(sum(missed), len(missed), "missed", "rate")
+                                          for key, missed in sorted(sets.items())},
+    }
+
+
+def report_delay_percentiles(delays):
+    return {
+        "report_delay_median_ms": float(np.median(delays)) if delays else None,
+        "report_delay_p95_ms": float(np.percentile(delays, 95, method="inverted_cdf")) if delays else None,
+        "report_delay_max_ms": float(max(delays)) if delays else None,
+    }
+
+
+def repetition_metrics(predictions, references, tolerance_ms=400, require_station=True, *,
+                       timeline=None, observed_predictions=None):
     pairs = match_repetitions(predictions, references, tolerance_ms, require_station)
     tp, fp, fn = len(pairs), len(predictions) - len(pairs), len(references) - len(pairs)
     start_errors = [abs(predictions[p]["start_ms"] - references[r]["start_ms"]) for p, r in pairs]
@@ -78,10 +176,14 @@ def repetition_metrics(predictions, references, tolerance_ms=400, require_statio
             "start_mae_ms": float(np.mean(start_errors)) if pairs else None,
             "end_mae_ms": float(np.mean(end_errors)) if pairs else None,
             "report_delay_mean_ms": float(np.mean(delays)) if pairs else None,
+            **report_delay_percentiles(delays),
             "matched_reported_before_1s_fraction": float(np.mean(np.array(delays) < 1000)) if pairs else None,
             "matched_early_report_fraction": float(np.mean(np.array(delays) < 0)) if pairs else None,
             "matched_reported_0_to_999ms_fraction": float(np.mean([(0 <= d < 1000) for d in delays])) if pairs else None,
-            "start_errors_ms": start_errors, "end_errors_ms": end_errors, "report_delays_ms": delays}
+            "start_errors_ms": start_errors, "end_errors_ms": end_errors, "report_delays_ms": delays,
+            **(repetition_diagnostics(predictions, references, pairs, timeline,
+                                      predictions if observed_predictions is None else observed_predictions)
+               if timeline is not None else {})}
 
 
 def covered_repetitions(predictions, t, coverage, references=(), tolerance_ms=400,
@@ -111,6 +213,25 @@ def count_rows(predictions, references, session, require_station=True):
             for name in names]
 
 
+def aggregate_diagnostics(results):
+    if not all("extra_breakdown" in r for r in results):
+        return {}
+    summary = {
+        field: {key: sum(r[field][key] for r in results) for key in keys}
+        for field, keys in (("extra_breakdown", EXTRA_TYPES), ("missed_breakdown", MISS_TYPES))
+    }
+    for field, count, rate in (("detection_by_position", "matched", "recall"),
+                               ("detection_by_duration", "matched", "recall"),
+                               ("entire_sets_missed_by_exercise", "missed", "rate")):
+        buckets = {}
+        for result in results:
+            for key, row in result[field].items():
+                buckets.setdefault(key, []).append(row)
+        summary[field] = {key: tally(sum(row[count] for row in rows), sum(row["total"] for row in rows),
+                                     count, rate) for key, rows in buckets.items()}
+    return summary
+
+
 def aggregate_repetitions(results, counts):
     if not results:
         return {"status": "not_scored_no_validated_reference_coverage"}
@@ -126,6 +247,7 @@ def aggregate_repetitions(results, counts):
             "start_mae_ms": float(np.mean(starts)) if starts else None,
             "end_mae_ms": float(np.mean(ends)) if ends else None,
             "report_delay_mean_ms": float(np.mean(delays)) if delays else None,
+            **(report_delay_percentiles(delays) if all("report_delay_p95_ms" in r for r in results) else {}),
             "matched_reported_before_1s_fraction": float(np.mean(np.array(delays) < 1000)) if delays else None,
             "matched_early_report_fraction": float(np.mean(np.array(delays) < 0)) if delays else None,
             "matched_reported_0_to_999ms_fraction": float(np.mean([(0 <= d < 1000) for d in delays])) if delays else None,
@@ -133,7 +255,7 @@ def aggregate_repetitions(results, counts):
             "exact_count_accuracy_all_station_sessions": float(np.mean([r["exact"] for r in counts])) if counts else None,
             "count_mae_active_station_sessions": float(np.mean([r["absolute_error"] for r in active])) if active else None,
             "exact_count_accuracy_active_station_sessions": float(np.mean([r["exact"] for r in active])) if active else None,
-            "count_rows": counts}
+            "count_rows": counts, **aggregate_diagnostics(results)}
 
 
 def reporting_tolerances(values=None, primary=400):
@@ -144,9 +266,11 @@ def reporting_tolerances(values=None, primary=400):
     return sorted(set([primary, *values]))
 
 
-def score_stream(predictions, references, t, coverage, metadata, tolerances, station_metrics=True):
+def score_stream(predictions, references, t, coverage, metadata, tolerances, station_metrics=True, *,
+                 station_targets=None):
     """Score an unchanged decoded stream at several endpoint tolerances."""
     scores = {}
+    timeline = ReferenceTimeline(references, t, coverage, station_targets)
     for tolerance in tolerances:
         result = {}
         modes = ((True, "repetitions"), (False, "segmentation")) if station_metrics else ((False, "segmentation"),)
@@ -155,12 +279,14 @@ def score_stream(predictions, references, t, coverage, metadata, tolerances, sta
             rows = count_rows(scored, references, metadata["session"], require_station)
             for row in rows:
                 row.update({k: metadata[k] for k in ("source_session", "subject", "side")})
-            result[key] = {"metrics": repetition_metrics(scored, references, tolerance, require_station),
+            result[key] = {"metrics": repetition_metrics(scored, references, tolerance, require_station,
+                                                         timeline=timeline, observed_predictions=predictions),
                            "counts": rows}
             if require_station:
                 result["per_exercise"] = {
                     name: repetition_metrics([r for r in scored if r["station"] == name],
-                                             [r for r in references if r["station"] == name], tolerance)
+                                             [r for r in references if r["station"] == name], tolerance,
+                                             timeline=timeline, observed_predictions=predictions)
                     for name in CLASSES[1:] if name != "plank"}
         scores[str(tolerance)] = result
     return scores

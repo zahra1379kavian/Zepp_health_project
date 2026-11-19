@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from .constants import CLASSES, DT_MS, START_HISTORY, STATION_STATES
+from .constants import CLASSES, DT_MS, SET_GAP_MS, START_HISTORY, STATION_STATES
 
 
 @dataclass
@@ -19,7 +19,7 @@ class DecoderConfig:
     min_rep_ms: int = 240
     max_rep_ms: int = 30000
     refractory_ms: int = 200
-    set_gap_ms: int = 10000
+    set_gap_ms: int = SET_GAP_MS
     start_rule: str = "learned"
 
     def __post_init__(self):
@@ -170,7 +170,7 @@ class RepDecoder:
         return events
 
 
-def group_sets(repetitions, gap_ms=10000):
+def group_sets(repetitions, gap_ms=SET_GAP_MS):
     sets = []
     for rep in repetitions:
         if (not sets or rep.get("new_set") or sets[-1]["station"] != rep["station"] or

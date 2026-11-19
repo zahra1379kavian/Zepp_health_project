@@ -391,12 +391,14 @@ def evaluate(args):
         if arrays["coverage"].any() and not ckpt["station_only"]:
             record["repetition_scores"] = score_stream(decoded["repetitions"], references,
                                                         arrays["t"], arrays["coverage"], record, tolerances,
-                                                        station_metrics=station_metrics)
+                                                        station_metrics=station_metrics, station_targets=arrays["y"])
             if complete and config.start_rule == "learned":
                 baseline = decode_sequence(arrays["t"], p, q, infer_valid,
                                            replace(config, start_rule="previous_end"), lookahead_ms=lag * DT_MS)
+                decoded["previous_end_repetitions"] = baseline["repetitions"]
                 record["previous_end_scores"] = score_stream(baseline["repetitions"], references,
-                                                            arrays["t"], arrays["coverage"], record, tolerances, False)
+                                                            arrays["t"], arrays["coverage"], record, tolerances, False,
+                                                            station_targets=arrays["y"])
         result = {key: record[key] for key in ("session", "source_session", "subject", "side",
                                               "eligible_samples", "reference_samples")}
         result.update(aggregate_streams([record], tolerances, tolerance, station_metrics))
@@ -428,6 +430,71 @@ def evaluate(args):
                                                           "Phase NULL denotes frames outside a repetition."))),
               "excluded_sessions": manifest["excluded"]}
     write_json(out / "report.json", report)
+    return report
+
+
+def rescore_evaluation(predictions, data):
+    """Regenerate one evaluation report from a saved decoded stream per session."""
+    report = json.loads((predictions / "report.json").read_text())
+    tolerance = report["timing_tolerance_ms"]
+    tolerances = report["report_tolerances_ms"]
+    station_metrics = "classification" in report
+    records, sessions = [], []
+    for session in report["per_subject_session"]:
+        name = session["session"]
+        decoded = json.loads((predictions / f"{name}.json").read_text())
+        record = decoded["scoring"]
+        if record["repetition_scores"]:
+            stream = data / name
+            t, coverage, y = (np.load(stream / f"{key}.npy", allow_pickle=False, mmap_mode="r")
+                              for key in ("t", "coverage", "y"))
+            references = json.loads((stream / "references.json").read_text())
+            record["repetition_scores"] = score_stream(
+                decoded["repetitions"], references, t, coverage, record, tolerances,
+                station_metrics, station_targets=y)
+            if "previous_end_repetitions" in decoded:
+                record["previous_end_scores"] = score_stream(
+                    decoded["previous_end_repetitions"], references, t, coverage, record,
+                    tolerances, False, station_targets=y)
+        records.append(record)
+        sessions.append({**session, **aggregate_streams([record], tolerances, tolerance, station_metrics)})
+    updated = grouped_stream_report(records, tolerances, tolerance, station_metrics)
+    return {**report, **updated, "per_subject_session": sessions}, records
+
+
+def rescore(args):
+    """Refresh report JSON without training, inference or decoder tuning."""
+    predictions, output = Path(args.predictions), Path(args.output)
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite {output}")
+    original = json.loads((predictions / "report.json").read_text())
+    if original["report_scope"] == "subject_wise_cross_validation":
+        records, folds = [], []
+        for fold in original["folds"]:
+            path = predictions / f"fold_{fold['fold']}"
+            report, held_out = rescore_evaluation(path / "test", args.data or path / "data")
+            records.extend(held_out)
+            folds.append({**fold, **{key: report[key] for key in fold if key in report}})
+        updated = grouped_stream_report(records, original["report_tolerances_ms"],
+                                        original["timing_tolerance_ms"], "classification" in original)
+        for old, new in [(original, updated), *((original["per_side"][side], row)
+                                                 for side, row in updated["per_side"].items())]:
+            for tolerance, row in new["by_tolerance"].items():
+                for key in ("fold_segmentation_f1_mean", "fold_segmentation_f1_std"):
+                    if key in old["by_tolerance"][tolerance]:
+                        row[key] = old["by_tolerance"][tolerance][key]
+                        if int(tolerance) == original["timing_tolerance_ms"]:
+                            new[key] = row[key]
+        report = {**original, **updated, "folds": folds}
+    else:
+        report, _ = rescore_evaluation(predictions, args.data or predictions.parent / "data")
+    if "previous_end" in report and "extra_breakdown" not in report["previous_end"]:
+        report["previous_end_diagnostics"] = (
+            "Replay the complete-rep checkpoint with the saved validation decoder to recover previous-end predictions.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
     return report
 
 
