@@ -12,6 +12,17 @@ from ...data import write_json
 from ...orientation import INPUT_MODES
 
 
+def unseen_f1_by_exercise(by_pair, exercises, folds):
+    if set(by_pair) != {(fold, exercise) for fold in folds for exercise in exercises}:
+        raise ValueError("Incomplete exercise/subject fold comparison")
+    f1 = {}
+    for exercise in exercises:
+        rows = [by_pair[fold, exercise]["by_tolerance"]["400"] for fold in folds]
+        tp, extra, missed = (sum(r[k] for r in rows) for k in ("tp", "extra", "missed"))
+        f1[exercise] = 2 * tp / (2 * tp + extra + missed)
+    return f1
+
+
 def summarize(reports, exercises, folds):
     """Pool held-out subjects per exercise, then give each exercise equal weight."""
     by_pair = {}
@@ -21,13 +32,7 @@ def summarize(reports, exercises, folds):
             if pair in by_pair:
                 raise ValueError(f"Duplicate holdout {pair}")
             by_pair[pair] = score
-    if set(by_pair) != {(fold, exercise) for fold in folds for exercise in exercises}:
-        raise ValueError("Incomplete exercise/subject fold comparison")
-    f1 = {}
-    for exercise in exercises:
-        rows = [by_pair[fold, exercise]["by_tolerance"]["400"] for fold in folds]
-        tp, extra, missed = (sum(r[k] for r in rows) for k in ("tp", "extra", "missed"))
-        f1[exercise] = 2 * tp / (2 * tp + extra + missed)
+    f1 = unseen_f1_by_exercise(by_pair, exercises, folds)
     guards = [s["guard_rails"] for s in by_pair.values()]
     hours = sum(g["certified_rest_hours"] for g in guards)
     counts = sum(g["false_reps_during_rest"] for g in guards)
@@ -55,23 +60,30 @@ def select(summaries):
 
 
 def compare_similarity(args):
+    return compare_change(args, "similarity")
+
+
+def compare_change(args, change):
     """Apply step 2's acceptance rule to paired fits with the same input representation."""
     if args.output.exists():
         raise FileExistsError(args.output)
     signatures = {}
     summaries = {}
     modes = set()
-    for variant, paths in (("original", args.control_reports), ("similarity", args.similarity_reports)):
+    if change == "synthetic":
+        flag, treatment = "synthetic_reps", args.synthetic_reports
+    else:
+        flag, treatment = "causal_similarity", args.similarity_reports
+    for variant, paths in (("original", args.control_reports), (change, treatment)):
         reports = [json.loads(path.read_text()) for path in paths]
         pairs = {}
         for r in reports:
-            settings = r["training"]
-            enabled = settings.get("causal_similarity", False)
-            if (r["protocol"] != "paired" or r["repetition_head"] != "complete" or enabled != (variant == "similarity")
+            settings = {"acausal": False, "causal_similarity": False, "synthetic_reps": False, **r["training"]}
+            if (r["protocol"] != "paired" or r["repetition_head"] != "complete" or settings[flag] != (variant == change)
                     or set(r["results"]) != set(r["exercises"])):
                 raise ValueError(f"Expected completed paired {variant} holdouts")
             modes.add(r["rep_inputs"])
-            training = {k: v for k, v in settings.items() if k not in ("output", "exercises", "causal_similarity")}
+            training = {k: v for k, v in settings.items() if k not in ("output", "exercises", flag)}
             for exercise, score in r["results"].items():
                 metrics, guards = score["by_tolerance"]["400"], score["guard_rails"]
                 pairs[r["subject_fold"], exercise] = (
@@ -81,11 +93,11 @@ def compare_similarity(args):
         exercises = sorted({e for _, e in pairs})
         summaries[variant] = summarize(reports, exercises, folds)
         signatures[variant] = pairs
-    if len(modes) != 1 or signatures["original"] != signatures["similarity"]:
+    if len(modes) != 1 or signatures["original"] != signatures[change]:
         raise ValueError("Compare identical input modes, folds, exercises, selectors and training settings")
     decision = {"rep_inputs": modes.pop(), "subject_folds": folds, "exercises": exercises,
-                "control": summaries["original"], "similarity": summaries["similarity"],
-                "passes_step_2_gate": select(summaries) == "similarity"}
+                "control": summaries["original"], change: summaries[change],
+                "passes_step_2_gate": select(summaries) == change}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as f:
         print(json.dumps(decision, indent=2, allow_nan=False), file=f)

@@ -207,7 +207,7 @@ def group_sets(repetitions, gap_ms=SET_GAP_MS):
     return sets
 
 
-def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahead_ms=0):
+def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahead_ms=0, *, offline=False):
     decoder, reps, holds = RepDecoder(config), [], []
     if len(boundary_prob) and len(boundary_prob[0]) == 4:
         from .data import runs
@@ -240,8 +240,9 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
                     def rest_at(d):
                         j = last_rest[i-d]
                         return int(t[a+j]) if j >= 0 else None
+                    reported = int(t[-1]) if offline else clock + c.confirmation_frames * DT_MS + lookahead_ms
                     reps.extend(decoder.close_peak(clock, float(station_prob[a+i, 1]), end[i], distance,
-                                                   confidence, clock + c.confirmation_frames * DT_MS + lookahead_ms,
+                                                   confidence, reported,
                                                    i+1, rest_at, end_ms))
         return {"repetitions": reps, "counts": dict(Counter(r["station"] for r in reps)), "holds": holds,
                 "sets": group_sets(reps, c.set_gap_ms), "decoder": asdict(c)}
@@ -260,7 +261,7 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
         if is_hold and hold_start is None:
             hold_start = int(clock)
         reps.extend(decoder.step(clock, station, boundary_prob[i], bool(valid[i]),
-                                 reported_at_ms=int(clock) + lookahead_ms))
+                                 reported_at_ms=int(t[-1]) if offline else int(clock) + lookahead_ms))
         previous = int(clock)
     if hold_start is not None:
         end = int(t[-1] + DT_MS)

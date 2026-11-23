@@ -38,7 +38,8 @@ def digest(path):
 
 class Windows(Dataset):
     def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
-                 lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False):
+                 lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False,
+                 future_context=0):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name, include_phase=repetition_head == "phase") for name in sessions]
@@ -55,6 +56,7 @@ class Windows(Dataset):
         self.history, self.width = history, width
         self.repetition_head = repetition_head
         self.lookahead, self.augmentation = lookahead, augmentation
+        self.future_context = future_context
         self.features = FEATURES if features is None else features
         if augmentation and repetition_head != "phase":
             raise ValueError("Time-warp augmentation requires dense phase targets")
@@ -62,22 +64,25 @@ class Windows(Dataset):
         for i, arrays in enumerate(self.arrays):
             for a, b in runs(arrays["valid"]):
                 for start in range(a, b - lookahead, width):
-                    self.windows.append((i, a, start, min(start + width, b - lookahead)))
+                    self.windows.append((i, a, start, min(start + width, b - lookahead), b))
 
     def __len__(self):
         return len(self.windows)
 
     def __getitem__(self, i):
-        session, run_start, start, end = self.windows[i]
-        arrays = self.arrays[session]
-        left, length = max(run_start, start - self.history), self.history + self.width + self.lookahead
+        session, run_start, start, end, run_end = self.windows[i]
+        return self.window(self.arrays[session], run_start, start, end, run_end, rotate=self.rotate_training_windows)
+
+    def window(self, arrays, run_start, start, end, run_end, *, rotate):
+        left = max(run_start, start - self.history)
+        length = self.history + self.width + self.lookahead + self.future_context
         offset = self.history - (start - left)
-        right = end + self.lookahead
+        right = min(run_end, end + self.lookahead + self.future_context)
         stop = offset + right - left
         values = {key: np.array(arrays[key][left:right], copy=True)
                   for key in ("y", "boundary", "coverage", "phase", "phase_mask") if key in arrays}
         raw_x = arrays["x"][left:right]
-        if self.rep_inputs == "rotated" and self.rotate_training_windows:
+        if self.rep_inputs == "rotated" and rotate:
             raw_x = rotate_window(raw_x)
         if self.augmentation:
             raw_x, values = augment(raw_x, values, self.features)
@@ -86,7 +91,7 @@ class Windows(Dataset):
         mask = np.zeros((1, length), np.float32)
         mask[:, offset:stop] = 1
         target_mask = np.zeros(length, bool)
-        target_mask[self.history:stop - self.lookahead] = True
+        target_mask[self.history:self.history + end - start] = True
         y = np.zeros(length, np.int64)
         y[offset:stop] = values["y"]
         if self.repetition_head == "complete":
@@ -153,6 +158,11 @@ def train(args):
     if lookahead_ms < 0:
         raise ValueError("lookahead-ms must be nonnegative")
     complete = head == "complete"
+    synthetic = getattr(args, "synthetic_reps", False)
+    if synthetic and (not complete or manifest["features"] not in (FEATURES, FEATURES[:6])):
+        raise ValueError("Synthetic repetition training requires a complete rep head and wrist sensor triads")
+    if synthetic and args.batch_size % 4:
+        raise ValueError("Exactly 25% synthetic windows requires a batch size divisible by four")
     review_path = getattr(args, "rest_reviews", None)
     if (complete and args.station_only) or (review_path and not complete):
         raise ValueError("Rest reviews require complete-rep training; station-only is a separate mode")
@@ -164,17 +174,22 @@ def train(args):
     classes = STATION_STATES if binary_station else ([] if phase_only else CLASSES)
     config = ModelConfig(inputs=len(manifest["normalization"]["mean"]), classes=len(classes), stages=args.stages, layers=args.layers,
                          channels=args.channels, repetition_head=head, causal_similarity=getattr(args, "causal_similarity", False),
-                         lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)))
+                         lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)), acausal=getattr(args, "acausal", False))
     model = DenseMSTCN(config).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
                                model.history_samples, args.window, head, config.lookahead_samples,
                                split == "train" and getattr(args, "augment", False), manifest["features"],
-                               reviews if split == "train" else (), rotate_training_windows=split == "train")
+                               reviews if split == "train" else (), rotate_training_windows=split == "train",
+                               future_context=model.future_samples)
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
     loaders = {split: DataLoader(data, batch_size=args.batch_size, shuffle=split == "train", num_workers=0)
                for split, data in datasets.items()}
+    if synthetic:
+        from .synthetic import SyntheticReps
+        generator = SyntheticReps(root, manifest, datasets["train"], args.seed)
+        loaders["train"] = generator.loader(args.batch_size)
     weights = None
     if not phase_only:
         counts = np.asarray(manifest["train_class_counts"], dtype=float)
@@ -201,6 +216,11 @@ def train(args):
     phase_weights = torch.tensor(phase_weights, dtype=torch.float32, device=args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     out.mkdir(parents=True)
+    if synthetic:
+        write_json(out / "synthetic_sources.json", {"seed": args.seed, "source_split": "train",
+                   "training_streams": manifest["split"]["train"], "analysis": manifest.get("analysis"),
+                   "real_per_batch": 3 * args.batch_size // 4, "synthetic_per_batch": args.batch_size // 4,
+                   **generator.counts})
     history, best, stale = [], None, 0
     selection_decoder = DecoderConfig()
     tolerance = getattr(args, "tolerance_ms", 400)
@@ -234,6 +254,9 @@ def train(args):
                         break
             record[f"{split}_loss"] = loss_sum / max(frames, 1)
             record[f"{split}_batches"] = batches
+            if synthetic and split == "train":
+                record["synthetic_training_windows"] = batches * (args.batch_size // 4)
+                record["real_training_windows"] = batches * (3 * args.batch_size // 4)
         if args.station_only:
             key = (-record["validation_loss"],)
         else:
@@ -251,6 +274,7 @@ def train(args):
                           "features": manifest["features"] if mode == "original" else FEATURES[:6],
                           "model_features": model_feature_names(mode, manifest["features"]),
                           "augmentation": getattr(args, "augment", False),
+                          "synthetic_reps": synthetic,
                           "analysis": manifest.get("analysis"),
                           "location": manifest["location"], "station_only": args.station_only,
                           "sensor_policy": manifest.get("wrist_selection"),
@@ -295,7 +319,7 @@ def load_checkpoint(path, device="cpu", data=None):
 
 @torch.no_grad()
 def probabilities(model, x, valid, norm, device="cpu", chunk=512):
-    """Offline replay of exact causal outputs, resetting all caches at each gap."""
+    """Score complete valid runs, with cached causal or overlapping offline inference."""
     x = rep_values(x, valid, norm.get("rep_inputs", "original"))
     p = np.zeros((len(x), model.config.classes), np.float32) if model.config.classes else None
     q = np.zeros((len(x), model.config.replay_columns), np.float32)
@@ -305,8 +329,17 @@ def probabilities(model, x, valid, norm, device="cpu", chunk=512):
         state = None
         for left in range(a, b, chunk):
             right = min(b, left + chunk)
-            features = torch.tensor(((x[left:right] - mean) / std).T[None], device=device)
-            station, boundary, state = model.stream(features, state)
+            if model.config.acausal:
+                # Keep only centers with the same real context as a whole-run forward pass.
+                lo, hi = max(a, left - model.history_samples), min(b, right + model.future_samples)
+                features = torch.tensor(((x[lo:hi] - mean) / std).T[None], device=device)
+                station, boundary = model(features)[-1]
+                center = slice(left - lo, right - lo)
+                station = station[:, :, center] if station is not None else None
+                boundary = boundary[:, :, center]
+            else:
+                features = torch.tensor(((x[left:right] - mean) / std).T[None], device=device)
+                station, boundary, state = model.stream(features, state)
             first = max(left, a + lag)
             if first < right:
                 if station is not None:
@@ -341,6 +374,7 @@ def validation_cache(model, root, manifest, device):
         p, q = probabilities(model, a["x"], a["valid"], manifest["normalization"], device)
         a["valid"] = prediction_mask(a["valid"], model.config.lookahead_samples)
         a["lookahead_ms"] = model.config.lookahead_samples * DT_MS
+        a["offline"] = model.config.acausal
         refs = json.loads((Path(root) / name / "references.json").read_text())
         if selection:
             refs = [r for r in refs if r["station"] == selection]
@@ -354,7 +388,7 @@ def score_cache(cache, config, tolerance, require_station=True):
     scores, rows = [], []
     for name, a, p, q, refs in cache:
         result = decode_sequence(a["t"], p, q, a["valid"], config,
-                                 lookahead_ms=a.get("lookahead_ms", 0))
+                                 lookahead_ms=a.get("lookahead_ms", 0), offline=a.get("offline", False))
         if a.get("selection_exercise"):
             scored = exercise_predictions(result["repetitions"], refs, a["t"], a["coverage"], tolerance)
         else:
@@ -396,6 +430,7 @@ def evaluate(args):
     tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), tolerance)
     manifest = json.loads((root / "manifest.json").read_text())
     metadata = {s["session"]: s for s in manifest["sessions"]}
+    lag = model.config.lookahead_samples
     out.mkdir(parents=True)
     records, sessions = [], []
     for name in manifest["split"][args.split]:
@@ -403,9 +438,9 @@ def evaluate(args):
         p, q = probabilities(model, arrays["x"], arrays["valid"], ckpt["normalization"], args.device)
         if ckpt["station_only"]:
             q[:] = 0
-        lag = ckpt.get("config", {}).get("lookahead_samples", 0)
         infer_valid = prediction_mask(arrays["valid"], lag)
-        decoded = decode_sequence(arrays["t"], p, q, infer_valid, config, lookahead_ms=lag * DT_MS)
+        decoded = decode_sequence(arrays["t"], p, q, infer_valid, config, lookahead_ms=lag * DT_MS,
+                                  offline=model.config.acausal)
         info = metadata[name]
         record = {"session": name, "source_session": info.get("source_session", name),
                   "subject": info["subject"], "side": info.get("side", info["label_column"]),
@@ -432,7 +467,7 @@ def evaluate(args):
             if complete and config.start_rule == "learned":
                 baseline = decode_sequence(arrays["t"], p, q, infer_valid,
                                            replace(config, start_rule="previous_end", refine_end=False),
-                                           lookahead_ms=lag * DT_MS)
+                                           lookahead_ms=lag * DT_MS, offline=model.config.acausal)
                 decoded["previous_end_repetitions"] = baseline["repetitions"]
                 record["previous_end_scores"] = score_stream(baseline["repetitions"], references,
                                                             arrays["t"], arrays["coverage"], record, tolerances, False,
@@ -457,13 +492,16 @@ def evaluate(args):
               "sensor_policy": manifest.get("wrist_selection"),
               "analysis": manifest.get("analysis"),
               "repetition_head": ckpt.get("config", {}).get("repetition_head", "boundary"),
+              "acausal": model.config.acausal, "future_context_ms": model.future_samples * DT_MS,
               "causal_similarity": ckpt.get("config", {}).get("causal_similarity", False),
+              "synthetic_reps": ckpt.get("synthetic_reps", False),
               "start_rule": config.start_rule if complete else None,
               "end_refinement": config.refine_end,
               "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
-              "model_lookahead_ms": ckpt.get("config", {}).get("lookahead_samples", 0) * DT_MS,
+              "model_lookahead_ms": None if model.config.acausal else lag * DT_MS,
               "per_subject_session": sessions,
-              "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
+              "latency_note": ("Offline teacher predictions are reported at session end." if model.config.acausal else
+                               "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions."),
               "coverage_note": "Counts cover certified, available wrist streams. Paired wrists observe the same workout; pooled repetitions and stream-hours are not distinct workout totals. Both wrists stay in the same subject fold.",
               "limitations": ("One session per subject; uneven exercise and demographic coverage. "
                               + ("NULL is category-relative rest, not a learned unknown-exercise class."
@@ -600,6 +638,8 @@ def predict(args):
     if not 1 <= args.chunk <= 20:
         raise ValueError("Online chunk size must be 1..20 samples (at most 760 ms buffering)")
     model, ckpt = load_checkpoint(args.checkpoint, args.device)
+    if model.config.acausal:
+        raise ValueError("Use evaluate for offline teacher checkpoints; predict targets online replay")
     input_side = Path(args.input).stem
     if (ckpt["location"] in ("left_wrist", "right_wrist") and
             input_side in ("left_wrist", "right_wrist") and input_side != ckpt["location"]):
@@ -739,8 +779,12 @@ def run_pipeline(args):
     common = ["--device", args.device, "--threads", str(args.threads)]
     common.extend(["--repetition-head", getattr(args, "repetition_head", "auto"),
                    "--rep-inputs", getattr(args, "rep_inputs", "original")])
+    if getattr(args, "acausal", False):
+        common.append("--acausal")
     if getattr(args, "causal_similarity", False):
         common.append("--causal-similarity")
+    if getattr(args, "synthetic_reps", False):
+        common.append("--synthetic-reps")
     if getattr(args, "rest_reviews", None):
         common.extend(["--rest-reviews", str(args.rest_reviews)])
     main(["cross-validate", "--data", str(root), "--output", str(out / "cross_validation"),
@@ -770,6 +814,8 @@ def completed_fold_report(args, fold, expected_manifest, tolerances):
     if (any(checkpoint["config"].get(key, 0 if key == "lookahead_samples" else None) != value
             for key, value in expected_config.items())
             or checkpoint["config"].get("causal_similarity", False) != getattr(args, "causal_similarity", False)
+            or checkpoint["config"].get("acausal", False) != getattr(args, "acausal", False)
+            or checkpoint.get("synthetic_reps", False) != getattr(args, "synthetic_reps", False)
             or checkpoint.get("augmentation", False) != getattr(args, "augment", False)
             or checkpoint.get("rest_reviews_sha256") != (digest(args.rest_reviews) if getattr(args, "rest_reviews", None) else None)
             or checkpoint["seed"] != args.seed or checkpoint["station_only"]
@@ -856,6 +902,9 @@ def cross_validate(args):
             records.append(json.loads((fold / "test" / f"{name}.json").read_text())["scoring"])
         write_json(out / "folds.json", reports)
     result = {**grouped_stream_report(records, tolerances, args.tolerance_ms, named_stations), "folds": reports,
+              "acausal": getattr(args, "acausal", False),
+              "fit_settings": {key: getattr(args, key) for key in
+                               ("batch_size", "window", "epochs", "learning_rate", "patience", "augment")},
               "report_scope": "subject_wise_cross_validation", "report_tolerances_ms": tolerances,
               "seed": args.seed, "timing_tolerance_ms": args.tolerance_ms,
               "protocol": "Subject-disjoint outer test folds; next fold validates; remaining folds train. Both wrists of a subject always stay together. Each subject tested exactly once. Normalization and loss weights refit on training subjects. Checkpoint and decoder selected only on validation at the primary tolerance; the same test predictions are scored at every reporting tolerance.",

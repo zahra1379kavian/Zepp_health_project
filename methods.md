@@ -101,24 +101,26 @@ Apply one random 3-D rotation to the whole sequence, and pad each side with 5–
 Label a start and end at every cycle boundary. Make 25% of each batch synthetic.
 Risk: walking is also periodic. Keep real rest as negatives, with your reviewed hard-negative weights. Don't take source pieces whose accelerometer repeats at 0.4–0.7 s (step rhythm), and watch false reps per rest hour.
 
+**Validation.** The fold-1 screen compares synthetic training with the step 2.2 gravity-input model on biceps curls, push-up and squat. Both use the same real validation subjects, decoder selection exercise and test recordings. With a batch size of eight, synthetic training uses six real windows and two generated windows per update. [Generation and scoring details](baseline/MS-TCN/mstcn/analyses/leave_one_exercise_out/README.md#step-23-synthetic-repetitions) · [Screen logs](baseline/MS-TCN/experiment_runs/step_2_3/)
+
 2.4 Only if a large gap remains: add a head that tries to predict the exercise from stage-1 features, trained with reversed gradients (DANN, JMLR 2016), ramping its weight from 0 to 0.1.
 Add these one at a time (2.1 → 2.2 → 2.3). Keep a change only if:
 unseen F1 rises by at least 0.05,
 seen F1 drops by no more than 0.02, and
 false reps per rest hour rise by no more than 20%.
+
 ## Step 3 — Check the teacher's best case, then lookahead, then distillation
 3.1 Teacher ceiling
-
 Add an --acausal flag: in Residual, pad (d, d) instead of (2d, 0). Use the step-2 inputs.
 Train one teacher per fold, on that fold's training subjects only.
 Run it on whole sessions offline and measure first-rep recall, last-rep recall, F1, and unseen-exercise F1.
 Continue to 3.3 only if the teacher's first-rep recall beats the student's by at least 0.15, or its unseen F1 by at least 0.05. If not, the future signal doesn't contain the missing information, and distillation can't add it.
-3.2 Lookahead sweep (existing --lookahead-ms)
 
+3.2 Lookahead sweep (existing --lookahead-ms)
 Run 0 / 160 / 320 / 480 / 640 ms on fold 1. Score first- and last-rep recall and the 95th-percentile delay from true end to report, which must stay under 1000 ms.
 Pick the smallest lookahead that captures at least 80% of the teacher's first/last-rep gain, then confirm it on 5 folds.
-3.3 Distillation
 
+3.3 Distillation
 Loss:
 the usual label loss;
 λ₁ × a term matching the student's end probability to the teacher's (temperature 2), applied on all valid frames, including masked-reference frames where only the teacher gives a signal;
@@ -127,6 +129,7 @@ Try λ ∈ {0.3, 1, 3} and pick on validation.
 From OnPoint (ECCV 2026): also turn the teacher's confident reps (>0.9) inside currently masked intervals into extra training reps.
 If the student can't keep up with a teacher that sees the whole session, first use a teacher limited to 2 s of future. This follows the curriculum of increasingly future-aware teachers in Privileged Knowledge Distillation (Zhao et al., arXiv 2020).
 Later option: Dual-mode ASR (ICLR 2021) trains one network, with shared weights, in both streaming and full-context modes, with distillation inside the same model. It improved both accuracy and latency of the streaming mode.
+
 ## Step 4 — Report leg raise separately as sensor-limited
 Put the motion table above in the paper. State the rule as data-based, not F1-based: both wrist motion ratios below about 0.3× rest. Only leg raise qualifies.
 Headline results: the other 12 dynamic exercises. Then a separate leg-raise row, then all 13 pooled for transparency. Report plank as hold duration. Crunch stays in the headline.

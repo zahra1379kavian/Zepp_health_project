@@ -40,6 +40,15 @@ def main(argv=None):
     similarity.add_argument("--control-reports", type=Path, nargs="+", required=True)
     similarity.add_argument("--similarity-reports", type=Path, nargs="+", required=True)
     similarity.add_argument("--output", type=Path, required=True, help="Decision and guard rails as JSON")
+    synthetic = sub.add_parser("compare-synthetic", help="Compare matched real-only and synthetic-rep training runs")
+    synthetic.add_argument("--control-reports", type=Path, nargs="+", required=True)
+    synthetic.add_argument("--synthetic-reports", type=Path, nargs="+", required=True)
+    synthetic.add_argument("--output", type=Path, required=True)
+    teacher = sub.add_parser("compare-teacher", help="Apply the step 3.1 rule to matched student and teacher test results")
+    for role in ("student", "teacher"):
+        teacher.add_argument(f"--{role}-cv", type=Path, required=True, help="Completed all-exercise CV directory")
+        teacher.add_argument(f"--{role}-holdouts", type=Path, nargs="+", required=True, help="Paired holdout report files")
+    teacher.add_argument("--output", type=Path, required=True)
     ablation.add_argument("--folds", type=int, default=5)
     ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
     loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
@@ -119,6 +128,10 @@ def main(argv=None):
     run.add_argument("--references", type=Path, help="Validated full-rep references when preparing a new dataset")
     run.add_argument("--repetition-head", choices=["auto", "phase", "boundary", "complete"], default="auto")
     for command in (run, train, cv, loeo):
+        command.add_argument("--acausal", action="store_true",
+                             help="Train an offline teacher with past and future motion at each frame")
+        command.add_argument("--synthetic-reps", action="store_true",
+                             help="Complete rep head: fill one quarter of each training batch with synthetic wrist repetitions")
         command.add_argument("--causal-similarity", action="store_true",
                              help="Complete rep head: compare stage-1 motion embeddings over the past six seconds")
         command.add_argument("--rest-reviews", type=Path, help="Complete mode: reviewed mine-rest JSON")
@@ -145,9 +158,12 @@ def main(argv=None):
     if args.command == "reference-benchmark":
         from .analyses.reference import benchmark
         benchmark(args)
-    elif args.command == "compare-similarity":
-        from .analyses.leave_one_exercise_out.study import compare_similarity
-        compare_similarity(args)
+    elif args.command == "compare-teacher":
+        from .analyses.teacher import compare_teacher
+        compare_teacher(args)
+    elif args.command in ("compare-similarity", "compare-synthetic"):
+        from .analyses.leave_one_exercise_out.study import compare_change
+        compare_change(args, "synthetic" if args.command == "compare-synthetic" else "similarity")
     elif args.command == "biceps-diagnostic":
         from .analyses.leave_one_exercise_out.diagnostic import run
         run(args)

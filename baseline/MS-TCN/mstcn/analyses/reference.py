@@ -29,11 +29,13 @@ class WristModel:
         self.device = device
         self.lag = self.model.config.lookahead_samples
         self.metadata = dict(checkpoint=str(path), checkpoint_sha256=digest(path),
+                             acausal=self.model.config.acausal, future_context_ms=self.model.future_samples * DT_MS,
                              decoder_sha256=digest(fold / "decoder.json"), head=self.head,
                              causal_similarity=self.model.config.causal_similarity,
+                             synthetic_reps=ckpt.get("synthetic_reps", False),
                              features=ckpt["features"], model_features=ckpt.get("model_features", ckpt["features"]),
                              rep_inputs=self.norm.get("rep_inputs", "original"), start_rule=self.config.start_rule,
-                             refine_end=self.config.refine_end, model_lookahead_ms=self.lag * DT_MS,
+                             refine_end=self.config.refine_end, model_lookahead_ms=None if self.model.config.acausal else self.lag * DT_MS,
                              decoder_confirmation_ms=self.config.confirmation_frames * DT_MS,
                              simulated_input_buffer_ms=0)
 
@@ -50,11 +52,12 @@ class WristModel:
             traces[a:b][available] = q[available]
             local_ms = np.arange(b - a) * DT_MS
             reps = decode_sequence(local_ms, station, q, available, self.config,
-                                   lookahead_ms=self.lag * DT_MS)["repetitions"]
+                                   lookahead_ms=self.lag * DT_MS, offline=self.model.config.acausal)["repetitions"]
             for r in reps:
-                intervals.append({key: int(a + round(r[field] / DT_MS))
-                                  for key, field in (("start", "start_ms"), ("end", "end_ms"),
-                                                     ("reported_at", "reported_at_ms"))})
+                intervals.append({"start": int(a + round(r["start_ms"] / DT_MS)),
+                                  "end": int(a + round(r["end_ms"] / DT_MS)),
+                                  "reported_at": len(t) - 1 if self.model.config.acausal else
+                                                 int(a + round(r["reported_at_ms"] / DT_MS))})
         names = {"phase": ("background", "phase 1", "phase 2"),
                  "boundary": ("start", "end"), "complete": ("end",)}[self.head]
         return Prediction(intervals, {name: traces[:, i] for i, name in enumerate(names)})

@@ -24,6 +24,7 @@ class ModelConfig:
     repetition_head: str = "phase"
     lookahead_samples: int = 0
     causal_similarity: bool = False
+    acausal: bool = False
 
     def __post_init__(self):
         if self.classes is None:
@@ -40,6 +41,8 @@ class ModelConfig:
             raise ValueError("Causal similarity requires the complete rep head and at least two stages")
         if not isinstance(self.lookahead_samples, int) or self.lookahead_samples < 0:
             raise ValueError("lookahead_samples must be a nonnegative integer")
+        if self.acausal and self.lookahead_samples:
+            raise ValueError("The offline teacher uses centered convolutions and requires zero lookahead shift")
 
     @property
     def repetition_classes(self):
@@ -54,15 +57,16 @@ class ModelConfig:
 
 
 class Residual(nn.Module):
-    def __init__(self, channels, dilation, dropout):
+    def __init__(self, channels, dilation, dropout, acausal=False):
         super().__init__()
         self.history = 2 * dilation
+        self.padding = (dilation, dilation) if acausal else (self.history, 0)
         self.conv = nn.Conv1d(channels, channels, 3, dilation=dilation)
         self.project = nn.Conv1d(channels, channels, 1)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask):
-        h = self.conv(F.pad(x, (self.history, 0)))
+        h = self.conv(F.pad(x, self.padding))
         return (x + self.dropout(self.project(F.relu(h)))) * mask
 
     def stream(self, x, previous):
@@ -135,7 +139,7 @@ class Stage(nn.Module):
     def __init__(self, inputs, config, select_start=False):
         super().__init__()
         self.project = nn.Conv1d(inputs, config.channels, 1)
-        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout)
+        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout, config.acausal)
                                      for i in range(config.layers)])
         self.station = nn.Conv1d(config.channels, config.classes, 1) if config.classes else None
         self.boundary = nn.Conv1d(config.channels, config.repetition_classes, 1)
@@ -180,8 +184,12 @@ class DenseMSTCN(nn.Module):
                                      for i in range(c.stages)])
 
     @property
+    def future_samples(self):
+        return self.config.stages * (2 ** self.config.layers - 1) if self.config.acausal else 0
+
+    @property
     def history_samples(self):
-        history = self.config.stages * 2 * (2 ** self.config.layers - 1)
+        history = self.config.stages * 2 * (2 ** self.config.layers - 1) - self.future_samples
         if self.similarity is not None:
             # A candidate start can itself depend on another six seconds of motion.
             history += START_HISTORY
@@ -216,6 +224,8 @@ class DenseMSTCN(nn.Module):
         discard the initial lookahead outputs after each reset; never flush
         missing future samples at EOF. Chunk boundaries do not affect outputs.
         """
+        if self.config.acausal:
+            raise ValueError("Acausal teacher checkpoints require offline session evaluation")
         if self.training:
             raise ValueError("Call model.eval() before streaming")
         caches = []

@@ -119,6 +119,59 @@ reports on each side to pool the six exercise pairs across subject folds.
   --output "$runs/step_2_2/comparison_$mode.json"
 ```
 
+## Step 2.3 synthetic repetitions
+
+Enable `--synthetic-reps` with the complete-rep head. Each training batch
+contains 75% real windows and 25% generated windows. Use a batch size
+divisible by four. Each epoch has the control's number of optimizer updates.
+Normalization and loss weights are fit on real training data. Validation,
+checkpoint and decoder selection, and testing all use real recordings.
+
+The generator draws 15–50 frames from one continuous, certified training
+exercise, beginning at a local minimum of gyroscope speed below the piece's
+median. It excludes held-out exercises, plank, gaps and masked frames.
+It checks both the piece and up to two seconds of surrounding motion for a
+step rhythm. A local peak of at least 0.65 in acceleration autocorrelation
+at lags of 10–17 frames rejects the candidate. At least 35 contiguous
+frames of the same exercise are needed for the surrounding check.
+
+Each synthetic set uses 3–15 cycles. The return stroke reverses acceleration
+and reverses and negates angular velocity. Speed and amplitude vary per cycle.
+Acceleration is scaled about its initial value to preserve the starting pose.
+Between cycles there is a 25% chance of a pause up to one second. Each side
+gets 5–30 seconds of certified training rest, preferentially from the same
+wrist stream. Reviewed rest weights carry through to these negatives.
+One uniform 3-D rotation applies to every raw sensor triad in the full set
+before computing model features. Each full set is then split into the same
+causal windows as the real data. The model folder records its source pool
+and batch composition in `synthetic_sources.json`.
+
+The initial screen holds the gravity inputs and causal-similarity model fixed.
+Use a separate output directory for each exercise. For example, from the
+workspace root:
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+exercise=biceps_curls
+.venv/bin/python -m baseline.mstcn leave-one-exercise-out \
+  --data baseline/MS-TCN/prepared_datasets/separate_wrist_streams \
+  --output "$runs/step_2_3/$exercise" --subject-fold 1 --protocol paired \
+  --exercises "$exercise" --repetition-head complete --rep-inputs gravity \
+  --rest-reviews "$runs/complete_rep_review/reviewed.json" --causal-similarity --synthetic-reps
+```
+
+After all three real test reports and the matched control finish, the following
+command checks the prespecified unseen F1, seen F1 and rest false-count
+criteria. It also reports crunch F1 and first-rep recall.
+
+```bash
+.venv/bin/python -m baseline.mstcn compare-synthetic \
+  --control-reports "$runs/step_2_2/screen_gravity/report.json" \
+  --synthetic-reports "$runs/step_2_3/biceps_curls/report.json" \
+                     "$runs/step_2_3/push-up/report.json" "$runs/step_2_3/squat/report.json" \
+  --output "$runs/step_2_3/comparison_gravity.json"
+```
+
 ## Legacy phase-only evaluation
 
 Each exercise fold holds out one exercise identity. Every fold uses the same

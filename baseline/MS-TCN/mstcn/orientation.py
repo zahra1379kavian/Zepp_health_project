@@ -48,9 +48,9 @@ def rep_values(x, valid, mode):
 
 
 def rotate_window(x, rng=None):
-    """One Haar-uniform proper rotation for both triads and every frame."""
+    """One Haar-uniform proper rotation for all sensor triads and every frame."""
     rotation = Rotation.random(random_state=rng).as_matrix().astype(np.float32)
-    return (x.reshape(-1, 2, 3) @ rotation.T).reshape(-1, 6)
+    return (x.reshape(-1, 3) @ rotation.T).reshape(x.shape)
 
 
 def model_feature_names(mode, raw):
