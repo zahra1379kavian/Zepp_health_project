@@ -416,7 +416,10 @@ def evaluate(args):
     if out.exists():
         raise FileExistsError(f"Refusing to overwrite {out}")
     model, ckpt = load_checkpoint(args.checkpoint, args.device, root)
-    complete = ckpt.get("config", {}).get("repetition_head") == "complete"
+    model_config = ckpt.get("config", {})
+    complete = model_config.get("repetition_head") == "complete"
+    acausal = model_config.get("acausal", False)
+    lag = model_config.get("lookahead_samples", 0)
     binary_station = ckpt.get("classes") == STATION_STATES
     station_metrics = bool(ckpt.get("classes", CLASSES)) and not binary_station
     config, tolerance, selection = decoder_config(args.decoder, args.checkpoint, args.tolerance_ms,
@@ -430,7 +433,6 @@ def evaluate(args):
     tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), tolerance)
     manifest = json.loads((root / "manifest.json").read_text())
     metadata = {s["session"]: s for s in manifest["sessions"]}
-    lag = model.config.lookahead_samples
     out.mkdir(parents=True)
     records, sessions = [], []
     for name in manifest["split"][args.split]:
@@ -440,7 +442,7 @@ def evaluate(args):
             q[:] = 0
         infer_valid = prediction_mask(arrays["valid"], lag)
         decoded = decode_sequence(arrays["t"], p, q, infer_valid, config, lookahead_ms=lag * DT_MS,
-                                  offline=model.config.acausal)
+                                  offline=acausal)
         info = metadata[name]
         record = {"session": name, "source_session": info.get("source_session", name),
                   "subject": info["subject"], "side": info.get("side", info["label_column"]),
@@ -467,7 +469,7 @@ def evaluate(args):
             if complete and config.start_rule == "learned":
                 baseline = decode_sequence(arrays["t"], p, q, infer_valid,
                                            replace(config, start_rule="previous_end", refine_end=False),
-                                           lookahead_ms=lag * DT_MS, offline=model.config.acausal)
+                                           lookahead_ms=lag * DT_MS, offline=acausal)
                 decoded["previous_end_repetitions"] = baseline["repetitions"]
                 record["previous_end_scores"] = score_stream(baseline["repetitions"], references,
                                                             arrays["t"], arrays["coverage"], record, tolerances, False,
@@ -492,15 +494,15 @@ def evaluate(args):
               "sensor_policy": manifest.get("wrist_selection"),
               "analysis": manifest.get("analysis"),
               "repetition_head": ckpt.get("config", {}).get("repetition_head", "boundary"),
-              "acausal": model.config.acausal, "future_context_ms": model.future_samples * DT_MS,
+              "acausal": acausal, "future_context_ms": model.future_samples * DT_MS if acausal else 0,
               "causal_similarity": ckpt.get("config", {}).get("causal_similarity", False),
               "synthetic_reps": ckpt.get("synthetic_reps", False),
               "start_rule": config.start_rule if complete else None,
               "end_refinement": config.refine_end,
               "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
-              "model_lookahead_ms": None if model.config.acausal else lag * DT_MS,
+              "model_lookahead_ms": None if acausal else lag * DT_MS,
               "per_subject_session": sessions,
-              "latency_note": ("Offline teacher predictions are reported at session end." if model.config.acausal else
+              "latency_note": ("Offline teacher predictions are reported at session end." if acausal else
                                "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions."),
               "coverage_note": "Counts cover certified, available wrist streams. Paired wrists observe the same workout; pooled repetitions and stream-hours are not distinct workout totals. Both wrists stay in the same subject fold.",
               "limitations": ("One session per subject; uneven exercise and demographic coverage. "

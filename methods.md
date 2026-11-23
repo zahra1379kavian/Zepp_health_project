@@ -116,6 +116,8 @@ Train one teacher per fold, on that fold's training subjects only.
 Run it on whole sessions offline and measure first-rep recall, last-rep recall, F1, and unseen-exercise F1.
 Continue to 3.3 only if the teacher's first-rep recall beats the student's by at least 0.15, or its unseen F1 by at least 0.05. If not, the future signal doesn't contain the missing information, and distillation can't add it.
 
+**Implementation.** The offline teacher uses `--acausal` with the selected step-2 student settings. Compare first- and last-rep recall and overall F1 at ±400 ms across all five subject folds. For unseen F1, fit separate teachers with the same exercises withheld as in step 2. The comparison command applies the two thresholds above. Real-data teacher training awaits the step-2 selection. [Training and comparison commands](baseline/MS-TCN/README.md#step-31-offline-teacher)
+
 3.2 Lookahead sweep (existing --lookahead-ms)
 Run 0 / 160 / 320 / 480 / 640 ms on fold 1. Score first- and last-rep recall and the 95th-percentile delay from true end to report, which must stay under 1000 ms.
 Pick the smallest lookahead that captures at least 80% of the teacher's first/last-rep gain, then confirm it on 5 folds.

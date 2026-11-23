@@ -1,6 +1,7 @@
-"""MS-TCN-inspired causal refinement with an optional station head.
+"""MS-TCN refinement with an optional station head.
 
-Left padding supports online use. Repetition modes include dense phases,
+Left padding supports online use and centered padding supports offline teachers.
+Repetition modes include dense phases,
 independent boundaries, and end detection with conditional start selection.
 """
 

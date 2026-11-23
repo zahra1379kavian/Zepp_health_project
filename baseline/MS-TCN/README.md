@@ -163,6 +163,48 @@ side-specific annotation differences. Inputs remain nine channels from one wrist
 either wrist can be used at inference. No waist signal or waist label is used.
 Explicit `--location left_wrist` and `--location right_wrist` runs remain available.
 
+## Step 3.1 offline teacher
+
+After step 2 selects a student, repeat its all-exercise and confirmed exercise-holdout
+fits with `--acausal`. Copy its inputs, model, training settings and reviewed rest
+file. The teacher uses centered convolutions in every stage. With the default
+three stages and six layers it can see up to 189 future samples (7.56 seconds).
+Training windows include real context on both sides. Full-session evaluation
+resets at gaps and reports the teacher's predictions at session end.
+
+From the workspace root, set the Bash array `fit` to the selected student's
+shared training arguments, including `--data`, `--repetition-head complete`,
+`--rep-inputs`, and any selected similarity or synthetic-training flags.
+Use the same fold numbers as the student's confirmation. For the default
+confirmation on folds 1 and 2, the commands are
+
+```bash
+out=baseline/MS-TCN/experiment_runs/step_3_1
+.venv/bin/python -m baseline.mstcn cross-validate "${fit[@]}" --acausal \
+  --folds 5 --output "$out/all_exercise_cv"
+for fold in 1 2; do
+  .venv/bin/python -m baseline.mstcn leave-one-exercise-out "${fit[@]}" --acausal \
+    --protocol paired --exercises confirm --subject-fold "$fold" --output "$out/holdouts_$fold"
+done
+```
+
+Set `student_cv` to the selected student's completed all-exercise CV directory.
+Set the Bash array `student_holdouts` to its paired report files covering all
+six confirmed exercises on the same folds, including any reused screen fits.
+
+```bash
+.venv/bin/python -m baseline.mstcn compare-teacher \
+  --student-cv "$student_cv" --student-holdouts "${student_holdouts[@]}" \
+  --teacher-cv "$out/all_exercise_cv" --teacher-holdouts "$out"/holdouts_*/report.json \
+  --output "$out/decision.json"
+```
+
+The decision reports pooled first- and last-rep recall and overall F1 from the
+five all-exercise test folds. Unseen F1 pools counts within each withheld exercise
+and averages the six exercise scores equally. All four metrics use ±400 ms for
+both endpoints. `proceed_to_step_3_3` is true if first-rep recall gains at least
+0.15 or mean unseen F1 gains at least 0.05 over the streaming student.
+
 ## Exactly what to run
 
 From the repository root, set up Python once:

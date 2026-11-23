@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ import torch
 
 from baseline.mstcn.__main__ import main
 from baseline.mstcn.analyses.leave_one_exercise_out import PAIRS
+from baseline.mstcn.analyses.teacher import compare_teacher
 from baseline.mstcn.constants import DT_MS
 from baseline.mstcn.data import prepare, runs
 from baseline.mstcn.demo import synthetic_source
@@ -102,3 +104,14 @@ class TeacherTests(unittest.TestCase):
                                        decision["teacher"][key] - decision["student"][key])
             with self.assertRaisesRegex(ValueError, "configuration changed"):
                 main(["cross-validate", *fit, "--output", str(root / "teacher"), "--resume-completed"])
+
+    def test_either_gain_at_the_threshold_qualifies(self):
+        student = dict(first_rep_recall=.20, last_rep_recall=.60, f1_at_400=.50, mean_unseen_f1_at_400=.30)
+        with tempfile.TemporaryDirectory() as tmp:
+            for first, unseen, passes in ((.35, .30, True), (.20, .35, True), (.349, .349, False)):
+                teacher = {**student, "first_rep_recall": first, "mean_unseen_f1_at_400": unseen}
+                scores = [(s, {}, [1, 2], {}) for s in (student, teacher)]
+                args = SimpleNamespace(student_cv=None, student_holdouts=None, teacher_cv=None, teacher_holdouts=None,
+                                       output=Path(tmp) / f"{first}-{unseen}.json")
+                with patch("baseline.mstcn.analyses.teacher.ceiling_scores", side_effect=scores):
+                    self.assertEqual(compare_teacher(args)["proceed_to_step_3_3"], passes)
