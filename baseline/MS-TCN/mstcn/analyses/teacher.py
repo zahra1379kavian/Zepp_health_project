@@ -25,6 +25,7 @@ def ceiling_scores(cv, holdouts, acausal):
         ckpt = torch.load(cv / f"fold_{fold}/model/best.pt", weights_only=True, map_location="cpu")
         config = ckpt["config"]
         if (config.get("acausal", False) != acausal or config.get("lookahead_samples", 0)
+                or config.get("future_limit_samples") is not None
                 or config["repetition_head"] != "complete" or ckpt["split"] != split):
             raise ValueError(f"Wrong checkpoint or split in {cv}, fold {fold}")
         recipes.append(dict(rep_inputs=ckpt["normalization"].get("rep_inputs", "original"),
@@ -43,7 +44,7 @@ def ceiling_scores(cv, holdouts, acausal):
         fold = r["subject_fold"]
         settings = {"acausal": False, "causal_similarity": False, "synthetic_reps": False, **r["training"]}
         if (r["protocol"] != "paired" or r["repetition_head"] != "complete" or settings["acausal"] != acausal
-                or settings.get("lookahead_ms", 0) or r["split"] != folds.get(fold)
+                or settings.get("lookahead_ms", 0) or settings.get("future_limit_samples") is not None or r["split"] != folds.get(fold)
                 or settings["tolerance_ms"] != 400 or set(r["exercises"]) != set(r["results"])
                 or any(settings[k] != v for k, v in {**recipe, **report.get("fit_settings", {})}.items())):
             raise ValueError(f"Holdout settings do not match the all-exercise fit: {path}")
@@ -65,8 +66,8 @@ def ceiling_scores(cv, holdouts, acausal):
     positions = seg["detection_by_position"]
     scores = {"first_rep_recall": positions["first"]["recall"], "last_rep_recall": positions["last"]["recall"],
               "f1_at_400": seg["f1"], "mean_unseen_f1_at_400": mean(unseen.values())}
-    signature = (folds, manifests, recipe, paired_settings, seg["tp"] + seg["missed"],
-                 positions["first"]["total"], positions["last"]["total"])
+    signature = {"folds": folds, "manifests": manifests, "recipe": recipe, "paired_settings": paired_settings,
+                 "reference_counts": (seg["tp"] + seg["missed"], positions["first"]["total"], positions["last"]["total"])}
     return scores, unseen, holdout_folds, signature
 
 
@@ -77,6 +78,8 @@ def compare_teacher(args):
         raise ValueError("Compare the same inputs, training settings, subject splits and exercise pairs")
     gains = {key: round(teacher[key] - student[key], 12) for key in student}
     decision = {"tolerance_ms": 400, "holdout_subject_folds": folds, "student": student, "teacher": teacher,
+                "teacher_recipe": teacher_signature["recipe"], "fold_splits": teacher_signature["folds"],
+                "fold_manifest_and_review_hashes": teacher_signature["manifests"],
                 "teacher_minus_student": gains,
                 "unseen_f1_by_exercise": {"student": student_exercises, "teacher": teacher_exercises},
                 "proceed_to_step_3_3": gains["first_rep_recall"] >= .15 or gains["mean_unseen_f1_at_400"] >= .05}

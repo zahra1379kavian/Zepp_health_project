@@ -63,6 +63,7 @@ def main(argv=None):
     distill.add_argument("--lookahead-ms", type=int, default=0, help="Fixed streaming student lookahead from step 3.2")
     distill.add_argument("--rest-reviews", type=Path, help="Same reviewed rest file as the teacher")
     distill.add_argument("--initial-student", type=Path, help="Initialize the full-teacher pass from a student distilled with the two-second teacher")
+    distill.add_argument("--validation-only", action="store_true", help="Select weights and defer testing while comparing teaching schedules")
     distill.add_argument("--output", type=Path, required=True)
     distill.add_argument("--device", default="cpu")
     distill.add_argument("--threads", type=int, default=2)

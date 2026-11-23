@@ -245,6 +245,59 @@ from the same output directory.
   results and a pooled decision. Pooled recall uses total hits and labeled
   reps, and pooled delay uses all individual matched-rep delays.
 
+## Step 3.3 distillation
+
+After step 3.1 qualifies the teacher, train a streaming student on the same
+fold. Set `lookahead_ms` to the chosen student delay from step 3.2. From the
+workspace root, this example runs fold 1 with the reviewed rest file.
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+teacher_cv="$runs/step_3_1/all_exercise_cv"
+.venv/bin/python -m baseline.mstcn distill \
+  --teacher-fold "$teacher_cv/fold_1" --ceiling-decision "$runs/step_3_1/decision.json" \
+  --lookahead-ms "$lookahead_ms" --rest-reviews "$runs/complete_rep_review/reviewed.json" \
+  --output "$runs/step_3_3/fold_1"
+```
+
+Repeat for each subject fold using its own teacher and output directory. For
+an exercise holdout, supply that exercise's teacher folder with its masked
+data view. The paired selection exercise supplies its validation score, and
+the winner's `test/held_out_report.json` scores the unseen exercise. Omit
+`--rest-reviews` if the teacher fit omitted it.
+
+- **End timing.** On every valid training target frame, the student matches
+  the frozen teacher's end probability with binary KL at temperature 2,
+  scaled by 2². This includes frames without rep annotations. Both models
+  reset at data gaps. Padding, overlapping window context and unavailable
+  student lookahead are excluded from the loss.
+- **Rep starts.** At each labeled end and each end reported by the teacher's
+  validation-selected decoder, the student matches the teacher's full
+  distribution over 150 possible start frames and the no-start choice.
+  This KL uses temperature 1. A shared end timestamp contributes once.
+- **Extra training labels.** Accept a teacher rep when its joint confidence
+  (end probability times chosen-start probability) exceeds 0.9 and every
+  sample from start through end is valid and masked for rep supervision.
+  The accepted interval receives the usual end and start targets. Human
+  references, certified negatives and station labels retain their original
+  supervision. Extra labels are used only in training.
+- **Selection.** Try all nine independent pairs of weights from 0.3, 1 and 3.
+  Select by validation F1 at ±400 ms, breaking ties by lower validation
+  count error. Exact ties keep the first pair in ascending end/start weight
+  order. `selection.json` names the winning checkpoint and decoder. The
+  winner's `test/report.json` holds its held-out scores. Each trial also
+  records its training-stream pseudo reps and distillation losses. The
+  saved student works with the usual sensor-only `predict` command.
+
+For the optional curriculum, add `--two-second-teacher` to the original
+`--acausal` teacher fit in a new directory. This limits the network to at
+most 50 future samples across all stages. Run `distill` with that teacher
+and `--validation-only`. Then run `distill` with the full teacher in a new
+output directory, passing the first pass's selected checkpoint via
+`--initial-student`. Use validation to compare schedules. Running the
+chosen schedule again without `--validation-only` reuses completed trials
+and evaluates the selected student once on test subjects.
+
 ## Exactly what to run
 
 From the repository root, set up Python once:

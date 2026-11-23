@@ -110,7 +110,8 @@ class TeacherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for first, unseen, passes in ((.35, .30, True), (.20, .35, True), (.349, .349, False)):
                 teacher = {**student, "first_rep_recall": first, "mean_unseen_f1_at_400": unseen}
-                scores = [(s, {}, [1, 2], {}) for s in (student, teacher)]
+                signature = {"recipe": {}, "folds": {}, "manifests": {}}
+                scores = [(s, {}, [1, 2], signature) for s in (student, teacher)]
                 args = SimpleNamespace(student_cv=None, student_holdouts=None, teacher_cv=None, teacher_holdouts=None,
                                        output=Path(tmp) / f"{first}-{unseen}.json")
                 with patch("baseline.mstcn.analyses.teacher.ceiling_scores", side_effect=scores):

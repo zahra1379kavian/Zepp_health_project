@@ -134,6 +134,8 @@ From OnPoint (ECCV 2026): also turn the teacher's confident reps (>0.9) inside c
 If the student can't keep up with a teacher that sees the whole session, first use a teacher limited to 2 s of future. This follows the curriculum of increasingly future-aware teachers in Privileged Knowledge Distillation (Zhao et al., arXiv 2020).
 Later option: Dual-mode ASR (ICLR 2021) trains one network, with shared weights, in both streaming and full-context modes, with distillation inside the same model. It improved both accuracy and latency of the streaming mode.
 
+**Implementation.** The `distill` command uses the frozen teacher and validation-selected decoder for each fold. It trains all nine combinations of end and start loss weights, chooses them on validation, and evaluates the selected streaming student. It also supports the two-second teacher curriculum. Real-data distillation uses the passing step-3.1 decision and the chosen student lookahead. [Training commands and scoring](baseline/MS-TCN/README.md#step-33-distillation)
+
 ## Step 4 — Report leg raise separately as sensor-limited
 Put the motion table above in the paper. State the rule as data-based, not F1-based: both wrist motion ratios below about 0.3× rest. Only leg raise qualifies.
 Headline results: the other 12 dynamic exercises. Then a separate leg-raise row, then all 13 pooled for transparency. Report plank as hold duration. Crunch stays in the headline.

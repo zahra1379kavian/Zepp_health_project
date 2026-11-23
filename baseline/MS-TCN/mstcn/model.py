@@ -45,7 +45,8 @@ class ModelConfig:
             raise ValueError("lookahead_samples must be a nonnegative integer")
         if self.acausal and self.lookahead_samples:
             raise ValueError("The offline teacher uses centered convolutions and requires zero lookahead shift")
-        if self.future_limit_samples is not None and (not self.acausal or self.future_limit_samples < 0):
+        if self.future_limit_samples is not None and (
+                not self.acausal or not isinstance(self.future_limit_samples, int) or self.future_limit_samples < 0):
             raise ValueError("A future-context limit requires an offline teacher and a nonnegative limit")
 
     @property
@@ -61,9 +62,11 @@ class ModelConfig:
 
 
 class Residual(nn.Module):
-    def __init__(self, channels, dilation, dropout, future=0):
+    def __init__(self, channels, dilation, dropout, acausal=False, *, future=None):
         super().__init__()
         self.history = 2 * dilation
+        if future is None:
+            future = dilation if acausal else 0
         self.padding = (self.history - future, future)
         self.conv = nn.Conv1d(channels, channels, 3, dilation=dilation)
         self.project = nn.Conv1d(channels, channels, 1)
@@ -140,10 +143,11 @@ class StartSelector(nn.Module):
 
 
 class Stage(nn.Module):
-    def __init__(self, inputs, config, future_padding, select_start=False):
+    def __init__(self, inputs, config, select_start=False, *, future_padding=None):
         super().__init__()
         self.project = nn.Conv1d(inputs, config.channels, 1)
-        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout, future_padding[i])
+        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout, config.acausal,
+                                             future=future_padding[i] if future_padding is not None else None)
                                      for i in range(config.layers)])
         self.station = nn.Conv1d(config.channels, config.classes, 1) if config.classes else None
         self.boundary = nn.Conv1d(config.channels, config.repetition_classes, 1)
@@ -191,7 +195,8 @@ class DenseMSTCN(nn.Module):
         for dilation in [2 ** i for i in range(c.layers)] * c.stages:
             padding.append((used + dilation) * self.future_samples // full - used * self.future_samples // full)
             used += dilation
-        self.stages = nn.ModuleList([Stage(c.inputs if i == 0 else refinement_width, c, padding[i*c.layers:(i+1)*c.layers],
+        self.stages = nn.ModuleList([Stage(c.inputs if i == 0 else refinement_width, c,
+                                           future_padding=padding[i*c.layers:(i+1)*c.layers],
                                            select_start=c.repetition_head == "complete" and i == c.stages - 1)
                                      for i in range(c.stages)])
 

@@ -58,6 +58,7 @@ def source_fits(args, fold):
         config = model.config
         decoder = json.loads((folder / "decoder.json").read_text())
         if (config.acausal != offline or config.lookahead_samples or config.repetition_head != "complete"
+                or config.future_limit_samples is not None
                 or ckpt["station_only"] or ckpt["split"] != manifest["split"] or ckpt["seed"] != manifest["seed"]
                 or ckpt.get("rest_reviews_sha256") != review_hash or ckpt["tolerance_ms"] != 400
                 or decoder["tolerance_ms"] != 400 or decoder["selected_on"] != "validation"

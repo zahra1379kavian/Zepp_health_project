@@ -127,6 +127,8 @@ class Windows(Dataset):
 
 
 def train(args, *, teacher=None, initial_state=None):
+    if teacher is not None:
+        from .distillation import distillation_losses
     root, out = Path(args.data), Path(args.output)
     manifest = json.loads((root / "manifest.json").read_text())
     if manifest["location"] not in WRIST_LOCATIONS:
@@ -243,17 +245,17 @@ def train(args, *, teacher=None, initial_state=None):
         for split, loader in loaders.items():
             model.train(split == "train")
             loss_sum, frames, batches = 0., 0, 0
+            distilled = teacher is not None and split == "train"
+            end_sum, start_sum, teacher_ends, pseudo_frames = 0., 0., 0, 0
             with torch.set_grad_enabled(split == "train"):
                 for batch in loader:
                     x, mask, y, boundary, valid, reference, *extra = [a.to(args.device) for a in batch]
                     outputs = model(x, mask)
-                    distilled = teacher is not None and split == "train"
                     loss = dense_loss(outputs, y, boundary, valid, reference, weights, positive_weights,
                                       boundary_weight=0 if args.station_only else 1, phase_weights=phase_weights,
                                       repetition_valid=(valid | extra[4]) if distilled else valid,
                                       **(dict(start_choice=extra[0], rep_weights=extra[1]) if complete else {}))
                     if distilled:
-                        from .distillation import distillation_losses
                         end_loss, start_loss = distillation_losses(outputs[-1][1], extra[2], extra[3])
                         loss = loss + args.lambda_end * end_loss + args.lambda_start * start_loss
                     if not torch.isfinite(loss):
@@ -264,6 +266,12 @@ def train(args, *, teacher=None, initial_state=None):
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
                         optimizer.step()
                     n = int((extra[2] >= 0).sum()) if distilled else int(valid.sum())
+                    if distilled:
+                        ends = int((extra[3].sum(-1) > 0).sum())
+                        end_sum += float(end_loss.detach()) * n
+                        start_sum += float(start_loss.detach()) * ends
+                        teacher_ends += ends
+                        pseudo_frames += int(extra[4].sum())
                     loss_sum += float(loss.detach()) * n
                     frames += n
                     batches += 1
@@ -274,6 +282,9 @@ def train(args, *, teacher=None, initial_state=None):
                         break
             record[f"{split}_loss"] = loss_sum / max(frames, 1)
             record[f"{split}_batches"] = batches
+            if distilled:
+                record.update(teacher_frames=frames, teacher_start_rows=teacher_ends, pseudo_frames=pseudo_frames,
+                              end_kl=end_sum / max(frames, 1), start_kl=start_sum / max(teacher_ends, 1))
             if synthetic and split == "train":
                 record["synthetic_training_windows"] = batches * (args.batch_size // 4)
                 record["real_training_windows"] = batches * (3 * args.batch_size // 4)
