@@ -26,6 +26,7 @@ class ModelConfig:
     lookahead_samples: int = 0
     causal_similarity: bool = False
     acausal: bool = False
+    future_limit_samples: int | None = None
 
     def __post_init__(self):
         if self.classes is None:
@@ -44,6 +45,8 @@ class ModelConfig:
             raise ValueError("lookahead_samples must be a nonnegative integer")
         if self.acausal and self.lookahead_samples:
             raise ValueError("The offline teacher uses centered convolutions and requires zero lookahead shift")
+        if self.future_limit_samples is not None and (not self.acausal or self.future_limit_samples < 0):
+            raise ValueError("A future-context limit requires an offline teacher and a nonnegative limit")
 
     @property
     def repetition_classes(self):
@@ -58,10 +61,10 @@ class ModelConfig:
 
 
 class Residual(nn.Module):
-    def __init__(self, channels, dilation, dropout, acausal=False):
+    def __init__(self, channels, dilation, dropout, future=0):
         super().__init__()
         self.history = 2 * dilation
-        self.padding = (dilation, dilation) if acausal else (self.history, 0)
+        self.padding = (self.history - future, future)
         self.conv = nn.Conv1d(channels, channels, 3, dilation=dilation)
         self.project = nn.Conv1d(channels, channels, 1)
         self.dropout = nn.Dropout(dropout)
@@ -137,10 +140,10 @@ class StartSelector(nn.Module):
 
 
 class Stage(nn.Module):
-    def __init__(self, inputs, config, select_start=False):
+    def __init__(self, inputs, config, future_padding, select_start=False):
         super().__init__()
         self.project = nn.Conv1d(inputs, config.channels, 1)
-        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout, config.acausal)
+        self.layers = nn.ModuleList([Residual(config.channels, 2 ** i, config.dropout, future_padding[i])
                                      for i in range(config.layers)])
         self.station = nn.Conv1d(config.channels, config.classes, 1) if config.classes else None
         self.boundary = nn.Conv1d(config.channels, config.repetition_classes, 1)
@@ -180,13 +183,17 @@ class DenseMSTCN(nn.Module):
         self.similarity = CausalSimilarity(c.channels) if c.causal_similarity else None
         if self.similarity is not None:
             refinement_width += self.similarity.projection.out_channels
-        self.stages = nn.ModuleList([Stage(c.inputs if i == 0 else refinement_width, c,
+        # Apportion the teacher's total future context across its dilated layers.
+        full = c.stages * (2 ** c.layers - 1)
+        budget = min(full, c.future_limit_samples) if c.future_limit_samples is not None else full
+        self.future_samples = budget if c.acausal else 0
+        padding, used = [], 0
+        for dilation in [2 ** i for i in range(c.layers)] * c.stages:
+            padding.append((used + dilation) * self.future_samples // full - used * self.future_samples // full)
+            used += dilation
+        self.stages = nn.ModuleList([Stage(c.inputs if i == 0 else refinement_width, c, padding[i*c.layers:(i+1)*c.layers],
                                            select_start=c.repetition_head == "complete" and i == c.stages - 1)
                                      for i in range(c.stages)])
-
-    @property
-    def future_samples(self):
-        return self.config.stages * (2 ** self.config.layers - 1) if self.config.acausal else 0
 
     @property
     def history_samples(self):
@@ -264,7 +271,7 @@ class DenseMSTCN(nn.Module):
 
 def dense_loss(outputs, y, boundary, valid, reference_mask, class_weights=None,
                positive_weights=None, boundary_weight=1., smoothing_weight=.15,
-               phase_weights=None, start_choice=None, rep_weights=None):
+               phase_weights=None, start_choice=None, rep_weights=None, repetition_valid=None):
     """Masked repetition loss and, when present, station CE and smoothing.
 
     Smoothing uses both adjacent eligibility flags and detaches the preceding
@@ -282,7 +289,7 @@ def dense_loss(outputs, y, boundary, valid, reference_mask, class_weights=None,
             smooth = (logp[:, :, 1:] - logp[:, :, :-1].detach()).square().clamp(max=16).mean(1)
             smooth = (smooth * pair).sum() / pair.sum().clamp_min(1)
             total = total + cls + smoothing_weight * smooth
-        refs = reference_mask & valid
+        refs = reference_mask & (valid if repetition_valid is None else repetition_valid)
         if start_choice is not None:
             weights = refs * rep_weights
             end_logits = events[:, 0]

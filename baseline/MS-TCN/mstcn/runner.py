@@ -44,18 +44,21 @@ def fit_settings(args):
 class Windows(Dataset):
     def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
                  lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False,
-                 future_context=0):
+                 future_context=0, teacher=None):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name, include_phase=repetition_head == "phase") for name in sessions]
         self.rep_inputs = norm.get("rep_inputs", "original")
         self.rotate_training_windows = rotate_training_windows
+        self.teacher = teacher
         for arrays in self.arrays:
             arrays["x"] = rep_values(arrays["x"], arrays["valid"], self.rep_inputs)
         if repetition_head == "complete":
             for name, arrays in zip(sessions, self.arrays):
                 reps = json.loads((Path(root) / name / "references.json").read_text())
                 arrays.update(complete_targets(arrays, reps, (r for r in reviews if r["session"] == name)))
+                if teacher is not None:
+                    arrays["teacher"] = teacher.targets(arrays, reps, name)
         self.mean = np.asarray(norm["mean"], np.float32)
         self.std = np.asarray(norm["std"], np.float32)
         self.history, self.width = history, width
@@ -107,8 +110,11 @@ class Windows(Dataset):
             weight[offset:stop] = arrays["weight"][left:right]
             end_targets[offset:stop] = arrays["end"][left:right]
             target_mask[offset:stop] &= ~(values["coverage"] & (weight[offset:stop] == 0))
+            extra = ()
+            if self.teacher is not None:
+                extra = arrays["teacher"].window(start, end, self.history, length, end_targets, choice, weight)
             return tuple(torch.from_numpy(a.copy()) for a in
-                         (x.T, mask, y, end_targets, target_mask, weight > 0, choice, weight))
+                         (x.T, mask, y, end_targets, target_mask, weight > 0, choice, weight, *extra))
         boundary = np.zeros((length, 2), np.float32)
         boundary[offset:stop] = values["boundary"]
         reference = np.zeros(length, bool)
@@ -120,7 +126,7 @@ class Windows(Dataset):
         return tuple(torch.from_numpy(a.copy()) for a in (x.T, mask, y, boundary, target_mask, reference))
 
 
-def train(args):
+def train(args, *, teacher=None, initial_state=None):
     root, out = Path(args.data), Path(args.output)
     manifest = json.loads((root / "manifest.json").read_text())
     if manifest["location"] not in WRIST_LOCATIONS:
@@ -179,13 +185,16 @@ def train(args):
     classes = STATION_STATES if binary_station else ([] if phase_only else CLASSES)
     config = ModelConfig(inputs=len(manifest["normalization"]["mean"]), classes=len(classes), stages=args.stages, layers=args.layers,
                          channels=args.channels, repetition_head=head, causal_similarity=getattr(args, "causal_similarity", False),
-                         lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)), acausal=getattr(args, "acausal", False))
+                         lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)), acausal=getattr(args, "acausal", False),
+                         future_limit_samples=getattr(args, "future_limit_samples", None))
     model = DenseMSTCN(config).to(args.device)
+    if initial_state is not None:
+        model.load_state_dict(initial_state)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
                                model.history_samples, args.window, head, config.lookahead_samples,
                                split == "train" and getattr(args, "augment", False), manifest["features"],
                                reviews if split == "train" else (), rotate_training_windows=split == "train",
-                               future_context=model.future_samples)
+                               future_context=model.future_samples, teacher=teacher if split == "train" else None)
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
@@ -238,9 +247,15 @@ def train(args):
                 for batch in loader:
                     x, mask, y, boundary, valid, reference, *extra = [a.to(args.device) for a in batch]
                     outputs = model(x, mask)
+                    distilled = teacher is not None and split == "train"
                     loss = dense_loss(outputs, y, boundary, valid, reference, weights, positive_weights,
                                       boundary_weight=0 if args.station_only else 1, phase_weights=phase_weights,
+                                      repetition_valid=(valid | extra[4]) if distilled else valid,
                                       **(dict(start_choice=extra[0], rep_weights=extra[1]) if complete else {}))
+                    if distilled:
+                        from .distillation import distillation_losses
+                        end_loss, start_loss = distillation_losses(outputs[-1][1], extra[2], extra[3])
+                        loss = loss + args.lambda_end * end_loss + args.lambda_start * start_loss
                     if not torch.isfinite(loss):
                         raise RuntimeError("Nonfinite training loss")
                     if split == "train":
@@ -248,7 +263,7 @@ def train(args):
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
                         optimizer.step()
-                    n = int(valid.sum())
+                    n = int((extra[2] >= 0).sum()) if distilled else int(valid.sum())
                     loss_sum += float(loss.detach()) * n
                     frames += n
                     batches += 1
@@ -295,6 +310,9 @@ def train(args):
                           "selection_key": list(best), "selection_decoder": asdict(selection_decoder),
                           "tolerance_ms": tolerance,
                           "partial_epoch_max_steps": args.max_steps}
+            if teacher is not None:
+                checkpoint["distillation"] = {**teacher.provenance, "lambda_end": args.lambda_end,
+                                              "lambda_start": args.lambda_start}
             torch.save(checkpoint, out / "best.pt")
         else:
             stale += 1
@@ -324,9 +342,10 @@ def load_checkpoint(path, device="cpu", data=None):
 
 
 @torch.no_grad()
-def probabilities(model, x, valid, norm, device="cpu", chunk=512):
+def probabilities(model, x, valid, norm, device="cpu", chunk=512, *, prepared=False, capture_logits=None):
     """Score complete valid runs, with cached causal or overlapping offline inference."""
-    x = rep_values(x, valid, norm.get("rep_inputs", "original"))
+    if not prepared:
+        x = rep_values(x, valid, norm.get("rep_inputs", "original"))
     p = np.zeros((len(x), model.config.classes), np.float32) if model.config.classes else None
     q = np.zeros((len(x), model.config.replay_columns), np.float32)
     mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
@@ -351,6 +370,8 @@ def probabilities(model, x, valid, norm, device="cpu", chunk=512):
                 if station is not None:
                     p[first-lag:right-lag] = station.softmax(1)[0, :, first-left:].T.cpu().numpy()
                 q[first-lag:right-lag] = model.repetition_probabilities(boundary)[0, :, first-left:].T.cpu().numpy()
+                if capture_logits is not None:
+                    capture_logits(slice(first-lag, right-lag), boundary[0, :, first-left:].T)
     return p, q
 
 
@@ -798,6 +819,8 @@ def run_pipeline(args):
                    "--rep-inputs", getattr(args, "rep_inputs", "original")])
     if getattr(args, "acausal", False):
         common.append("--acausal")
+    if getattr(args, "future_limit_samples", None) is not None:
+        common.append("--two-second-teacher")
     if getattr(args, "causal_similarity", False):
         common.append("--causal-similarity")
     if getattr(args, "synthetic_reps", False):
@@ -827,6 +850,7 @@ def completed_fold_report(args, fold, expected_manifest, tolerances):
         head = default_head(expected_manifest)
     expected_config = {"stages": args.stages, "layers": args.layers, "channels": args.channels,
                        "repetition_head": head,
+                       "future_limit_samples": getattr(args, "future_limit_samples", None),
                        "lookahead_samples": int(np.ceil(getattr(args, "lookahead_ms", 0) / DT_MS))}
     if (any(checkpoint["config"].get(key, 0 if key == "lookahead_samples" else None) != value
             for key, value in expected_config.items())

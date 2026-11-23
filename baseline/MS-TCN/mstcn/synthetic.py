@@ -134,6 +134,8 @@ class SyntheticReps:
         a.update(complete_targets(a, bounds))
         a["weight"][:len(before)], a["weight"][cursor:] = before_weights, after_weights
         a["weight"][a["end"] > 0] = 1  # Jittered end targets beside the padding are positives.
+        if getattr(self.windows, "teacher", None) is not None:
+            a["teacher"] = self.windows.teacher.targets(a, bounds)
         return a, bounds
 
     def iter_windows(self):

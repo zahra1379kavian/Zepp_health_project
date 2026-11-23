@@ -57,6 +57,15 @@ def main(argv=None):
     sweep.add_argument("--stage", choices=["fit", "screen", "confirm", "all"], default="all")
     sweep.add_argument("--threads", type=int, default=2)
     sweep.add_argument("--device", default="cpu")
+    distill = sub.add_parser("distill", help="Train streaming students from a frozen complete-rep teacher for one fold")
+    distill.add_argument("--teacher-fold", type=Path, required=True, help="Teacher directory with data, model and validation decoder")
+    distill.add_argument("--ceiling-decision", type=Path, required=True, help="Passing step-3.1 comparison JSON")
+    distill.add_argument("--lookahead-ms", type=int, default=0, help="Fixed streaming student lookahead from step 3.2")
+    distill.add_argument("--rest-reviews", type=Path, help="Same reviewed rest file as the teacher")
+    distill.add_argument("--initial-student", type=Path, help="Initialize the full-teacher pass from a student distilled with the two-second teacher")
+    distill.add_argument("--output", type=Path, required=True)
+    distill.add_argument("--device", default="cpu")
+    distill.add_argument("--threads", type=int, default=2)
     ablation.add_argument("--folds", type=int, default=5)
     ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
     loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
@@ -136,6 +145,8 @@ def main(argv=None):
     run.add_argument("--references", type=Path, help="Validated full-rep references when preparing a new dataset")
     run.add_argument("--repetition-head", choices=["auto", "phase", "boundary", "complete"], default="auto")
     for command in (run, train, cv, loeo):
+        command.add_argument("--two-second-teacher", action="store_const", const=50, default=argparse.SUPPRESS,
+                             dest="future_limit_samples", help="With --acausal, cap future input at two seconds across all stages")
         command.add_argument("--acausal", action="store_true",
                              help="Train an offline teacher with past and future motion at each frame")
         command.add_argument("--synthetic-reps", action="store_true",
@@ -169,6 +180,9 @@ def main(argv=None):
     elif args.command == "compare-teacher":
         from .analyses.teacher import compare_teacher
         compare_teacher(args)
+    elif args.command == "distill":
+        from .distillation import run
+        run(args)
     elif args.command == "lookahead-sweep":
         from .analyses.lookahead import run
         run(args)
