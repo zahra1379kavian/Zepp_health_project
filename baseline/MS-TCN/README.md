@@ -205,6 +205,46 @@ and averages the six exercise scores equally. All four metrics use ±400 ms for
 both endpoints. `proceed_to_step_3_3` is true if first-rep recall gains at least
 0.15 or mean unseen F1 gains at least 0.05 over the streaming student.
 
+## Step 3.2 lookahead sweep
+
+The sweep reuses the selected step-2 student at 0 ms and trains students at
+160, 320, 480 and 640 ms on the same fold-1 training subjects. It copies the
+student's inputs and training settings and tunes each decoder on validation.
+The step-3.1 all-exercise teacher supplies the recall target. Its unseen-exercise
+results and its distillation decision are unnecessary for this sweep.
+
+From the workspace root, set `student_cv` to the selected step-2 all-exercise CV
+directory. For runs using the step-2 reviewed rest file, the command is
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+.venv/bin/python -m baseline.mstcn lookahead-sweep \
+  --student-cv "$student_cv" --teacher-cv "$runs/step_3_1/all_exercise_cv" \
+  --rest-reviews "$runs/complete_rep_review/reviewed.json" --output "$runs/step_3_2"
+```
+
+Omit `--rest-reviews` when the source models were trained without that file.
+Use `--stage fit` without `--teacher-cv` to train the four delayed students
+as soon as the selected step-2 fold-1 fit is available. Use `--stage screen`
+when the matching fold-1 teacher is available, then `--stage confirm` when
+the other four folds are ready. All stages reuse completed candidate fits
+from the same output directory.
+
+- **Selection.** `screen.json` reports first- and last-rep recall at ±400 ms for
+  each wait on fold-1 validation. For each position where the teacher improves
+  over 0 ms, a candidate must recover at least 80% of that improvement. A
+  position with zero or negative teacher gain has no improvement to recover.
+  The smallest qualifying wait wins. If no candidate qualifies, selection is null.
+- **Timing.** Delay runs from the labeled rep end to the time the decoder emits
+  a matched rep. It includes lookahead and decoder confirmation. The 95th
+  percentile must be strictly below 1000 ms. A candidate with no matched
+  reps has no measurable delay and cannot qualify. Timing uses sensor timestamps
+  and excludes hardware transport and processing time.
+- **Confirmation.** `confirmation.json` reports the locked wait against each
+  fold's 0-ms student and teacher on held-out test subjects. It gives per-fold
+  results and a pooled decision. Pooled recall uses total hits and labeled
+  reps, and pooled delay uses all individual matched-rep delays.
+
 ## Exactly what to run
 
 From the repository root, set up Python once:

@@ -49,6 +49,14 @@ def main(argv=None):
         teacher.add_argument(f"--{role}-cv", type=Path, required=True, help="Completed all-exercise CV directory")
         teacher.add_argument(f"--{role}-holdouts", type=Path, nargs="+", required=True, help="Paired holdout report files")
     teacher.add_argument("--output", type=Path, required=True)
+    sweep = sub.add_parser("lookahead-sweep", help="Select a fixed lookahead on fold-1 validation and confirm on five test folds")
+    sweep.add_argument("--student-cv", type=Path, required=True, help="Selected step-2 all-exercise CV directory")
+    sweep.add_argument("--teacher-cv", type=Path, help="Matching step-3.1 all-exercise CV directory for selection and confirmation")
+    sweep.add_argument("--rest-reviews", type=Path, help="Reviewed rest file used for the source fits")
+    sweep.add_argument("--output", type=Path, required=True)
+    sweep.add_argument("--stage", choices=["fit", "screen", "confirm", "all"], default="all")
+    sweep.add_argument("--threads", type=int, default=2)
+    sweep.add_argument("--device", default="cpu")
     ablation.add_argument("--folds", type=int, default=5)
     ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
     loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
@@ -161,6 +169,9 @@ def main(argv=None):
     elif args.command == "compare-teacher":
         from .analyses.teacher import compare_teacher
         compare_teacher(args)
+    elif args.command == "lookahead-sweep":
+        from .analyses.lookahead import run
+        run(args)
     elif args.command in ("compare-similarity", "compare-synthetic"):
         from .analyses.leave_one_exercise_out.study import compare_change
         compare_change(args, "synthetic" if args.command == "compare-synthetic" else "similarity")

@@ -36,6 +36,11 @@ def digest(path):
     return result.hexdigest()
 
 
+def fit_settings(args):
+    return {key: getattr(args, key) for key in ("batch_size", "window", "epochs", "learning_rate", "patience")} | {
+        "augment": getattr(args, "augment", False)}
+
+
 class Windows(Dataset):
     def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
                  lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False,
@@ -269,6 +274,7 @@ def train(args):
         if best is None or key > best:
             best, stale = key, 0
             checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
+                          "fit_settings": fit_settings(args),
                           "rest_reviews_sha256": digest(review_path) if review_path else None,
                           "normalization": manifest["normalization"], "classes": classes,
                           "features": manifest["features"] if mode == "original" else FEATURES[:6],
@@ -412,8 +418,14 @@ def decoder_config(path, checkpoint_path, default_tolerance=400, *, refine_end=F
 
 
 def evaluate(args):
-    root, out = Path(args.data), Path(args.output)
-    if out.exists():
+    report, _ = evaluate_streams(args, Path(args.output))
+    return report
+
+
+def evaluate_streams(args, out=None):
+    """Replay the chosen split and return its report and individual stream scores."""
+    root = Path(args.data)
+    if out is not None and out.exists():
         raise FileExistsError(f"Refusing to overwrite {out}")
     model, ckpt = load_checkpoint(args.checkpoint, args.device, root)
     model_config = ckpt.get("config", {})
@@ -433,7 +445,8 @@ def evaluate(args):
     tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), tolerance)
     manifest = json.loads((root / "manifest.json").read_text())
     metadata = {s["session"]: s for s in manifest["sessions"]}
-    out.mkdir(parents=True)
+    if out is not None:
+        out.mkdir(parents=True)
     records, sessions = [], []
     for name in manifest["split"][args.split]:
         arrays = load_arrays(root / name, include_phase=False)
@@ -480,14 +493,15 @@ def evaluate(args):
         if ckpt["station_only"]:
             result["repetitions"] = {"status": "station_only"}
         decoded["scored_repetitions"], decoded["unscored_repetitions"] = scored, unscored
-        write_json(out / f"{name}.json", {**decoded, "metrics": result, "scoring": record})
+        if out is not None:
+            write_json(out / f"{name}.json", {**decoded, "metrics": result, "scoring": record})
         records.append(record)
         sessions.append(result)
         print(f"Evaluated {name}", flush=True)
     report = {**grouped_stream_report(records, tolerances, tolerance, station_metrics),
               "split": args.split, "decoder_selection": selection, "timing_tolerance_ms": tolerance,
               "report_tolerances_ms": tolerances,
-              "report_scope": "fold_test" if "cross_validation" in manifest else "single_split_diagnostic",
+              "report_scope": f"fold_{args.split}" if "cross_validation" in manifest else "single_split_diagnostic",
               "reference_mode": manifest.get("reference_mode"),
               "reference_convention": manifest.get("reference_convention"),
               "phase_order_validated": manifest.get("phase_order_validated", False),
@@ -510,8 +524,9 @@ def evaluate(args):
                                  if station_metrics else ("Station output records presence." if binary_station else
                                                           "Phase NULL denotes frames outside a repetition."))),
               "excluded_sessions": manifest["excluded"]}
-    write_json(out / "report.json", report)
-    return report
+    if out is not None:
+        write_json(out / "report.json", report)
+    return report, records
 
 
 def rescore_evaluation(predictions, data):
@@ -905,8 +920,7 @@ def cross_validate(args):
         write_json(out / "folds.json", reports)
     result = {**grouped_stream_report(records, tolerances, args.tolerance_ms, named_stations), "folds": reports,
               "acausal": getattr(args, "acausal", False),
-              "fit_settings": {key: getattr(args, key) for key in
-                               ("batch_size", "window", "epochs", "learning_rate", "patience", "augment")},
+              "fit_settings": fit_settings(args),
               "report_scope": "subject_wise_cross_validation", "report_tolerances_ms": tolerances,
               "seed": args.seed, "timing_tolerance_ms": args.tolerance_ms,
               "protocol": "Subject-disjoint outer test folds; next fold validates; remaining folds train. Both wrists of a subject always stay together. Each subject tested exactly once. Normalization and loss weights refit on training subjects. Checkpoint and decoder selected only on validation at the primary tolerance; the same test predictions are scored at every reporting tolerance.",

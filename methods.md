@@ -122,6 +122,8 @@ Continue to 3.3 only if the teacher's first-rep recall beats the student's by at
 Run 0 / 160 / 320 / 480 / 640 ms on fold 1. Score first- and last-rep recall and the 95th-percentile delay from true end to report, which must stay under 1000 ms.
 Pick the smallest lookahead that captures at least 80% of the teacher's first/last-rep gain, then confirm it on 5 folds.
 
+**Implementation.** Screen on fold 1's validation subjects using the selected step-2 student and its matched step-3.1 teacher. Require 80% of each positive first- or last-rep recall gain separately and a measured 95th-percentile delay below 1000 ms. Freeze the smallest qualifying wait for all five test folds. If none qualifies, record that outcome. [Lookahead sweep and scoring](baseline/MS-TCN/README.md#step-32-lookahead-sweep)
+
 3.3 Distillation
 Loss:
 the usual label loss;
