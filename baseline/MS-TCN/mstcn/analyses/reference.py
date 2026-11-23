@@ -30,7 +30,8 @@ class WristModel:
         self.lag = self.model.config.lookahead_samples
         self.metadata = dict(checkpoint=str(path), checkpoint_sha256=digest(path),
                              decoder_sha256=digest(fold / "decoder.json"), head=self.head,
-                             features=ckpt["features"], start_rule=self.config.start_rule,
+                             features=ckpt["features"], model_features=ckpt.get("model_features", ckpt["features"]),
+                             rep_inputs=self.norm.get("rep_inputs", "original"), start_rule=self.config.start_rule,
                              refine_end=self.config.refine_end, model_lookahead_ms=self.lag * DT_MS,
                              decoder_confirmation_ms=self.config.confirmation_frames * DT_MS,
                              simulated_input_buffer_ms=0)

@@ -13,12 +13,14 @@ import torch
 
 from baseline.mstcn.__main__ import main
 from baseline.mstcn.analyses.common import make_view, exercise_predictions, waist_on_grid
+from baseline.mstcn.analyses.leave_one_exercise_out.study import select, summarize
 from baseline.mstcn.augmentation import augment
 from baseline.mstcn.constants import CLASSES, DT_MS, FEATURES
 from baseline.mstcn.data import load_arrays, prepare, subject_folds
 from baseline.mstcn.decode import decode_sequence
 from baseline.mstcn.demo import synthetic_source
 from baseline.mstcn.model import DenseMSTCN, ModelConfig
+from baseline.mstcn.orientation import gravity_features, rep_values, rotate_window
 from baseline.mstcn.runner import Windows, prediction_mask, probabilities, load_checkpoint
 
 
@@ -86,6 +88,38 @@ class LookaheadTests(unittest.TestCase):
 
 
 class AugmentationTests(unittest.TestCase):
+    def test_gravity_features_are_causal_rotation_invariant_and_reset_at_gaps(self):
+        rng = np.random.default_rng(3)
+        x = rng.normal(size=(180, 9)).astype(np.float32)
+        valid = np.ones(len(x), bool)
+        valid[91:96] = False
+        rotated = rotate_window(x[:, :6], rng)
+        features = rep_values(x, valid, "gravity")
+        np.testing.assert_allclose(rep_values(rotated, valid, "gravity"), features, atol=2e-6)
+        head, state = gravity_features(x[:40])
+        tail, _ = gravity_features(x[40:91], state)
+        np.testing.assert_array_equal(np.concatenate([head, tail]), features[:91])
+        changed = x.copy()
+        changed[:96] += 200
+        changed[:, 6:] -= 10
+        np.testing.assert_array_equal(rep_values(changed, valid, "gravity")[96:], features[96:])
+        static = np.tile([0., 0., 9.8, 2., 0., -3.], (50, 1))
+        expected = np.tile([9.8, 0., 0., np.sqrt(13), -3., 2.], (50, 1))
+        np.testing.assert_allclose(gravity_features(static)[0], expected, atol=1e-6)
+        self.assertTrue(np.isfinite(gravity_features(np.zeros((3, 6)))[0]).all())
+
+    def test_full_rotation_preserves_angles_and_does_not_favor_original_axis(self):
+        rng = np.random.default_rng(42)
+        window = np.tile([1., 0., 0., 0., 1., 0.], (10, 1))
+        samples = []
+        for _ in range(400):
+            x = rotate_window(window, rng)
+            np.testing.assert_array_equal(x[0], x[-1])
+            basis = x[0].reshape(2, 3)
+            np.testing.assert_allclose(basis @ basis.T, np.eye(2), atol=1e-6)
+            samples.append(basis[0])
+        np.testing.assert_allclose(np.mean(samples, axis=0), np.zeros(3), atol=.1)
+
     def test_warp_synchronizes_signals_labels_and_masks(self):
         x = np.arange(200, dtype=np.float32)[:, None]
         phase = np.repeat([0, 1, 2, 0], 50)
@@ -158,6 +192,26 @@ class AnalysisTests(unittest.TestCase):
             self.assertFalse((y[mask[0].bool()] == cls).any())
             self.assertFalse(valid[-13:].any())
 
+    def test_study_pools_subjects_then_averages_exercises_and_applies_all_gates(self):
+        def score(tp, missed):
+            return {"by_tolerance": {"400": dict(tp=tp, extra=0, missed=missed)},
+                    "guard_rails": dict(seen_f1_at_400=.7, crunch_f1_at_400=.2, certified_rest_hours=2,
+                                        false_reps_during_rest=4, first_rep_recall=dict(matched=1, total=4),
+                                        unseen_first_rep_recall=dict(matched=0, total=1))}
+        reports = [dict(subject_fold=1, results={"squat": score(10, 0), "push-up": score(0, 5)}),
+                   dict(subject_fold=2, results={"squat": score(0, 20), "push-up": score(0, 2)})]
+        summary = summarize(reports, ["squat", "push-up"], [1, 2])
+        self.assertEqual(summary["mean_unseen_f1_at_400"], .25)
+        self.assertEqual(summary["first_rep_recall"], .25)
+        self.assertEqual(summary["false_reps_per_rest_hour"], 2)
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            summarize(reports[:1], ["squat", "push-up"], [1, 2])
+        candidate = {**summary, "mean_unseen_f1_at_400": .31, "mean_seen_f1_at_400": .69,
+                     "false_reps_per_rest_hour": 2.3}
+        self.assertEqual(select({"original": summary, "gravity": candidate}), "gravity")
+        for k, v in (("mean_unseen_f1_at_400", .29), ("mean_seen_f1_at_400", .67), ("false_reps_per_rest_hour", 2.5)):
+            self.assertEqual(select({"original": summary, "gravity": {**candidate, k: v}}), "original")
+
     def test_waist_pair_control_uses_identical_coverage_and_wrist_labels(self):
         waist, control = self.root / "waist", self.root / "control"
         wm = make_view(self.data, waist, self.manifest, self.split, {}, sensor_set="acc_gyro", waist=True)
@@ -172,6 +226,77 @@ class AnalysisTests(unittest.TestCase):
             self.assertFalse(wa["valid"][110:120].any())
             self.assertEqual((waist / name / "references.json").read_bytes(),
                              (control / name / "references.json").read_bytes())
+
+    def test_paired_complete_inputs_checkpoint_decoder_and_raw_replay(self):
+        # Make six named exercise bouts in each wrist stream, including the selector
+        # and a seen crunch. Keep the original fixture for the legacy CLI tests.
+        source = self.root / "source"
+        for path in source.glob("*/label.csv"):
+            labels = pd.read_csv(path)
+            for col in ("left_wrist", "right_wrist"):
+                for i, e in enumerate(["squat", "pull-up", "crunch", "push-up", "rowing", "dips"]):
+                    a = 40 + i * 80
+                    labels.loc[a:a+19, col] = e + "_phase1"
+                    labels.loc[a+20:a+39, col] = e + "_phase2"
+            labels.to_csv(path, index=False)
+        data = self.root / "paired_data"
+        prepare(source, data, self.root / "alignment.csv")
+        for mode in ("rotated", "gravity"):
+            out = self.root / mode
+            main(["leave-one-exercise-out", "--data", str(data), "--output", str(out),
+                  "--folds", "3", "--exercises", "squat", "--repetition-head", "complete",
+                  "--rep-inputs", mode, "--epochs", "1", "--max-steps", "1", "--batch-size", "2",
+                  "--window", "128", "--stages", "1", "--layers", "2", "--channels", "4", "--threads", "1"])
+            fold = out / "squat"
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["mean_unseen_f1_at_400"], report["results"]["squat"]["segmentation"]["f1"])
+            self.assertIsNotNone(report["results"]["squat"]["guard_rails"]["crunch_f1_at_400"])
+            decoder = json.loads((fold / "decoder.json").read_text())
+            self.assertEqual(decoder["selection_exercise"], "pull-up")
+            model, ckpt = load_checkpoint(fold / "model/best.pt", data=fold / "data")
+            self.assertEqual(model.config.inputs, 6)
+            self.assertEqual(ckpt["normalization"]["rep_inputs"], mode)
+            n_validation_refs = 0
+            for split, names in ckpt["split"].items():
+                for name in names:
+                    arrays = load_arrays(fold / "data" / name)
+                    for e in ("squat", "pull-up"):
+                        retained = (arrays["valid"] & (arrays["y"] == CLASSES.index(e))).any()
+                        self.assertEqual(retained, split == "test" or (split == "validation" and e == "pull-up"))
+                    refs = json.loads((fold / "data" / name / "references.json").read_text())
+                    if split == "validation":
+                        n_validation_refs += sum(r["station"] == "pull-up" for r in refs)
+            history = json.loads((fold / "model/history.json").read_text())
+            score = history[0]["validation_segmentation"]
+            self.assertGreater(n_validation_refs, 0)
+            self.assertEqual(score["tp"] + score["missed"], n_validation_refs)
+            # Inference from the CSV and the evaluator's clip adapter use identical features.
+            from baseline.mstcn.analyses.reference import WristModel
+            path = next(source.glob("*/left_wrist.csv"))
+            raw = pd.read_csv(path)
+            raw.loc[40:, "sync_timestamp"] += DT_MS * 10
+            raw.to_csv(self.root / "input.csv", index=False)
+            main(["predict", "--checkpoint", str(fold / "model/best.pt"), "--decoder", str(fold / "decoder.json"),
+                  "--input", str(self.root / "input.csv"), "--output", str(out / "csv"), "--chunk", "7"])
+            frames = pd.read_csv(out / "csv/frames.csv")
+            prediction = WristModel(fold, "cpu").predict(raw.sync_timestamp.to_numpy(),
+                                                         raw[FEATURES].to_numpy(np.float32))
+            np.testing.assert_allclose(frames.end_probability, prediction.traces["end"], atol=2e-6)
+
+    def test_all_exercise_gravity_cross_validation_and_resume(self):
+        out = self.root / "all_cv"
+        command = ["cross-validate", "--data", str(self.data), "--output", str(out),
+                   "--folds", "3", "--repetition-head", "complete", "--rep-inputs", "gravity",
+                   "--epochs", "1", "--max-steps", "1", "--batch-size", "2", "--window", "128",
+                   "--stages", "1", "--layers", "2", "--channels", "4", "--threads", "1"]
+        main(command)
+        main(command + ["--resume-completed"])
+        for fold in out.glob("fold_*"):
+            manifest = json.loads((fold / "data/manifest.json").read_text())
+            self.assertTrue(all(manifest["train_class_counts"][CLASSES.index(e)] for e in ("squat", "push-up")))
+            model, ckpt = load_checkpoint(fold / "model/best.pt", data=fold / "data")
+            self.assertEqual(ckpt["normalization"], manifest["normalization"])
+            self.assertEqual(model.config.inputs, 6)
 
     def test_exercise_score_ignores_station_and_counts_crossing_false_positive(self):
         refs = [dict(station="squat", start_ms=400, end_ms=800)]

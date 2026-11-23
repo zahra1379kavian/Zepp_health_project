@@ -193,6 +193,14 @@ def repetition_metrics(predictions, references, tolerance_ms=400, require_statio
                if timeline is not None else {})}
 
 
+def exercise_predictions(predictions, references, t, coverage, tolerance):
+    """Score matches plus unmatched predictions overlapping a selected exercise bout."""
+    matched = {p for p, _ in match_repetitions(predictions, references, tolerance, require_station=False)}
+    intervals = [(int(t[a]), int(t[b-1] + DT_MS)) for a, b in runs(coverage)]
+    return [r for i, r in enumerate(predictions) if i in matched or
+            any(r["start_ms"] < b and r["end_ms"] > a for a, b in intervals)]
+
+
 def covered_repetitions(predictions, t, coverage, references=(), tolerance_ms=400,
                         require_station=True):
     """Match first; coverage can exclude only unmatched predictions.

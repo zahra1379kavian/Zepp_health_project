@@ -7,10 +7,10 @@ from pathlib import Path
 
 import numpy as np
 
-from ..constants import CLASSES, DT_MS, FEATURES
+from ..constants import CLASSES, FEATURES
 from ..data import (dense_phase_targets, load_arrays, load_sensor, phase_label_targets,
-                    runs, subject_folds, training_statistics, write_json)
-from ..metrics import ReferenceTimeline, aggregate_repetitions, count_rows, match_repetitions, repetition_metrics
+                    subject_folds, training_statistics, write_json)
+from ..metrics import ReferenceTimeline, aggregate_repetitions, count_rows, exercise_predictions, repetition_metrics
 from ..runner import digest, evaluate, train, tune
 
 
@@ -24,8 +24,9 @@ def pilot(args):
         raise ValueError("Analyses require version-4 wrist data with validated phase labels")
     if manifest["features"] != FEATURES or manifest.get("analysis"):
         raise ValueError("Start these analyses from the original nine-channel wrist dataset")
-    if args.station_only or args.repetition_head not in ("auto", "phase"):
-        raise ValueError("These analyses require dense phase1/phase2 targets")
+    allowed = ("auto", "phase", "complete") if args.command == "leave-one-exercise-out" else ("auto", "phase")
+    if args.station_only or args.repetition_head not in allowed:
+        raise ValueError(f"{args.command} requires a repetition head from {allowed}")
     splits = subject_folds(manifest["sessions"], args.folds, args.seed)
     if not 1 <= args.fold <= len(splits):
         raise ValueError("fold must be between 1 and folds")
@@ -56,12 +57,11 @@ def waist_on_grid(source, row, t):
 
 
 def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=False,
-              paired_control=False, held_out=None, source=None):
+              paired_control=False, held_out=None, source=None, selection_exercise=None, rep_inputs="original"):
     """Share immutable files; write changed arrays only inside a new experiment.
 
-    Held-out frames become gaps in train AND validation. Their original y/raw
-    labels are preserved. Thus neither loss, smoothing, normalization, context,
-    early stopping nor threshold tuning uses the held-out exercise.
+    Mask the test exercise in train and validation, and the selection exercise
+    in train. Rebuild targets and reset all context at each excluded span.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=False)
@@ -77,6 +77,7 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
                                 "wrist signals; matched waist availability" if paired_control else
                                 manifest["wrist_selection"])
     masked_names = set(split["train"] + split["validation"])
+    training_names = set(split["train"])
     audit = []
     cached_waist = None
     for row in view["sessions"]:
@@ -101,6 +102,10 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
         if held_out and name in masked_names:
             removed = arrays["y"] == CLASSES.index(held_out)
             valid &= ~removed
+        selection_removed = np.zeros(len(valid), bool)
+        if selection_exercise and name in training_names:
+            selection_removed = arrays["y"] == CLASSES.index(selection_exercise)
+            valid &= ~selection_removed
         target = dest / name
         target.mkdir()
         refs = json.loads((original / "references.json").read_text())
@@ -121,18 +126,19 @@ def make_view(root, dest, manifest, split, analysis, sensor_set="all", waist=Fal
                    reference_samples=int(updates.get("coverage", arrays["coverage"]).sum()))
         audit.append({"session": name, "split": next(k for k, names in split.items() if name in names),
                       "held_out_masked_frames": int((removed & arrays["valid"]).sum()),
+                      "selection_exercise_masked_frames": int((selection_removed & arrays["valid"]).sum()),
                       "waist_unavailable_frames": int((arrays["valid"] & ~waist_available).sum())
                       if waist_available is not None else 0,
                       "waist_sensor": waist_info,
                       "eligible_frames": int(valid.sum()), "reference_repetitions": len(refs)})
-    view.update(training_statistics(dest, split["train"]))
+    view.update(training_statistics(dest, split["train"], rep_inputs=rep_inputs))
     write_json(dest / "mask_audit.json", audit)
     write_json(dest / "manifest.json", view)
     return view
 
 
 def fit_and_score(args, folder, report_scope="single_fold_analysis_pilot", **overrides):
-    params = {**vars(args), **overrides, "repetition_head": "phase",
+    params = {**vars(args), "repetition_head": "phase", **overrides,
               "data": folder / "data", "output": folder / "model"}
     checkpoint = train(Namespace(**params))
     params.update(checkpoint=checkpoint, output=folder / "decoder.json")
@@ -144,28 +150,18 @@ def fit_and_score(args, folder, report_scope="single_fold_analysis_pilot", **ove
     return report
 
 
-def exercise_predictions(predictions, references, t, coverage, tolerance):
-    """Keep matches and every unmatched prediction overlapping scored coverage.
-
-    Do not filter by predicted station: a wrong or unknown station still counts,
-    and an overlong cycle crossing the exercise boundary cannot hide an extra.
-    """
-    matched = {p for p, _ in match_repetitions(predictions, references, tolerance, require_station=False)}
-    intervals = [(int(t[a]), int(t[b-1] + DT_MS)) for a, b in runs(coverage)]
-    return [r for i, r in enumerate(predictions) if i in matched or
-            any(r["start_ms"] < b and r["end_ms"] > a for a, b in intervals)]
-
-
 def score_exercise(data, predictions, exercise, tolerances, primary):
     """Use exercise labels only after full-session inference and decoding."""
     manifest = json.loads((Path(data) / "manifest.json").read_text())
     metadata = {row["session"]: row for row in manifest["sessions"]}
     records = []
+    exercises = [exercise] if isinstance(exercise, str) else exercise
+    class_ids = [CLASSES.index(e) for e in exercises]
     for name in manifest["split"]["test"]:
         a = load_arrays(Path(data) / name)
-        coverage = a["coverage"] & a["valid"] & (a["y"] == CLASSES.index(exercise))
+        coverage = a["coverage"] & a["valid"] & np.isin(a["y"], class_ids)
         all_refs = json.loads((Path(data) / name / "references.json").read_text())
-        refs = [r for r in all_refs if r["station"] == exercise]
+        refs = [r for r in all_refs if r["station"] in exercises]
         if not coverage.any() and not refs:
             continue
         reps = json.loads((Path(predictions) / f"{name}.json").read_text())["repetitions"]

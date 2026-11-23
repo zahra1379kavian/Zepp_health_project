@@ -52,20 +52,19 @@ All four variants have the requested error breakdown. The end-time experiment re
 ## Step 2 — Make the rep detector work for any exercise
 2.0 Set up the evaluation first (no new model yet)
 Let the leave-one-exercise-out analysis accept --repetition-head complete. It currently has phase_only=True hard-coded in analyses/leave_one_exercise_out/__init__.py.
-Test with exercises that score well when seen, one or more per movement group. Choose checkpoints using a second held-out exercise (E′) from a different group. This is the "leave-one-domain-out" selection rule from Gulrajani & Lopez-Paz (ICLR 2021).
+Test with exercises that score well when seen, one or more per movement group. Use a second held-out exercise (E′) from a different group to select the checkpoint and decoder on validation subjects.
 Test exercise	Selection exercise E′ (also removed from training)
 biceps_curls	bench_press
 lat_pulldown	lunges
 push-up	rowing
-overhead_press	deadlift
+overhead_press_(ohp)	deadlift
 squat	pull-up
 hip_thrust	dips
-Main metric: average F1@400 over the unseen exercises.
+Average F1@400 over the unseen exercises. For the main result, train the selected variant on all exercises within each training fold and compare its pooled TP%, FN% and FP% with the phase baseline. [Reference wrist benchmark](#reference-wrist-benchmark)
 Guard rails: F1 on seen exercises, crunch F1 (seen), false reps per rest hour, and first-rep recall.
 Screen variants cheaply: use subject fold 1 and biceps / push-up / squat, which already have baselines (0.01 / 0.49 / 0.40). Confirm the winner on all 6 exercises and at least 2 subject folds.
 Free diagnostic first: re-score the existing biceps-curl leave-one-out model across a range of decoder thresholds. This is a diagnostic only; never report it as a result.
-If F1 jumps, the collapse is mostly a threshold problem, and selecting on E′ fixes it.
-If F1 stays near zero, the model's learned features are the problem.
+If F1 rises, check whether a threshold selected on E′ transfers. If it stays near zero, inspect the missed reps and endpoint errors.
 
 2.1 Make the rep inputs independent of wrist orientation
 Estimate the gravity direction causally: low-pass the accelerometer at about 0.3 Hz and normalize it.

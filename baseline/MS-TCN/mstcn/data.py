@@ -403,17 +403,18 @@ def load_arrays(path, include_phase=True):
     return arrays
 
 
-def training_statistics(root, sessions, include_phase=True, classes=CLASSES):
+def training_statistics(root, sessions, include_phase=True, classes=CLASSES, rep_inputs="original"):
     """Fit normalization and all loss weights on this fold's training subjects."""
     if not sessions:
         raise ValueError("No training sessions")
-    dimensions = load_arrays(Path(root) / sessions[0], include_phase)["x"].shape[1]
+    from .orientation import rep_values
+    dimensions = load_arrays(Path(root) / sessions[0], include_phase)["x"].shape[1] if rep_inputs == "original" else 6
     sums, squares, count = np.zeros(dimensions), np.zeros(dimensions), 0
     class_counts, phase_counts = np.zeros(len(classes), np.int64), np.zeros(3, np.int64)
     boundary_positives, boundary_frames = np.zeros(2), 0
     for name in sessions:
         arrays = load_arrays(Path(root) / name, include_phase)
-        selected = arrays["x"][arrays["valid"]].astype(np.float64)
+        selected = rep_values(arrays["x"], arrays["valid"], rep_inputs)[arrays["valid"]].astype(np.float64)
         sums += selected.sum(0)
         squares += (selected ** 2).sum(0)
         count += len(selected)
@@ -427,6 +428,13 @@ def training_statistics(root, sessions, include_phase=True, classes=CLASSES):
         raise ValueError("No eligible training samples")
     mean = sums / count
     std = np.sqrt(np.maximum(squares / count - mean ** 2, 1e-8))
-    return {"normalization": {"mean": mean.tolist(), "std": std.tolist(), "fit_samples": count},
+    if rep_inputs == "rotated":
+        # Expected moments after uniform SO(3) augmentation. Use one scale per triad.
+        mean = np.zeros(6)
+        std = np.repeat(np.sqrt(np.maximum(squares.reshape(2, 3).sum(1) / (3 * count), 1e-8)), 3)
+    normalization = {"mean": mean.tolist(), "std": std.tolist(), "fit_samples": count}
+    if rep_inputs != "original":
+        normalization["rep_inputs"] = rep_inputs
+    return {"normalization": normalization,
             "train_class_counts": class_counts.tolist(), "train_phase_counts": phase_counts.tolist(),
             "train_boundary_positives": boundary_positives.tolist(), "train_boundary_frames": boundary_frames}

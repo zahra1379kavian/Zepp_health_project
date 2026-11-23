@@ -20,11 +20,12 @@ from .data import (WRIST_LOCATIONS, load_arrays, load_sensor, runs, write_json,
                    subject_folds, training_statistics)
 from .decode import DecoderConfig, RepDecoder, decode_sequence, group_sets
 from .metrics import (aggregate_repetitions, classification_metrics, confusion_matrix,
-                      count_rows, covered_repetitions, false_exercise_events, repetition_metrics,
+                      count_rows, covered_repetitions, exercise_predictions, false_exercise_events, repetition_metrics,
                       report_delay_percentiles, reporting_tolerances, score_stream, aggregate_streams,
                       grouped_stream_report)
 from .model import DenseMSTCN, ModelConfig, configuration, dense_loss
 from .augmentation import augment
+from .orientation import gravity_features, model_feature_names, rep_values, rotate_window
 
 
 def digest(path):
@@ -37,10 +38,14 @@ def digest(path):
 
 class Windows(Dataset):
     def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
-                 lookahead=0, augmentation=False, features=None, reviews=()):
+                 lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name, include_phase=repetition_head == "phase") for name in sessions]
+        self.rep_inputs = norm.get("rep_inputs", "original")
+        self.rotate_training_windows = rotate_training_windows
+        for arrays in self.arrays:
+            arrays["x"] = rep_values(arrays["x"], arrays["valid"], self.rep_inputs)
         if repetition_head == "complete":
             for name, arrays in zip(sessions, self.arrays):
                 reps = json.loads((Path(root) / name / "references.json").read_text())
@@ -72,6 +77,8 @@ class Windows(Dataset):
         values = {key: np.array(arrays[key][left:right], copy=True)
                   for key in ("y", "boundary", "coverage", "phase", "phase_mask") if key in arrays}
         raw_x = arrays["x"][left:right]
+        if self.rep_inputs == "rotated" and self.rotate_training_windows:
+            raw_x = rotate_window(raw_x)
         if self.augmentation:
             raw_x, values = augment(raw_x, values, self.features)
         x = np.zeros((length, len(self.mean)), np.float32)
@@ -129,6 +136,15 @@ def train(args):
     phase_only = getattr(args, "phase_only", False)
     if head == "auto":
         head = default_head(manifest, args.station_only)
+    mode = getattr(args, "rep_inputs", "original")
+    if mode != "original":
+        if (manifest["features"] not in (FEATURES, FEATURES[:6]) or args.station_only
+                or head not in ("phase", "complete") or getattr(args, "augment", False)):
+            raise ValueError("Step 2 inputs require a wrist phase or complete rep head with no time warp")
+        phase_only = head == "phase"
+    if manifest["normalization"].get("rep_inputs", "original") != mode:
+        manifest.update(training_statistics(root, manifest["split"]["train"], rep_inputs=mode,
+                                            include_phase=head == "phase", classes=manifest["classes"]))
     if phase_only and (args.station_only or head != "phase"):
         raise ValueError("Phase-only training requires dense phases and cannot be station-only")
     if head == "phase" and not manifest.get("phase_order_validated"):
@@ -146,14 +162,14 @@ def train(args):
         raise ValueError(f"Review file contains unknown streams: {sorted(unknown_streams)}")
     binary_station = complete or manifest.get("reference_mode") == "endpoints"
     classes = STATION_STATES if binary_station else ([] if phase_only else CLASSES)
-    config = ModelConfig(inputs=len(manifest["features"]), classes=len(classes), stages=args.stages, layers=args.layers,
+    config = ModelConfig(inputs=len(manifest["normalization"]["mean"]), classes=len(classes), stages=args.stages, layers=args.layers,
                          channels=args.channels, repetition_head=head,
                          lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)))
     model = DenseMSTCN(config).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
                                model.history_samples, args.window, head, config.lookahead_samples,
                                split == "train" and getattr(args, "augment", False), manifest["features"],
-                               reviews if split == "train" else ())
+                               reviews if split == "train" else (), rotate_training_windows=split == "train")
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
@@ -231,7 +247,9 @@ def train(args):
             best, stale = key, 0
             checkpoint = {"version": 2, "model": model.state_dict(), "config": configuration(model),
                           "rest_reviews_sha256": digest(review_path) if review_path else None,
-                          "normalization": manifest["normalization"], "classes": classes, "features": manifest["features"],
+                          "normalization": manifest["normalization"], "classes": classes,
+                          "features": manifest["features"] if mode == "original" else FEATURES[:6],
+                          "model_features": model_feature_names(mode, manifest["features"]),
                           "augmentation": getattr(args, "augment", False),
                           "analysis": manifest.get("analysis"),
                           "location": manifest["location"], "station_only": args.station_only,
@@ -278,6 +296,7 @@ def load_checkpoint(path, device="cpu", data=None):
 @torch.no_grad()
 def probabilities(model, x, valid, norm, device="cpu", chunk=512):
     """Offline replay of exact causal outputs, resetting all caches at each gap."""
+    x = rep_values(x, valid, norm.get("rep_inputs", "original"))
     p = np.zeros((len(x), model.config.classes), np.float32) if model.config.classes else None
     q = np.zeros((len(x), model.config.replay_columns), np.float32)
     mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
@@ -311,15 +330,23 @@ def checkpoint_key(summary):
 def validation_cache(model, root, manifest, device):
     cache = []
     model.eval()
+    selection = (manifest.get("analysis") or {}).get("selection_exercise")
     for name in manifest["split"]["validation"]:
         a = load_arrays(Path(root) / name, include_phase=False)
+        if selection:
+            a["coverage"] = a["coverage"] & (a["y"] == CLASSES.index(selection))
+            a["selection_exercise"] = selection
         if not a["coverage"].any():
             continue
         p, q = probabilities(model, a["x"], a["valid"], manifest["normalization"], device)
         a["valid"] = prediction_mask(a["valid"], model.config.lookahead_samples)
         a["lookahead_ms"] = model.config.lookahead_samples * DT_MS
         refs = json.loads((Path(root) / name / "references.json").read_text())
+        if selection:
+            refs = [r for r in refs if r["station"] == selection]
         cache.append((name, a, p, q, refs))
+    if selection and not any(refs for *_, refs in cache):
+        raise ValueError(f"No validation reference repetitions for selection exercise {selection}")
     return cache
 
 
@@ -328,8 +355,11 @@ def score_cache(cache, config, tolerance, require_station=True):
     for name, a, p, q, refs in cache:
         result = decode_sequence(a["t"], p, q, a["valid"], config,
                                  lookahead_ms=a.get("lookahead_ms", 0))
-        scored, _ = covered_repetitions(result["repetitions"], a["t"], a["coverage"],
-                                        refs, tolerance, require_station)
+        if a.get("selection_exercise"):
+            scored = exercise_predictions(result["repetitions"], refs, a["t"], a["coverage"], tolerance)
+        else:
+            scored, _ = covered_repetitions(result["repetitions"], a["t"], a["coverage"],
+                                            refs, tolerance, require_station)
         scores.append(repetition_metrics(scored, refs, tolerance, require_station))
         rows.extend(count_rows(scored, refs, name, require_station))
     return aggregate_repetitions(scores, rows)
@@ -520,6 +550,7 @@ def tune(args):
     if ckpt["station_only"]:
         raise ValueError("A station-only checkpoint cannot tune repetition boundaries")
     manifest = json.loads((root / "manifest.json").read_text())
+    manifest["normalization"] = ckpt["normalization"]
     cache = validation_cache(model, root, manifest, args.device)
     if not cache or not sum(len(c[-1]) for c in cache):
         raise ValueError("No validated validation repetitions available for threshold selection")
@@ -547,6 +578,7 @@ def tune(args):
     if station_metrics:
         selection_rule += ", then station-labelled F1"
     result = {"selected_on": "validation", "checkpoint_sha256": digest(args.checkpoint),
+              "selection_exercise": (manifest.get("analysis") or {}).get("selection_exercise"),
               "sessions": ckpt["split"]["validation"], "tolerance_ms": args.tolerance_ms,
               "selection_rule": selection_rule + "; fixed tolerance",
               "config": asdict(best_config), "trials": trials}
@@ -589,7 +621,7 @@ def predict(args):
     elif getattr(args, "waist_input", None):
         raise ValueError("--waist-input requires a paired wrist+waist checkpoint")
     norm = ckpt["normalization"]
-    x = (x - np.array(norm["mean"], np.float32)) / np.array(norm["std"], np.float32)
+    mean, std = np.array(norm["mean"], np.float32), np.array(norm["std"], np.float32)
     out.mkdir(parents=True)
     decoder, repetitions, latencies = RepDecoder(config), [], []
     all_p = np.zeros((len(t), model.config.classes), np.float32) if model.config.classes else None
@@ -601,13 +633,17 @@ def predict(args):
     with (out / "events.jsonl").open("w") as event_file:
         for a, b in zip(edges[:-1], edges[1:]):
             state = None
+            gravity = None
             decoder.reset()
             for left in range(a, b, args.chunk):
                 right = min(b, left + args.chunk)
-                features = torch.tensor(x[left:right].T[None], device=args.device)
                 if str(args.device).startswith("cuda"):
                     torch.cuda.synchronize()
                 started = time.perf_counter()
+                values = x[left:right]
+                if norm.get("rep_inputs") == "gravity":
+                    values, gravity = gravity_features(values, gravity)
+                features = torch.tensor(((values - mean) / std).T[None], device=args.device)
                 station, boundary, state = model.stream(features, state)
                 p = station.softmax(1)[0].T.cpu().numpy() if station is not None else None
                 q = model.repetition_probabilities(boundary)[0].T.cpu().numpy()
@@ -700,7 +736,8 @@ def run_pipeline(args):
               "--seed", str(args.seed), "--output", str(root),
               *(["--references", str(args.references)] if getattr(args, "references", None) else [])])
     common = ["--device", args.device, "--threads", str(args.threads)]
-    common.extend(["--repetition-head", getattr(args, "repetition_head", "auto")])
+    common.extend(["--repetition-head", getattr(args, "repetition_head", "auto"),
+                   "--rep-inputs", getattr(args, "rep_inputs", "original")])
     if getattr(args, "rest_reviews", None):
         common.extend(["--rest-reviews", str(args.rest_reviews)])
     main(["cross-validate", "--data", str(root), "--output", str(out / "cross_validation"),
@@ -778,14 +815,16 @@ def cross_validate(args):
     splits = subject_folds(manifest["sessions"], args.folds, args.seed)
     reports, records = [], []
     complete = (default_head(manifest) if args.repetition_head == "auto" else args.repetition_head) == "complete"
-    named_stations = not complete and manifest.get("reference_mode") != "endpoints"
+    mode = getattr(args, "rep_inputs", "original")
+    named_stations = not complete and manifest.get("reference_mode") != "endpoints" and mode == "original"
     for index, split in enumerate(splits):
         fold = out / f"fold_{index + 1}"
         data = fold / "data"
         fold_manifest = {**manifest, "split": split, "seed": args.seed,
                          "cross_validation": {"fold": index + 1, "folds": args.folds}}
-        fold_manifest.update(training_statistics(root, split["train"], include_phase=named_stations,
-                                                 classes=manifest["classes"]))
+        fold_manifest.update(training_statistics(root, split["train"], include_phase=named_stations or
+                                                 (mode != "original" and not complete),
+                                                 classes=manifest["classes"], rep_inputs=mode))
         if fold.exists():
             if not resume_completed:
                 raise FileExistsError(fold)

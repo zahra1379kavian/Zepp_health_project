@@ -30,7 +30,12 @@ def main(argv=None):
     train = sub.add_parser("train", help="Train both heads, or an explicit station-only diagnostic")
     cv = sub.add_parser("cross-validate", help="Subject-wise folds with separate validation and pooled held-out scores")
     ablation = sub.add_parser("sensor-ablation", help="One-fold lookahead, inertial augmentation and waist comparisons")
-    loeo = sub.add_parser("leave-one-exercise-out", help="Train and score a phase-only model per held-out exercise")
+    loeo = sub.add_parser("leave-one-exercise-out", help="Train and score a repetition model per held-out exercise")
+    diagnostic = sub.add_parser("biceps-diagnostic", help="Inspect threshold sensitivity of the frozen biceps phase holdout")
+    diagnostic.add_argument("--run-dir", type=Path, required=True, help="Existing biceps_curls holdout folder")
+    diagnostic.add_argument("--output", type=Path, required=True, help="Diagnostic JSON, separate from scored results")
+    diagnostic.add_argument("--threads", type=int, default=2)
+    diagnostic.add_argument("--device", default="cpu")
     ablation.add_argument("--folds", type=int, default=5)
     ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
     loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
@@ -42,8 +47,9 @@ def main(argv=None):
                                                            "combined", "combined_paired_wrist", "combined_waist"],
                           choices=["baseline", "lookahead", "acc_gyro", "augmentation", "combined",
                                    "combined_paired_wrist", "combined_waist"])
-    loeo.add_argument("--exercises", nargs="+", default=["leg_raise", "squat", "push-up", "biceps_curls", "crunch"],
-                     help="One fold per listed exercise; default is five exercises. Use 'all' for all dynamic exercises.")
+    loeo.add_argument("--exercises", nargs="+", help="Exercise names, 'screen' (three), or 'confirm' (six). Legacy also accepts 'all'.")
+    loeo.add_argument("--protocol", choices=["paired", "legacy"],
+                      help="Complete heads, step 2 inputs and screen/confirm presets default to paired validation")
     train.add_argument("--phase-only", action="store_true",
                        help="Train a repetition model on phase targets without an exercise classification head")
     cv.add_argument("--folds", type=int, default=5)
@@ -53,7 +59,7 @@ def main(argv=None):
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--station-only", action="store_true")
-        heads = ["auto", "phase", "boundary", "complete"] if command in (train, cv) else ["auto", "phase", "boundary"]
+        heads = ["auto", "phase", "boundary", "complete"] if command in (train, cv, loeo) else ["auto", "phase", "boundary"]
         command.add_argument("--repetition-head", choices=heads, default="auto")
         command.add_argument("--epochs", type=int, default=30)
         command.add_argument("--batch-size", type=int, default=8)
@@ -108,8 +114,10 @@ def main(argv=None):
     run.add_argument("--data", type=Path, help="Reuse a prepared wrist dataset instead of preparing it again")
     run.add_argument("--references", type=Path, help="Validated full-rep references when preparing a new dataset")
     run.add_argument("--repetition-head", choices=["auto", "phase", "boundary", "complete"], default="auto")
-    for command in (run, train, cv):
+    for command in (run, train, cv, loeo):
         command.add_argument("--rest-reviews", type=Path, help="Complete mode: reviewed mine-rest JSON")
+        command.add_argument("--rep-inputs", choices=["original", "gravity", "rotated"], default="original",
+                             help="Existing sensors, six gravity features, or acc+gyro with uniform training rotations")
     run.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     run.add_argument("--alignment", type=Path, default=Path("strength_training/data_demographics/tables/log_clock_alignment.csv"))
     run.add_argument("--location", choices=["wrist", "left_wrist", "right_wrist"], default="wrist")
@@ -131,6 +139,9 @@ def main(argv=None):
     if args.command == "reference-benchmark":
         from .analyses.reference import benchmark
         benchmark(args)
+    elif args.command == "biceps-diagnostic":
+        from .analyses.leave_one_exercise_out.diagnostic import run
+        run(args)
     elif args.command == "prepare":
         from .data import prepare as prepare_dataset
         result = prepare_dataset(args.source, args.output, args.alignment, args.location,
