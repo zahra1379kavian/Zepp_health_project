@@ -142,7 +142,22 @@ Each fold applies review decisions only to its training streams.
 
 ## Additional analyses
 
-Two independent analyses are implemented in separate folders:
+### Wrist-first phase fusion
+
+Run the three-way online comparison from the workspace root. Choose a fresh output directory.
+
+```bash
+.venv/bin/python -Bu -m baseline.mstcn.analyses.wrist_gate \
+  --output baseline/MS-TCN/experiment_runs/wrist_first_gate
+```
+
+The default runs fold 5 first and then folds 1–4. Use `--folds 5` for a single-fold run. The analysis loads the wrist checkpoints from `wrist_cross_validation`, the synchronized accelerometer and gyroscope arrays from the sensor ablation, and the saved Feishu phase benchmark's subject and clip assignments.
+
+The wrist baseline supplies phase and station probabilities. A small network learns an additive correction to the wrist log phase probabilities using wrist and waist motion. A second network learns a weight between zero and one for mixing the corrected probabilities with the original wrist probabilities. Its inputs include both phase distributions and both sensors' motion over trailing windows of 1, 5, 15 and 40 samples. All three arms use the original fold's station scores and decoder. At missing waist timestamps, each arm uses the wrist phase probabilities. All heads run with zero model lookahead.
+
+The fused path trains on the fold's training participants. The gate fits on a subset of the validation participants. The remaining validation participants select epochs by phase loss. Each fold saves these assignments in `fit.json` and the fitted heads and normalization in `heads.pt`. The test scorer uses identical release clips for all arms. Each fold writes `comparison.csv`, per-arm online tables and delay summaries, and `clips.csv` with waist availability, mean gate weight, and reps recovered or lost relative to wrist only. `coverage.json` records the number of wrist replays whose event intervals differ from the archived benchmark. The five-fold run also writes pooled results under `all_five_folds/`.
+
+### Sensor ablations and exercise holdouts
 
 - [Sensor and model ablations](mstcn/analyses/sensor_ablation/README.md): baseline,
   520 ms lookahead, accelerometer + gyroscope, training augmentation, their
