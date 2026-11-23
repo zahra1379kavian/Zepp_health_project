@@ -122,3 +122,20 @@ def clip_signature(t, y):
     h = hashlib.sha256(t.astype("<i8", copy=False).tobytes())
     h.update(y.astype("u1", copy=False).tobytes())
     return h.hexdigest()
+
+
+def input_provenance(raw, sessions):
+    """Fingerprint raw inputs and the release code separately from model weights."""
+    files = []
+    for session in sorted(sessions):
+        folder = Path(raw) / session
+        files.extend([folder / "label.csv", *sorted(folder.glob("*wrist.csv"))])
+    fingerprint = hashlib.sha256()
+    for path in files:
+        with path.open("rb") as f:
+            hashed = hashlib.file_digest(f, "sha256").hexdigest()
+        fingerprint.update(f"{path.relative_to(raw)}:{hashed}\n".encode())
+    ref_files = ("splits.json", "src/data/dataset.py", "src/data/utils.py",
+                 "src/utils/rep.py", "src/utils/plot.py")
+    return dict(raw_inputs_sha256=fingerprint.hexdigest(), reference_sha256={
+        name: hashlib.sha256((REFERENCE / name).read_bytes()).hexdigest() for name in ref_files})

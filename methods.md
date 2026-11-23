@@ -1,5 +1,19 @@
 # Activity-agnostic rep detection from wrist motion
 
+## Reference wrist benchmark
+
+The August 31 Feishu activity-agnostic wrist release is the comparison for the 14-exercise benchmark. Run each model through the [shared evaluation API](baseline/MS-TCN/README.md#compare-with-the-feishu-wrist-release). Reuse the sensor-only test clips, frozen subject-fold checkpoints, release rep extractor, overlap matcher and KPI denominators. The existing endpoint-tolerance F1 experiments below answer a separate timing question.
+
+| Five folds pooled | Labeled reps | TP % | FN % | FP % |
+| --- | ---: | ---: | ---: | ---: |
+| Published reference, p. 7 | 41,363 | 92.7 | 7.3 | 4.4 |
+| MS-TCN phase | 41,345 | 83.6 | 16.4 | 5.6 |
+| MS-TCN boundary | 41,345 | 78.4 | 21.6 | 10.4 |
+| MS-TCN complete rep | 41,345 | 69.4 | 30.6 | 1.5 |
+| MS-TCN previous end | 41,345 | 85.1 | 14.9 | 82.1 |
+
+All 51 available sessions were checked. The release crop rule yielded 1,086 clips from 47 sessions and 83 wrist streams. Four available sessions contained no eligible wrist exercise clips. The local runs share identical clips and fold assignments. The released weights were unavailable, so the reference row uses the published figures. The local fifth fold and the published final fold are identified separately in the report. [Combined report](baseline/MS-TCN/experiment_runs/feishu_wrist_rep_comparison/all_models_summary/wrist_model_comparison.pdf) · [Per-exercise results](baseline/MS-TCN/experiment_runs/feishu_wrist_rep_comparison/all_models_summary/model_comparison.csv) · [Loader and scorer verification](baseline/MS-TCN/experiment_runs/feishu_wrist_rep_comparison/verification.json)
+
 ## Step 1 — Finish the complete-rep model and break down its errors
 
 The complete-rep and boundary runs finished all five folds with seed 42 and identical subject splits.

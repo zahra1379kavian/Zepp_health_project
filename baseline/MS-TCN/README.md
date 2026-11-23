@@ -2,13 +2,24 @@
 
 ## Compare with the Feishu wrist release
 
+Open the [all-model comparison PDF](experiment_runs/feishu_wrist_rep_comparison/all_models_summary/wrist_model_comparison.pdf) for the overview. For the phase model, open the [overall chart](experiment_runs/feishu_wrist_rep_comparison/phase_sequence_model/all_five_folds/test_metrics.png), the [per-exercise table](experiment_runs/feishu_wrist_rep_comparison/phase_sequence_model/all_five_folds/table_results.png), or the [prediction examples](experiment_runs/feishu_wrist_rep_comparison/phase_sequence_model/all_five_folds/prediction_examples).
+
+Under `experiment_runs/feishu_wrist_rep_comparison/`, the four run folders identify how each model finds a rep.
+
+| Folder | Method |
+| --- | --- |
+| `phase_sequence_model/` | Pairs predicted movement phases |
+| `start_end_boundary_model/` | Detects rep starts and ends |
+| `rep_end_with_learned_start/` | Detects each end and selects its start with a learned model |
+| `previous_rep_end_as_start/` | Uses the preceding detected end as the next start |
+
 The [shared benchmark](../rep_benchmark/evaluate.py) replays each fold's frozen checkpoint on the release's wrist clips. From the project root, install the existing MS-TCN requirements and run:
 
 ```bash
 runs=baseline/MS-TCN/experiment_runs
 python -m baseline.mstcn reference-benchmark \
   --run-dir "$runs/wrist_cross_validation/cross_validation" \
-  --model-name "MS-TCN phase" --output "$runs/reference_benchmark/phase"
+  --model-name "MS-TCN phase" --output "$runs/feishu_wrist_rep_comparison/phase_sequence_model"
 ```
 
 Use a fresh output directory for a new run. The [MS-TCN adapter](mstcn/analyses/reference.py) also accepts boundary and complete-rep checkpoints. Use `--start-rule previous_end` for the previous-end decoder. Weights, normalization and validation-selected thresholds come from the individual folds.
@@ -25,7 +36,7 @@ prediction = Prediction([{"start": 20, "end": 68, "reported_at": 70}])
 
 `reported_at` is optional for offline models. Supply the model's actual emission time for online comparisons. Optional `traces` maps probability names to one value per frame for prediction figures. The MS-TCN adapter replays its causal network plus configured lookahead and decoder confirmation, resetting on timestamp gaps. Reported delay measures emission relative to the labeled end on the 25 Hz replay clock. The reference runner uses a 10 s window, 2 s stride and 1 s front context. The published wrist KPI table gives no measured end-to-end delay.
 
-**Outputs.** `intervals.jsonl` records the labeled intervals, predictions and clip signatures. `test_metrics_detailed.csv` has one row per session, wrist and exercise. `pooled/` and `fold_5/` contain the PDF-style tables, release-code figures, count/duration errors, matched reporting delays and published comparison columns. Example figures show the best and worst clip F1 for push-up, deadlift and leg raise, with a 30 s excerpt selected for matched or missed/extra reps. Re-render a saved run with `python -m baseline.rep_benchmark.report RUN`.
+**Outputs.** `intervals.jsonl` records the labeled intervals, predictions and clip signatures. `test_metrics_detailed.csv` has one row per session, wrist and exercise. `all_five_folds/` and `local_fold_5_only/` contain the PDF-style tables, release-code figures, count/duration errors, matched reporting delays and published comparison columns. Within each, `per_exercise_results/` holds the exercise-specific charts and tables. Figures in `prediction_examples/` show the best and worst clip F1 for push-up, deadlift and leg raise, with a 30 s excerpt selected for matched or missed/extra reps. Re-render a saved run with `python -m baseline.rep_benchmark.report RUN`.
 
 **Cohort.** The release manifest contains 53 sessions. Only `20260529_DQTQDQTQ` and `20260529_JCLQJCLQ` are missing locally. Keep the 43 original MS-TCN held-out subject assignments and use the release fold number for previously unused subjects. The reference's activity labels determine the scored clips, including the five-second margins. Four local sessions yield zero eligible clips. The local fifth fold follows MS-TCN's assignments. Use the PDF's final-fold values as published context only.
 

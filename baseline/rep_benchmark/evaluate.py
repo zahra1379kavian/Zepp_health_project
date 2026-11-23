@@ -9,7 +9,8 @@ import tempfile
 import numpy as np
 import pandas as pd
 
-from .protocol import REFERENCE, clips, clip_signature, score, session_plan
+from . import report_directory
+from .protocol import clips, clip_signature, input_provenance, score, session_plan
 
 
 def dump(path, obj):
@@ -78,14 +79,14 @@ def evaluate(raw, output, model_name, fold_subjects, load_model):
         frame = pd.DataFrame(rows)
         frame.to_csv(stage / "test_metrics_detailed.csv", index=False)
         for (scope, activity, kind), (_, meta, signals) in candidates.items():
-            path = stage / scope / "examples"
+            path = report_directory(report_directory(stage, scope), "examples")
             path.mkdir(parents=True, exist_ok=True)
             dump(path / f"{activity}_{kind}.json", meta)
             np.savez_compressed(path / f"{activity}_{kind}.npz", **signals)
         dump(stage / "manifest.json", dict(model=model_name, sensor_hz=25, models=models,
              missing_sessions=missing, fold_subjects=fold_subjects,
              sessions=[dict(**p, clips=coverage[p["session"]]) for p in plan],
-             reference_splits_sha256=hashlib.sha256((REFERENCE / "splits.json").read_bytes()).hexdigest(),
+             **input_provenance(raw, (p["session"] for p in plan)),
              protocol_sha256=signature.hexdigest(), raw_source=str(raw.resolve())))
         from .report import render
         render(stage)

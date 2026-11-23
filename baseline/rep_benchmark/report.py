@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from . import report_directory
 from .protocol import REFERENCE, rep
 
 
@@ -139,7 +140,7 @@ def render(stage):
             record = json.loads(line)
             delays[record["fold"]].extend(record["matched_delay_ms"])
     for scope, idx, label in [("pooled", 0, "Five folds pooled"), ("fold_5", 1, "Local fold 5")]:
-        out = stage / scope
+        out = report_directory(stage, scope)
         out.mkdir(exist_ok=True)
         rows = frame if idx == 0 else frame[frame.fold == 5]
         summary = summaries(rows)
@@ -168,14 +169,14 @@ def render(stage):
         plot.plot_metrics(rows, out / "test_metrics.png")
         plot.plot_outliers_by_session(rows, out / "fn_outliers_by_session.png")
         for activity, data in detailed.groupby("activity"):
-            folder = out / "activities" / activity
+            folder = report_directory(out, "activities") / activity
             folder.mkdir(parents=True, exist_ok=True)
             data.to_csv(folder / "test_metrics.csv", index=False)
             plot.plot_metrics(data, folder / "test_metrics.png")
             plot.plot_outliers_by_session(data, folder / "fn_outliers_by_session.png", activity)
             with redirect_stdout(io.StringIO()):
                 plot.plot_error_by_session_device(csv, activity=activity, save_dir=folder)
-        for path in sorted((out / "examples").glob("*.json")):
+        for path in sorted(report_directory(out, "examples").glob("*.json")):
             example_plot(path)
 
 

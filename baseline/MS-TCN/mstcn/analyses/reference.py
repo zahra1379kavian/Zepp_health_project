@@ -32,7 +32,8 @@ class WristModel:
                              decoder_sha256=digest(fold / "decoder.json"), head=self.head,
                              features=ckpt["features"], start_rule=self.config.start_rule,
                              refine_end=self.config.refine_end, model_lookahead_ms=self.lag * DT_MS,
-                             decoder_confirmation_ms=self.config.confirmation_frames * DT_MS)
+                             decoder_confirmation_ms=self.config.confirmation_frames * DT_MS,
+                             simulated_input_buffer_ms=0)
 
     def predict(self, t, sensors):
         # Reset both network and decoder at clip boundaries and actual sensor gaps.
