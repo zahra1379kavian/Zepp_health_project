@@ -52,8 +52,8 @@ Screen variants cheaply: use subject fold 1 and biceps / push-up / squat, which 
 Free diagnostic first: re-score the existing biceps-curl leave-one-out model across a range of decoder thresholds. This is a diagnostic only; never report it as a result.
 If F1 jumps, the collapse is mostly a threshold problem, and selecting on E′ fixes it.
 If F1 stays near zero, the model's learned features are the problem.
-2.1 Make the rep inputs independent of wrist orientation
 
+2.1 Make the rep inputs independent of wrist orientation
 Estimate the gravity direction causally: low-pass the accelerometer at about 0.3 Hz and normalize it.
 Feed the rep model 6 channels:
 overall accelerometer magnitude;
@@ -63,8 +63,8 @@ gyroscope rotation about gravity, and its magnitude across gravity.
 Optionally add a 7th: the projection onto the main movement axis of the last 5 s. This is the classic exercise-independent counting signal from RecoFit (CHI 2014).
 Drop the magnetometer from the rep inputs. It encodes compass heading and the magnetic field near steel machines, which identifies the station. Keep it in the 15-class station classifier: in fold 1, dropping it raised false exercise events from 159 to 262 per rest hour.
 Compare against raw accelerometer + gyroscope with fully random 3-D rotation of each training window (Um et al., ICMI 2017; see also TRI-HAR, ISWC 2026). Your current augmentation rotates by only ±10°, which leaves the orientation cue intact. So your earlier augmentation ablation didn't actually test this.
-2.2 Add a causal check for repeated motion (RepNet, CVPR 2020; TransRAC, CVPR 2022)
 
+2.2 Add a causal check for repeated motion (RepNet, CVPR 2020; TransRAC, CVPR 2022)
 After stage 1, compute a 32-dimensional normalized embedding z_t for each frame.
 At each frame, compute s_t(k) = z_t · z_{t−k} for k = 1…150 (the last 6 s). This is one row of RepNet's self-similarity matrix, computed using only the past.
 Use it in two places:
@@ -72,9 +72,9 @@ Use it in two places:
 (b) Add α·s_t(k) to the start selector's score for "start = t−k", with α learned and starting at 1. A rep ends when the wrist returns to its starting pose, which holds for nearly every strength exercise and also works for the first rep.
 In RepNet's ablation, this similarity layer was what let training on synthetic videos carry over to real ones: error on the QUVA benchmark fell from 1.29 to 0.10.
 Later option: use the first detected rep of a set as a template and add the current window's similarity to it as an input (ESCounts, ACCV 2024; CaRaCount, IEEE TPAMI 2025, which is wearable-specific).
+
 2.3 Train on synthetic repetitions (RepNet; CaRaCount)
 In CaRaCount's AAAI 2024 version, pretraining on synthetic data was the largest single gain (counting error 10.05 → 7.66).
-
 Take a 0.6–2 s piece of real training signal that starts in a still pose (a local minimum of gyroscope magnitude). Never take it from E or E′.
 Append its time reversal to make one cycle that returns to the start pose:
 accelerometer: reversed in time;
@@ -83,10 +83,9 @@ Repeat the cycle 3–15 times, varying each cycle's speed by ×0.85–1.15 and a
 Apply one random 3-D rotation to the whole sequence, and pad each side with 5–30 s of real rest.
 Label a start and end at every cycle boundary. Make 25% of each batch synthetic.
 Risk: walking is also periodic. Keep real rest as negatives, with your reviewed hard-negative weights. Don't take source pieces whose accelerometer repeats at 0.4–0.7 s (step rhythm), and watch false reps per rest hour.
+
 2.4 Only if a large gap remains: add a head that tries to predict the exercise from stage-1 features, trained with reversed gradients (DANN, JMLR 2016), ramping its weight from 0 to 0.1.
-
 Add these one at a time (2.1 → 2.2 → 2.3). Keep a change only if:
-
 unseen F1 rises by at least 0.05,
 seen F1 drops by no more than 0.02, and
 false reps per rest hour rise by no more than 20%.

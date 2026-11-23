@@ -1,5 +1,36 @@
 # MS-TCN for strength training
 
+## Compare with the Feishu wrist release
+
+The [shared benchmark](../rep_benchmark/evaluate.py) replays each fold's frozen checkpoint on the release's wrist clips. From the project root, install the existing MS-TCN requirements and run:
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+python -m baseline.mstcn reference-benchmark \
+  --run-dir "$runs/wrist_cross_validation/cross_validation" \
+  --model-name "MS-TCN phase" --output "$runs/reference_benchmark/phase"
+```
+
+Use a fresh output directory for a new run. The [MS-TCN adapter](mstcn/analyses/reference.py) also accepts boundary and complete-rep checkpoints. Use `--start-rule previous_end` for the previous-end decoder. Weights, normalization and validation-selected thresholds come from the individual folds.
+
+**Future model API.** Call `evaluate(raw, output, model_name, fold_subjects, load_model)` from `baseline.rep_benchmark.evaluate`. Supply subject IDs under `train`, `validation` and `test` for folds 1–5. The phase run's `manifest.json` lists the shared test assignment for every available session. Checkpoint selection and threshold tuning belong on training-side subjects. Each `load_model(fold)` returns an adapter with JSON-serializable `metadata` identifying the checkpoint, features, lookahead, decoder and buffering, and a `predict(t_ms, sensors)` method. Start with fresh state at every call. The inputs are the clip's sensor timestamps and an N × 9 raw array ordered as accelerometer XYZ, gyroscope XYZ and magnetometer XYZ. The predictor receives no activity or ground truth. Use integer, clip-relative sample indices:
+
+```python
+from baseline.rep_benchmark.protocol import Prediction
+
+# One interval starts at sample 20, ends just before sample 68,
+# and is reported when sample 70 is available.
+prediction = Prediction([{"start": 20, "end": 68, "reported_at": 70}])
+```
+
+`reported_at` is optional for offline models. Supply the model's actual emission time for online comparisons. Optional `traces` maps probability names to one value per frame for prediction figures. The MS-TCN adapter replays its causal network plus configured lookahead and decoder confirmation, resetting on timestamp gaps. Reported delay measures emission relative to the labeled end on the 25 Hz replay clock. The reference runner uses a 10 s window, 2 s stride and 1 s front context. The published wrist KPI table gives no measured end-to-end delay.
+
+**Outputs.** `intervals.jsonl` records the labeled intervals, predictions and clip signatures. `test_metrics_detailed.csv` has one row per session, wrist and exercise. `pooled/` and `fold_5/` contain the PDF-style tables, release-code figures, count/duration errors, matched reporting delays and published comparison columns. Example figures show the best and worst clip F1 for push-up, deadlift and leg raise, with a 30 s excerpt selected for matched or missed/extra reps. Re-render a saved run with `python -m baseline.rep_benchmark.report RUN`.
+
+**Cohort.** The release manifest contains 53 sessions. Only `20260529_DQTQDQTQ` and `20260529_JCLQJCLQ` are missing locally. Keep the 43 original MS-TCN held-out subject assignments and use the release fold number for previously unused subjects. The reference's activity labels determine the scored clips, including the five-second margins. Four local sessions yield zero eligible clips. The local fifth fold follows MS-TCN's assignments. Use the PDF's final-fold values as published context only.
+
+**Scoring.** The release matches each labeled rep to the unused prediction with the greatest positive overlap. TP%, FN% and FP% all divide by labeled reps. The release splits FP by the midpoint label and pools counts across all clips before computing rates. The other MS-TCN commands retain the full-session analyses and endpoint-tolerance F1.
+
 - `mstcn/` contains the causal segmentation model, command-line entry point, tests, and analysis code.
 - `prepared_datasets/` contains `separate_wrist_streams/` (version 4), `single_wrist_per_session/` (version 2), and the historical `waist_sensor/` dataset (version 1).
 - `experiment_runs/` contains `wrist_cross_validation/`, `sensor_ablation_fold_1/`, `leave_one_exercise_out_fold_1/`, and `job_launches/`.

@@ -8,6 +8,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m baseline.mstcn",
                                      description="Causal MS-TCN: station/NULL + dense repetition phases")
     sub = parser.add_subparsers(dest="command", required=True)
+    compare = sub.add_parser("reference-benchmark", help="Replay wrist checkpoints on the Feishu reference clips and KPIs")
+    compare.add_argument("--run-dir", type=Path, required=True, help="Directory containing fold_1 through fold_5")
+    compare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
+    compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument("--model-name", default="MS-TCN")
+    compare.add_argument("--start-rule", choices=["learned", "previous_end"])
+    compare.add_argument("--refine-end", action="store_true")
+    compare.add_argument("--threads", type=int, default=1)
+    compare.add_argument("--device", default="cpu")
     prepare = sub.add_parser("prepare", help="Exact-clock joins, exclusions, references and subject splits")
     prepare.add_argument("--source", type=Path, default=Path("strength_training/strength_training_data_clean"))
     prepare.add_argument("--output", type=Path, required=True)
@@ -119,7 +128,10 @@ def main(argv=None):
     if hasattr(args, "threads"):
         import torch
         torch.set_num_threads(args.threads)
-    if args.command == "prepare":
+    if args.command == "reference-benchmark":
+        from .analyses.reference import benchmark
+        benchmark(args)
+    elif args.command == "prepare":
         from .data import prepare as prepare_dataset
         result = prepare_dataset(args.source, args.output, args.alignment, args.location,
                                  args.references, args.seed, args.reference_mode)
