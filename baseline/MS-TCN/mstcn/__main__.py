@@ -36,6 +36,10 @@ def main(argv=None):
     diagnostic.add_argument("--output", type=Path, required=True, help="Diagnostic JSON, separate from scored results")
     diagnostic.add_argument("--threads", type=int, default=2)
     diagnostic.add_argument("--device", default="cpu")
+    similarity = sub.add_parser("compare-similarity", help="Compare matched step 2.1 and 2.2 holdout reports")
+    similarity.add_argument("--control-reports", type=Path, nargs="+", required=True)
+    similarity.add_argument("--similarity-reports", type=Path, nargs="+", required=True)
+    similarity.add_argument("--output", type=Path, required=True, help="Decision and guard rails as JSON")
     ablation.add_argument("--folds", type=int, default=5)
     ablation.add_argument("--fold", type=int, default=1, help="One-based pilot fold; only this fold is run")
     loeo.add_argument("--subject-folds", "--folds", dest="folds", type=int, default=5,
@@ -115,6 +119,8 @@ def main(argv=None):
     run.add_argument("--references", type=Path, help="Validated full-rep references when preparing a new dataset")
     run.add_argument("--repetition-head", choices=["auto", "phase", "boundary", "complete"], default="auto")
     for command in (run, train, cv, loeo):
+        command.add_argument("--causal-similarity", action="store_true",
+                             help="Complete rep head: compare stage-1 motion embeddings over the past six seconds")
         command.add_argument("--rest-reviews", type=Path, help="Complete mode: reviewed mine-rest JSON")
         command.add_argument("--rep-inputs", choices=["original", "gravity", "rotated"], default="original",
                              help="Existing sensors, six gravity features, or acc+gyro with uniform training rotations")
@@ -139,6 +145,9 @@ def main(argv=None):
     if args.command == "reference-benchmark":
         from .analyses.reference import benchmark
         benchmark(args)
+    elif args.command == "compare-similarity":
+        from .analyses.leave_one_exercise_out.study import compare_similarity
+        compare_similarity(args)
     elif args.command == "biceps-diagnostic":
         from .analyses.leave_one_exercise_out.diagnostic import run
         run(args)

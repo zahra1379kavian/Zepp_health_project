@@ -77,6 +77,8 @@ Optionally add a 7th: the projection onto the main movement axis of the last 5 s
 Drop the magnetometer from the rep inputs. It encodes compass heading and the magnetic field near steel machines, which identifies the station. Keep it in the 15-class station classifier: in fold 1, dropping it raised false exercise events from 159 to 262 per rest hour.
 Compare against raw accelerometer + gyroscope with fully random 3-D rotation of each training window (Um et al., ICMI 2017; see also TRI-HAR, ISWC 2026). Your current augmentation rotates by only ±10°, which leaves the orientation cue intact. So your earlier augmentation ablation didn't actually test this.
 
+**Implementation and runs.** The paired evaluation supports the complete-rep head. The fold-1 screen compares the original nine inputs, six gravity-based inputs and six randomly rotated raw inputs on biceps curls, push-up and squat. Each fit uses the same reviewed rest intervals. The optional seventh channel is omitted. The biceps threshold sweep is saved separately for diagnosis. [Run instructions and scoring](baseline/MS-TCN/mstcn/analyses/leave_one_exercise_out/README.md) · [Experiment directory](baseline/MS-TCN/experiment_runs/step_2/)
+
 2.2 Add a causal check for repeated motion (RepNet, CVPR 2020; TransRAC, CVPR 2022)
 After stage 1, compute a 32-dimensional normalized embedding z_t for each frame.
 At each frame, compute s_t(k) = z_t · z_{t−k} for k = 1…150 (the last 6 s). This is one row of RepNet's self-similarity matrix, computed using only the past.
@@ -85,6 +87,8 @@ Use it in two places:
 (b) Add α·s_t(k) to the start selector's score for "start = t−k", with α learned and starting at 1. A rep ends when the wrist returns to its starting pose, which holds for nearly every strength exercise and also works for the first rep.
 In RepNet's ablation, this similarity layer was what let training on synthetic videos carry over to real ones: error on the QUVA benchmark fell from 1.29 to 0.10.
 Later option: use the first detected rep of a set as a template and add the current window's similarity to it as an input (ESCounts, ACCV 2024; CaRaCount, IEEE TPAMI 2025, which is wearable-specific).
+
+**Implementation.** Use `--repetition-head complete --causal-similarity` to enable both uses of the six-second motion history. The fold-1 screen uses the same subjects, exercise pairs, and reviewed rest intervals as step 2.1. Each input choice has its own matched control. Use the comparison for the input selected in step 2.1 to judge the additional benefit of similarity. [Model and experiment instructions](baseline/MS-TCN/mstcn/analyses/leave_one_exercise_out/README.md#step-22-causal-motion-similarity)
 
 2.3 Train on synthetic repetitions (RepNet; CaRaCount)
 In CaRaCount's AAAI 2024 version, pretraining on synthetic data was the largest single gain (counting error 10.05 → 7.66).

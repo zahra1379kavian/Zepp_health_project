@@ -23,6 +23,7 @@ class ModelConfig:
     dropout: float = .3
     repetition_head: str = "phase"
     lookahead_samples: int = 0
+    causal_similarity: bool = False
 
     def __post_init__(self):
         if self.classes is None:
@@ -35,6 +36,8 @@ class ModelConfig:
             raise ValueError("Complete repetitions use a binary station head")
         if self.classes == 0 and self.repetition_head != "phase":
             raise ValueError("Models without a station head require dense phases")
+        if self.causal_similarity and (self.repetition_head != "complete" or self.stages < 2):
+            raise ValueError("Causal similarity requires the complete rep head and at least two stages")
         if not isinstance(self.lookahead_samples, int) or self.lookahead_samples < 0:
             raise ValueError("lookahead_samples must be a nonnegative integer")
 
@@ -70,15 +73,49 @@ class Residual(nn.Module):
         return result, joined[:, :, -self.history:].detach()
 
 
-class StartSelector(nn.Module):
-    """Score each past start using motion there and duration evidence at the end."""
+class CausalSimilarity(nn.Module):
+    """Cosine similarities in start-selector order, from t-150 through t-1."""
 
     def __init__(self, channels):
         super().__init__()
+        self.embedding = nn.Conv1d(channels, 32, 1)
+        self.projection = nn.Conv1d(START_HISTORY, 64, 1)
+
+    def forward(self, hidden, mask=None, previous=None):
+        z = F.normalize(self.embedding(hidden), dim=1)
+        if mask is not None:
+            z = z * mask
+        if previous is None:
+            previous = z.new_zeros((*z.shape[:2], START_HISTORY))
+        joined = torch.cat((previous, z), dim=2)
+
+        # Nearby queries share keys. Tile the dot products to keep memory linear
+        # in sequence length. Column j for time t is always the key at t-150+j.
+        frames = z.size(2)
+        tile = min(64, frames)
+        columns = torch.arange(tile, device=z.device)[:, None] + torch.arange(START_HISTORY, device=z.device)
+        rows = []
+        for left in range(0, frames, tile):
+            right = min(left + tile, frames)
+            queries = z[:, :, left:right].transpose(1, 2)
+            keys = joined[:, :, left:right + START_HISTORY - 1]
+            dots = queries @ keys
+            rows.append(dots.gather(2, columns[:right-left].expand(z.size(0), -1, -1)))
+        similarities = torch.cat(rows, dim=1).transpose(1, 2)
+        cache = joined[:, :, -START_HISTORY:].detach().clone()
+        return similarities, self.projection(similarities), cache
+
+
+class StartSelector(nn.Module):
+    """Score each past start using motion there and duration evidence at the end."""
+
+    def __init__(self, channels, causal_similarity=False):
+        super().__init__()
         self.start_score = nn.Conv1d(channels, 1, 1)
         self.offset_scores = nn.Conv1d(channels, START_HISTORY + 1, 1)
+        self.alpha = nn.Parameter(torch.ones(())) if causal_similarity else None
 
-    def forward(self, h, mask=None, previous=None):
+    def forward(self, h, mask=None, previous=None, similarities=None):
         scores = self.start_score(h)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e4)
@@ -87,6 +124,8 @@ class StartSelector(nn.Module):
         joined = torch.cat((previous, scores), dim=-1)
         # At t: oldest through newest candidates [t-150, t-1], then no start.
         past = joined[:, 0, :-1].unfold(1, START_HISTORY, 1).transpose(1, 2)
+        if self.alpha is not None:
+            past = past + self.alpha * similarities
         offsets = self.offset_scores(h)
         logits = torch.cat((past + offsets[:, :-1], offsets[:, -1:]), dim=1)
         return logits, joined[:, :, -START_HISTORY:].detach()
@@ -100,20 +139,20 @@ class Stage(nn.Module):
                                      for i in range(config.layers)])
         self.station = nn.Conv1d(config.channels, config.classes, 1) if config.classes else None
         self.boundary = nn.Conv1d(config.channels, config.repetition_classes, 1)
-        self.selector = StartSelector(config.channels) if select_start else None
+        self.selector = StartSelector(config.channels, config.causal_similarity) if select_start else None
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, similarities=None):
         h = self.project(x) * mask
         for layer in self.layers:
             h = layer(h, mask)
         station = self.station(h) * mask if self.station is not None else None
         events = self.boundary(h) * mask
         if self.selector is not None:
-            starts, _ = self.selector(h, mask)
+            starts, _ = self.selector(h, mask, similarities=similarities)
             events = torch.cat((events, starts), dim=1)
-        return station, events
+        return station, events, h
 
-    def stream(self, x, state):
+    def stream(self, x, state, similarities=None):
         h, new_state = self.project(x), []
         for i, layer in enumerate(self.layers):
             h, cache = layer.stream(h, None if state is None else state[i])
@@ -121,10 +160,10 @@ class Stage(nn.Module):
         station = self.station(h) if self.station is not None else None
         events = self.boundary(h)
         if self.selector is not None:
-            starts, cache = self.selector(h, previous=None if state is None else state[-1])
+            starts, cache = self.selector(h, previous=None if state is None else state[-1], similarities=similarities)
             events = torch.cat((events, starts), dim=1)
             new_state.append(cache)
-        return station, events, new_state
+        return station, events, h, new_state
 
 
 class DenseMSTCN(nn.Module):
@@ -133,6 +172,9 @@ class DenseMSTCN(nn.Module):
         self.config = config or ModelConfig()
         c = self.config
         refinement_width = (c.inputs if c.repetition_head == "complete" else c.classes) + c.repetition_classes
+        self.similarity = CausalSimilarity(c.channels) if c.causal_similarity else None
+        if self.similarity is not None:
+            refinement_width += self.similarity.projection.out_channels
         self.stages = nn.ModuleList([Stage(c.inputs if i == 0 else refinement_width, c,
                                            select_start=c.repetition_head == "complete" and i == c.stages - 1)
                                      for i in range(c.stages)])
@@ -140,17 +182,23 @@ class DenseMSTCN(nn.Module):
     @property
     def history_samples(self):
         history = self.config.stages * 2 * (2 ** self.config.layers - 1)
+        if self.similarity is not None:
+            # A candidate start can itself depend on another six seconds of motion.
+            history += START_HISTORY
         return history + (START_HISTORY if self.config.repetition_head == "complete" else 0)
 
     def forward(self, x, mask=None):
         mask = x.new_ones(x.shape[0], 1, x.shape[-1]) if mask is None else mask
         wrist = x
         results = []
+        similarities = projected = None
         for i, stage in enumerate(self.stages):
-            station, boundary = stage(x, mask)
+            station, boundary, hidden = stage(x, mask, similarities)
             results.append((station, boundary))
+            if i == 0 and self.similarity is not None:
+                similarities, projected, _ = self.similarity(hidden, mask)
             if i + 1 < len(self.stages):
-                x = self._refinement_input(wrist, station, boundary) * mask
+                x = self._refinement_input(wrist, station, boundary, projected) * mask
         # A causal output acquired at t+L predicts the target at t. Shift only
         # after all refinement stages so their lookaheads do not accumulate.
         lag = self.config.lookahead_samples
@@ -172,16 +220,25 @@ class DenseMSTCN(nn.Module):
             raise ValueError("Call model.eval() before streaming")
         caches = []
         wrist = x
+        similarities = projected = embedding_cache = None
         for i, stage in enumerate(self.stages):
-            station, boundary, cache = stage.stream(x, None if state is None else state[i])
+            station, boundary, hidden, cache = stage.stream(x, None if state is None else state[i], similarities)
             caches.append(cache)
+            if i == 0 and self.similarity is not None:
+                previous = None if state is None else state[-1]
+                similarities, projected, embedding_cache = self.similarity(hidden, previous=previous)
             if i + 1 < len(self.stages):
-                x = self._refinement_input(wrist, station, boundary)
+                x = self._refinement_input(wrist, station, boundary, projected)
+        if embedding_cache is not None:
+            caches.append(embedding_cache)
         return station, boundary, caches
 
-    def _refinement_input(self, wrist, station, boundary):
+    def _refinement_input(self, wrist, station, boundary, projected=None):
         if self.config.repetition_head == "complete":
-            return torch.cat((wrist, boundary.sigmoid()), dim=1)
+            inputs = [wrist, boundary.sigmoid()]
+            if projected is not None:
+                inputs.append(projected)
+            return torch.cat(inputs, dim=1)
         phases = self.repetition_probabilities(boundary)
         return phases if station is None else torch.cat((station.softmax(1), phases), dim=1)
 

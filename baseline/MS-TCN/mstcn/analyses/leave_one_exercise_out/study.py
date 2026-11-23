@@ -54,6 +54,44 @@ def select(summaries):
     return max(passing, key=lambda m: summaries[m]["mean_unseen_f1_at_400"], default="original")
 
 
+def compare_similarity(args):
+    """Apply step 2's acceptance rule to paired fits with the same input representation."""
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    signatures = {}
+    summaries = {}
+    modes = set()
+    for variant, paths in (("original", args.control_reports), ("similarity", args.similarity_reports)):
+        reports = [json.loads(path.read_text()) for path in paths]
+        pairs = {}
+        for r in reports:
+            settings = r["training"]
+            enabled = settings.get("causal_similarity", False)
+            if (r["protocol"] != "paired" or r["repetition_head"] != "complete" or enabled != (variant == "similarity")
+                    or set(r["results"]) != set(r["exercises"])):
+                raise ValueError(f"Expected completed paired {variant} holdouts")
+            modes.add(r["rep_inputs"])
+            training = {k: v for k, v in settings.items() if k not in ("output", "exercises", "causal_similarity")}
+            for exercise, score in r["results"].items():
+                metrics, guards = score["by_tolerance"]["400"], score["guard_rails"]
+                pairs[r["subject_fold"], exercise] = (
+                    r["split"], r["selection_exercises"][exercise], training, metrics["tp"] + metrics["missed"],
+                    guards["certified_rest_hours"], guards["seen_exercises"])
+        folds = sorted({fold for fold, _ in pairs})
+        exercises = sorted({e for _, e in pairs})
+        summaries[variant] = summarize(reports, exercises, folds)
+        signatures[variant] = pairs
+    if len(modes) != 1 or signatures["original"] != signatures["similarity"]:
+        raise ValueError("Compare identical input modes, folds, exercises, selectors and training settings")
+    decision = {"rep_inputs": modes.pop(), "subject_folds": folds, "exercises": exercises,
+                "control": summaries["original"], "similarity": summaries["similarity"],
+                "passes_step_2_gate": select(summaries) == "similarity"}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("x") as f:
+        print(json.dumps(decision, indent=2, allow_nan=False), file=f)
+    return decision
+
+
 def fit_options(args, mode):
     return ["--data", str(args.data), "--repetition-head", "complete", "--rep-inputs", mode,
             "--rest-reviews", str(args.rest_reviews), "--threads", str(args.threads), "--device", args.device]

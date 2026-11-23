@@ -163,7 +163,7 @@ def train(args):
     binary_station = complete or manifest.get("reference_mode") == "endpoints"
     classes = STATION_STATES if binary_station else ([] if phase_only else CLASSES)
     config = ModelConfig(inputs=len(manifest["normalization"]["mean"]), classes=len(classes), stages=args.stages, layers=args.layers,
-                         channels=args.channels, repetition_head=head,
+                         channels=args.channels, repetition_head=head, causal_similarity=getattr(args, "causal_similarity", False),
                          lookahead_samples=int(np.ceil(lookahead_ms / DT_MS)))
     model = DenseMSTCN(config).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
@@ -457,6 +457,7 @@ def evaluate(args):
               "sensor_policy": manifest.get("wrist_selection"),
               "analysis": manifest.get("analysis"),
               "repetition_head": ckpt.get("config", {}).get("repetition_head", "boundary"),
+              "causal_similarity": ckpt.get("config", {}).get("causal_similarity", False),
               "start_rule": config.start_rule if complete else None,
               "end_refinement": config.refine_end,
               "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
@@ -700,7 +701,7 @@ def predict(args):
                "compute_ms_p50": float(np.percentile(latencies, 50)),
                "compute_ms_p95": float(np.percentile(latencies, 95)),
                "compute_ms_max": max(latencies), "maximum_buffer_delay_ms": (args.chunk - 1) * DT_MS,
-               "end_refinement": config.refine_end,
+               "end_refinement": config.refine_end, "causal_similarity": model.config.causal_similarity,
                "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
                "model_lookahead_ms": lag * DT_MS, "features": ckpt["features"],
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
@@ -738,6 +739,8 @@ def run_pipeline(args):
     common = ["--device", args.device, "--threads", str(args.threads)]
     common.extend(["--repetition-head", getattr(args, "repetition_head", "auto"),
                    "--rep-inputs", getattr(args, "rep_inputs", "original")])
+    if getattr(args, "causal_similarity", False):
+        common.append("--causal-similarity")
     if getattr(args, "rest_reviews", None):
         common.extend(["--rest-reviews", str(args.rest_reviews)])
     main(["cross-validate", "--data", str(root), "--output", str(out / "cross_validation"),
@@ -766,6 +769,7 @@ def completed_fold_report(args, fold, expected_manifest, tolerances):
                        "lookahead_samples": int(np.ceil(getattr(args, "lookahead_ms", 0) / DT_MS))}
     if (any(checkpoint["config"].get(key, 0 if key == "lookahead_samples" else None) != value
             for key, value in expected_config.items())
+            or checkpoint["config"].get("causal_similarity", False) != getattr(args, "causal_similarity", False)
             or checkpoint.get("augmentation", False) != getattr(args, "augment", False)
             or checkpoint.get("rest_reviews_sha256") != (digest(args.rest_reviews) if getattr(args, "rest_reviews", None) else None)
             or checkpoint["seed"] != args.seed or checkpoint["station_only"]
