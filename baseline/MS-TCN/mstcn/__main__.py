@@ -89,6 +89,9 @@ def main(argv=None):
     predict.add_argument("--output", type=Path, required=True)
     predict.add_argument("--decoder", type=Path)
     predict.add_argument("--chunk", type=int, default=1, help="1..20 samples; default is one sample (40 ms)")
+    for command in (sub.choices["evaluate"], predict):
+        command.add_argument("--refine-end", action="store_true",
+                             help="Refine complete-rep endpoints with a probability-weighted ±4-frame window")
     demo = sub.add_parser("demo", help="Run the whole pipeline with generated, validated synthetic boundaries")
     demo.add_argument("--output", type=Path, default=Path("baseline/MS-TCN/experiment_runs/demo"))
     run = sub.add_parser("run", help="Prepare every wrist stream → subject-wise cross-validation")

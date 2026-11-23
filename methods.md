@@ -1,7 +1,8 @@
 # Activity-agnostic rep detection from wrist motion
 
-Step 1 — Finish the complete-rep model and break down its errors
-Let complete_rep_cv finish all 5 folds; it's on fold 1 now. At the same time, run the boundary baseline using the command in the README (--repetition-head boundary --output .../boundary_rep_cv). Both use the same seed and folds, so you can compare them fold by fold.
+## Step 1 — Finish the complete-rep model and break down its errors
+
+The complete-rep and boundary runs finished all five folds with seed 42 and identical subject splits.
 Add the error breakdown to metrics.py so every report includes it:
 extra reps, split into inside a real rep / in rest / between reps;
 missed reps, split into overlapped by a prediction / not detected;
@@ -10,16 +11,32 @@ recall by rep duration;
 share of sets missed entirely, per exercise;
 reporting delay at the median, 95th percentile and maximum, instead of only the mean.
 Compare four versions fold by fold: the phase model (your existing run), the boundary model, the complete-rep model, and the complete-rep model with the start-equals-previous-end rule.
-Adopt the complete-rep model as the default if it wins F1@400 in at least 4 of 5 folds and cuts extras inside real reps (now 7,964) by at least 30%.
+Adopt the complete-rep model as the default if it wins F1@400 in at least 4 of 5 folds and cuts extras inside real reps (7,968 in the phase report) by at least 30%.
 If split reps are still the biggest error group, add this decoder rule. It needs no retraining; tune it on validation:
 Within a set, reject a rep shorter than f × the median duration of the last 3 reported reps, trying f = 0.5, 0.6 and 0.7. Reset the rule after 10 s with no reps.
 It adapts to each person's own pace, so it doesn't depend on the exercise. It is a streaming version of the duration and confidence post-processing in OnlineTAS (NeurIPS 2024). That paper shows models that see only past input break one action into fragments more often than offline models.
 If start/end error stays above about 100 ms, which drags down the ±200 ms score, refine the end time as a weighted average over ±4 frames around each peak. This is the boundary-as-distribution idea from TriDet (CVPR 2023); your start selector already works this way.
 Fallback: Bock et al. (IMWUT 2024) found that action-localization models of the ActionFormer type, trained on raw IMU signals, beat standard activity-recognition models on 4 of 6 datasets. They are offline models and would need to be made causal.
 
+### Step 1 results
+
+All four variants have the requested error breakdown. The end-time experiment reused the five complete-rep checkpoints and their validation-selected thresholds. It weighted the nine timestamps around each end peak by end probability and used the refined end in the decoder's existing overlap check. [Phase report](baseline/MS-TCN/experiment_runs/wrist_cross_validation/report_with_rep_diagnostics.json) · [Boundary report](baseline/MS-TCN/experiment_runs/boundary_rep_cv/cross_validation/report.json) · [Complete-rep and previous-end report](baseline/MS-TCN/experiment_runs/complete_rep_cv/previous_end_evaluation/report.json) · [Refinement report](baseline/MS-TCN/experiment_runs/complete_rep_cv/end_time_refinement/report.json)
+
+| Fold | Phase F1@400 | Boundary F1@400 | Complete-rep F1@400 | Previous-end F1@400 | Complete-rep F1@200 | Refined F1@200 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.640 | 0.528 | 0.591 | 0.349 | 0.443 | 0.402 |
+| 2 | 0.638 | 0.534 | 0.620 | 0.362 | 0.465 | 0.425 |
+| 3 | 0.715 | 0.575 | 0.662 | 0.470 | 0.520 | 0.485 |
+| 4 | 0.658 | 0.538 | 0.643 | 0.340 | 0.470 | 0.439 |
+| 5 | 0.654 | 0.396 | 0.626 | 0.298 | 0.483 | 0.445 |
+| Pooled | 0.662 | 0.518 | 0.629 | 0.364 | 0.477 | 0.440 |
+
+- **Default model.** Keep the phase model. Complete rep cut extras inside real reps by 33.9% (7,968 to 5,270), and phase had the highest F1@400 in all five folds.
+- **Duration filter.** The two missed-repetition categories (9,304 with overlap and 8,189 without overlap) each exceeded the split-repetition count (5,270). The filter's condition was not met across all error categories.
+- **End-time refinement.** The original complete-rep decoder's average end error was 108.0 ms at ±400 ms. The refinement reduced it to 107.7 ms, lowered F1@200 in all five folds, and increased 95th-percentile reporting delay from 200 to 280 ms at ±200 ms. Use the original peak timestamp for subsequent runs. The refinement remains available through `--refine-end`.
+
 ## Step 2 — Make the rep detector work for any exercise
 2.0 Set up the evaluation first (no new model yet)
-
 Let the leave-one-exercise-out analysis accept --repetition-head complete. It currently has phase_only=True hard-coded in analyses/leave_one_exercise_out/__init__.py.
 Test with exercises that score well when seen, one or more per movement group. Choose checkpoints using a second held-out exercise (E′) from a different group. This is the "leave-one-domain-out" selection rule from Gulrajani & Lopez-Paz (ICLR 2021).
 Test exercise	Selection exercise E′ (also removed from training)

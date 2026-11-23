@@ -335,13 +335,16 @@ def score_cache(cache, config, tolerance, require_station=True):
     return aggregate_repetitions(scores, rows)
 
 
-def decoder_config(path, checkpoint_path, default_tolerance=400):
+def decoder_config(path, checkpoint_path, default_tolerance=400, *, refine_end=False):
     if path is None:
-        return DecoderConfig(), default_tolerance, "defaults_not_validation_selected"
+        return DecoderConfig(refine_end=refine_end), default_tolerance, "defaults_not_validation_selected"
     data = json.loads(Path(path).read_text())
     if data.get("checkpoint_sha256") != digest(checkpoint_path) or data.get("selected_on") != "validation":
         raise ValueError("Decoder configuration must be selected on validation for this checkpoint")
-    return DecoderConfig(**data["config"]), data["tolerance_ms"], "validation_selected"
+    config = data["config"]
+    if refine_end:
+        config["refine_end"] = True
+    return DecoderConfig(**config), data["tolerance_ms"], "validation_selected"
 
 
 def evaluate(args):
@@ -352,7 +355,10 @@ def evaluate(args):
     complete = ckpt.get("config", {}).get("repetition_head") == "complete"
     binary_station = ckpt.get("classes") == STATION_STATES
     station_metrics = bool(ckpt.get("classes", CLASSES)) and not binary_station
-    config, tolerance, selection = decoder_config(args.decoder, args.checkpoint, args.tolerance_ms)
+    config, tolerance, selection = decoder_config(args.decoder, args.checkpoint, args.tolerance_ms,
+                                                   refine_end=getattr(args, "refine_end", False))
+    if config.refine_end and not complete:
+        raise ValueError("End refinement requires a complete-rep checkpoint")
     if getattr(args, "start_rule", None):
         if not complete:
             raise ValueError("--start-rule requires a complete-rep checkpoint")
@@ -395,7 +401,8 @@ def evaluate(args):
                                                         station_metrics=station_metrics, station_targets=arrays["y"])
             if complete and config.start_rule == "learned":
                 baseline = decode_sequence(arrays["t"], p, q, infer_valid,
-                                           replace(config, start_rule="previous_end"), lookahead_ms=lag * DT_MS)
+                                           replace(config, start_rule="previous_end", refine_end=False),
+                                           lookahead_ms=lag * DT_MS)
                 decoded["previous_end_repetitions"] = baseline["repetitions"]
                 record["previous_end_scores"] = score_stream(baseline["repetitions"], references,
                                                             arrays["t"], arrays["coverage"], record, tolerances, False,
@@ -421,6 +428,8 @@ def evaluate(args):
               "analysis": manifest.get("analysis"),
               "repetition_head": ckpt.get("config", {}).get("repetition_head", "boundary"),
               "start_rule": config.start_rule if complete else None,
+              "end_refinement": config.refine_end,
+              "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
               "model_lookahead_ms": ckpt.get("config", {}).get("lookahead_samples", 0) * DT_MS,
               "per_subject_session": sessions,
               "latency_note": "Sample-time replay includes decoder confirmation lag and timing error, but not compute/transport. Matched early reports meet the deadline and are reported separately; matching still requires endpoint tolerance. Missed reps are excluded from matched-delay fractions.",
@@ -562,7 +571,10 @@ def predict(args):
     if (ckpt["location"] in ("left_wrist", "right_wrist") and
             input_side in ("left_wrist", "right_wrist") and input_side != ckpt["location"]):
         raise ValueError("Input wrist side differs from the checkpoint's training location")
-    config, _, selection = decoder_config(args.decoder, args.checkpoint)
+    config, _, selection = decoder_config(args.decoder, args.checkpoint,
+                                          refine_end=getattr(args, "refine_end", False))
+    if config.refine_end and model.config.repetition_head != "complete":
+        raise ValueError("End refinement requires a complete-rep checkpoint")
     features = ckpt["features"]
     paired = features[0].startswith("wrist_")
     t, x = load_sensor(args.input, FEATURES[:6] if paired else features)
@@ -615,7 +627,8 @@ def predict(args):
                 latencies.append(elapsed_ms)
                 for event in batch_events:
                     event["compute_ms"] = elapsed_ms
-                    event["decoder_delay_ms"] = config.lag_frames * DT_MS
+                    peak_ms = event.get("end_peak_ms", event["end_ms"])
+                    event["decoder_delay_ms"] = config.confirmation_frames * DT_MS + peak_ms - event["end_ms"]
                     event["model_lookahead_ms"] = lag * DT_MS
                     event["buffer_delay_ms"] = (event["reported_at_ms"] - event["end_ms"]
                                                  - event["decoder_delay_ms"] - lag * DT_MS)
@@ -651,7 +664,8 @@ def predict(args):
                "compute_ms_p50": float(np.percentile(latencies, 50)),
                "compute_ms_p95": float(np.percentile(latencies, 95)),
                "compute_ms_max": max(latencies), "maximum_buffer_delay_ms": (args.chunk - 1) * DT_MS,
-               "decoder_confirmation_delay_ms": config.lag_frames * DT_MS,
+               "end_refinement": config.refine_end,
+               "decoder_confirmation_delay_ms": config.confirmation_frames * DT_MS,
                "model_lookahead_ms": lag * DT_MS, "features": ckpt["features"],
                "latency_note": "Compute+buffer delay is relative to predicted boundaries. Real <1 s performance requires validated end-time references and sensor/transport measurements. CSV replay is not a live hardware driver."}
     write_json(out / "predictions.json", summary)

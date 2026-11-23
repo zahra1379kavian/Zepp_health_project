@@ -8,6 +8,14 @@ import numpy as np
 from .constants import CLASSES, DT_MS, SET_GAP_MS, START_HISTORY, STATION_STATES
 
 
+END_REFINEMENT_FRAMES = 4
+END_WINDOW_OFFSETS_MS = np.arange(-END_REFINEMENT_FRAMES, END_REFINEMENT_FRAMES + 1) * DT_MS
+
+
+def refined_end_time(peak_ms, scores):
+    return peak_ms + round(np.average(END_WINDOW_OFFSETS_MS, weights=np.asarray(scores, dtype=np.float64)))
+
+
 @dataclass
 class DecoderConfig:
     start_threshold: float = .5
@@ -21,10 +29,13 @@ class DecoderConfig:
     refractory_ms: int = 200
     set_gap_ms: int = SET_GAP_MS
     start_rule: str = "learned"
+    refine_end: bool = False
 
     def __post_init__(self):
         if self.start_rule not in ("learned", "previous_end"):
             raise ValueError("Unknown start rule")
+        if self.refine_end and self.start_rule != "learned":
+            raise ValueError("End refinement requires the learned start rule")
         if not (0 < self.release_threshold < min(self.start_threshold, self.end_threshold)
                 and max(self.start_threshold, self.end_threshold) <= 1):
             raise ValueError("release threshold must be below both event thresholds")
@@ -35,6 +46,10 @@ class DecoderConfig:
         if (not isinstance(self.lag_frames, int) or not 0 <= self.lag_frames <= 3
                 or not 0 < self.phase_threshold <= 1):
             raise ValueError("Use 0..3 confirmation frames and a phase threshold in (0, 1]")
+
+    @property
+    def confirmation_frames(self):
+        return END_REFINEMENT_FRAMES if self.refine_end else self.lag_frames
 
 
 class RepDecoder:
@@ -55,6 +70,7 @@ class RepDecoder:
         self.previous_peak = None
         self.previous_rep_end = None
         self.previous_end_score = -1.
+        self.recent_end_scores = deque(maxlen=END_REFINEMENT_FRAMES)
 
     def complete_peak(self, t, station, prediction, future, reported):
         c = self.config
@@ -65,14 +81,19 @@ class RepDecoder:
         if 1 - no_start < c.start_threshold:
             distance = 0
         peak = (end >= c.end_threshold and end > self.previous_end_score
-                and all(end >= q[0] for _, _, q in future))
+                and all(end >= q[0] for _, _, q in future[:c.lag_frames]))
         self.previous_end_score = end
+        end_ms = t
+        if c.refine_end:
+            if peak and len(self.recent_end_scores) == END_REFINEMENT_FRAMES:
+                end_ms = refined_end_time(t, [*self.recent_end_scores, end, *(q[0] for _, _, q in future)])
+            self.recent_end_scores.append(end)
         if not peak:
             return []
         return self.close_peak(t, float(station[1]), end, distance, confidence, reported,
-                               len(self.station_history), lambda d: self.station_history[-d-1][1])
+                               len(self.station_history), lambda d: self.station_history[-d-1][1], end_ms)
 
-    def close_peak(self, t, station_probability, end, distance, confidence, reported, history_length, rest_at):
+    def close_peak(self, t, station_probability, end, distance, confidence, reported, history_length, rest_at, end_ms):
         c = self.config
         if self.previous_peak is not None and t - self.previous_peak < c.refractory_ms:
             return []
@@ -85,15 +106,18 @@ class RepDecoder:
         if not 1 <= distance <= START_HISTORY or distance >= history_length:
             return []
         start, rest_at_start = t - distance * DT_MS, rest_at(distance)
-        if self.previous_rep_end is not None and start < self.previous_rep_end:
+        if end_ms <= start or (self.previous_rep_end is not None and start < self.previous_rep_end):
             return []
         new_set = (self.previous_rep_end is None or
                    (start > self.previous_rep_end and rest_at_start is not None and rest_at_start >= self.previous_rep_end))
-        self.previous_rep_end = t
-        return [{"station": "unknown", "start_ms": start, "end_ms": t,
+        self.previous_rep_end = end_ms
+        event = {"station": "unknown", "start_ms": start, "end_ms": end_ms,
                  "confidence": float(end * confidence) if c.start_rule == "learned" else float(end),
                  "activity_probability": station_probability, "new_set": new_set,
-                 "reported_at_ms": reported}]
+                 "reported_at_ms": reported}
+        if c.refine_end:
+            event["end_peak_ms"] = t
+        return [event]
 
     def step(self, timestamp, station_prob, boundary_prob, valid=True, reported_at_ms=None):
         t, c = int(timestamp), self.config
@@ -103,11 +127,11 @@ class RepDecoder:
         if self.previous_time is not None and t - self.previous_time != DT_MS:
             self.reset()
         self.previous_time = t
-        # Delay decisions by two frames (80 ms by default), but retain the
-        # original boundary timestamp. Never flush unconfirmed events at EOF.
+        # Buffer the frames needed to confirm or refine an endpoint. Never
+        # flush unconfirmed events at EOF.
         station_prob = None if station_prob is None else np.array(station_prob, copy=True)
         self.frames.append((t, station_prob, np.array(boundary_prob, copy=True)))
-        if len(self.frames) <= c.lag_frames:
+        if len(self.frames) <= c.confirmation_frames:
             return []
         reported = t if reported_at_ms is None else max(t, int(reported_at_ms))
         t, station_prob, boundary_prob = self.frames[0]
@@ -197,7 +221,7 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
                 a, b = a + left, b + left
                 decoder.reset()
                 end = boundary_prob[a:b, 0]
-                n = len(end) - c.lag_frames
+                n = len(end) - c.confirmation_frames
                 if n <= 0:
                     continue
                 peaks = (end[:n] >= c.end_threshold) & (end[:n] > np.r_[-1., end[:n-1]])
@@ -207,6 +231,9 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
                                                            np.arange(b-a), -1))
                 for i in np.flatnonzero(peaks):
                     clock = int(t[a+i])
+                    end_ms = clock
+                    if c.refine_end and i >= END_REFINEMENT_FRAMES:
+                        end_ms = refined_end_time(clock, end[i-END_REFINEMENT_FRAMES:i+END_REFINEMENT_FRAMES+1])
                     _, distance, confidence, no_start = boundary_prob[a+i]
                     if 1 - no_start < c.start_threshold:
                         distance = 0
@@ -214,8 +241,8 @@ def decode_sequence(t, station_prob, boundary_prob, valid, config=None, lookahea
                         j = last_rest[i-d]
                         return int(t[a+j]) if j >= 0 else None
                     reps.extend(decoder.close_peak(clock, float(station_prob[a+i, 1]), end[i], distance,
-                                                   confidence, clock + c.lag_frames * DT_MS + lookahead_ms,
-                                                   i+1, rest_at))
+                                                   confidence, clock + c.confirmation_frames * DT_MS + lookahead_ms,
+                                                   i+1, rest_at, end_ms))
         return {"repetitions": reps, "counts": dict(Counter(r["station"] for r in reps)), "holds": holds,
                 "sets": group_sets(reps, c.set_gap_ms), "decoder": asdict(c)}
     hold_start = None

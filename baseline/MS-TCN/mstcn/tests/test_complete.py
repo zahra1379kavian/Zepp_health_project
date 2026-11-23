@@ -97,6 +97,27 @@ class CompleteRepTests(unittest.TestCase):
                              [(a * DT_MS, b * DT_MS) for a, b in expected])
             self.assertTrue(all(r["reported_at_ms"] == r["end_ms"] + 2 * DT_MS for r in bulk))
 
+    def test_end_refinement_matches_online_replay_and_respects_gaps(self):
+        t = np.arange(36) * DT_MS
+        p = np.tile([.01, .99], (len(t), 1))
+        q = np.zeros((len(t), 4))
+        q[6:15, 0] = [0, 0, 0, .5, 1., .75, .5, .25, .125]
+        q[10, 1:] = [5, .8, .05]
+        q[[20, 33]] = [1., 2, .8, .05]
+        valid = np.ones(len(t), bool)
+        valid[16] = False
+        config = DecoderConfig(refine_end=True)
+
+        decoder = RepDecoder(config)
+        online = []
+        for i in range(len(t)):
+            online.extend(decoder.step(t[i], p[i], q[i], valid[i]))
+        bulk = decode_sequence(t, p, q, valid, config)["repetitions"]
+
+        self.assertEqual(online, bulk)
+        self.assertEqual([(r["start_ms"], r["end_ms"], r["reported_at_ms"]) for r in bulk],
+                         [(t[5], t[10] + 32, t[14]), (t[18], t[20], t[24])])
+
     def test_endpoint_only_cross_validation_and_sensor_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -77,6 +77,11 @@ six seconds compete, including the midpoint and the previous rep's start when
 in range. Mid-rep false ends and the current model's peaks in certified rest
 teach the selector to reject an end. Sensor gaps reset the six-second history.
 The default decoder confirms peaks with two later frames (80 ms).
+For the complete-rep model with learned starts, pass `--refine-end` to `evaluate`
+or `predict` to average the timestamps within four frames on either side of each
+end peak, weighted by end probability. This uses the same peak thresholds and
+waits for four later frames (160 ms). At the start of a continuous segment where
+four earlier frames are unavailable, the decoder uses the peak timestamp.
 
 **Review rest predictions.** This command generates a fresh review list from
 the original baseline's held-out predictions.
