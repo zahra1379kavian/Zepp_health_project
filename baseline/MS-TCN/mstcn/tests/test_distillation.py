@@ -99,6 +99,11 @@ class DistillationTests(unittest.TestCase):
 
         with patch("baseline.mstcn.distillation.probabilities", side_effect=replay):
             targets = teacher.targets(arrays, refs)
+            soft_only = FrozenTeacher(model, {}, DecoderConfig(), "cpu", {}, pseudo_labels=False).targets(arrays, refs)
+        np.testing.assert_array_equal(soft_only.soft_end, targets.soft_end)
+        np.testing.assert_array_equal(soft_only.end_indices, targets.end_indices)
+        np.testing.assert_array_equal(soft_only.choices, targets.choices)
+        self.assertFalse(soft_only.pseudo_mask.any())
         np.testing.assert_array_equal(targets.end_indices, [30, 55])
         hard, choice, weights = np.zeros(n), np.full(n, -1), arrays["weight"].copy()
         soft, starts, pseudo = targets.window(0, n, 0, n, hard, choice, weights)
@@ -163,6 +168,16 @@ class DistillationTests(unittest.TestCase):
                 with patch("baseline.mstcn.distillation.train", side_effect=AssertionError("unexpected retraining")):
                     main(command)
                 self.assertEqual(len(list(out.glob("*/test/report.json"))), 1)
+                if stage == "full":
+                    soft_out = root / "soft_target_pilot"
+                    soft_command = [*distill, "--teacher-fold", str(teacher), "--output", str(soft_out)]
+                    main([*soft_command, "--soft-target-pilot"])
+                    pilot = json.loads((soft_out / "selection.json").read_text())
+                    self.assertEqual(len(pilot["trials"]), 1)
+                    self.assertEqual((pilot["selected"]["lambda_end"], pilot["selected"]["lambda_start"]), (1., 1.))
+                    self.assertFalse(pilot["selected"]["sources"]["pseudo_labels"])
+                    with self.assertRaisesRegex(ValueError, "different settings"):
+                        main(soft_command)
                 warm = ["--initial-student", str(out / selection["checkpoint"])]
 
     def test_exercise_holdout_with_synthetic_training(self):

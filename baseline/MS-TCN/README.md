@@ -190,6 +190,34 @@ resets at gaps and reports the teacher's predictions at session end.
 From the workspace root, set the Bash array `fit` to the selected student's
 shared training arguments, including `--data`, `--repetition-head complete`,
 `--rep-inputs`, and any selected similarity or synthetic-training flags.
+
+For a Fold 1 pilot, fit the all-exercise pair and the three screen exercise
+pairs with the same settings and device.
+
+```bash
+pilot=baseline/MS-TCN/experiment_runs/step_3_1/pilot
+for role in student teacher; do
+  extra=()
+  if [[ $role == teacher ]]; then extra=(--acausal); fi
+  .venv/bin/python -m baseline.mstcn cross-validate "${fit[@]}" "${extra[@]}" \
+    --folds 5 --subject-fold 1 --output "$pilot/${role}_cv"
+  .venv/bin/python -m baseline.mstcn leave-one-exercise-out "${fit[@]}" "${extra[@]}" \
+    --subject-folds 5 --subject-fold 1 --protocol paired --exercises screen \
+    --output "$pilot/${role}_holdouts"
+done
+.venv/bin/python -m baseline.mstcn compare-teacher --pilot \
+  --student-cv "$pilot/student_cv" --teacher-cv "$pilot/teacher_cv" \
+  --student-holdouts "$pilot/student_holdouts/report.json" \
+  --teacher-holdouts "$pilot/teacher_holdouts/report.json" \
+  --output "$pilot/pilot_comparison.json"
+```
+
+The pilot records first- and last-rep recall, overall and unseen F1, and false
+reps per rest hour across the holdout fits. The full comparison supplies the
+distillation decision. To extend either all-exercise pilot to five folds, use
+the same output and training settings with `--resume-completed` and omit
+`--subject-fold 1`.
+
 Use the same fold numbers as the student's confirmation. For the default
 confirmation on folds 1 and 2, the commands are
 
@@ -274,6 +302,11 @@ teacher_cv="$runs/step_3_1/all_exercise_cv"
   --lookahead-ms "$lookahead_ms" --rest-reviews "$runs/complete_rep_review/reviewed.json" \
   --output "$runs/step_3_3/fold_1"
 ```
+
+For a first comparison against an undistilled student at the same lookahead,
+add `--soft-target-pilot` and use a separate output directory. This fits one
+student with both KL weights set to 1. Human labels and soft teacher targets
+provide the supervision. The passing Step 3.1 decision is still required.
 
 Repeat for each subject fold using its own teacher and output directory. For
 an exercise holdout, supply that exercise's teacher folder with its masked

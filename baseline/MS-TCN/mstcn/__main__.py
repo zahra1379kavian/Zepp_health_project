@@ -48,6 +48,7 @@ def main(argv=None):
     for role in ("student", "teacher"):
         teacher.add_argument(f"--{role}-cv", type=Path, required=True, help="Completed all-exercise CV directory")
         teacher.add_argument(f"--{role}-holdouts", type=Path, nargs="+", required=True, help="Paired holdout report files")
+    teacher.add_argument("--pilot", action="store_true", help="Compare subject fold 1 and the three screen exercise pairs")
     teacher.add_argument("--output", type=Path, required=True)
     sweep = sub.add_parser("lookahead-sweep", help="Select a fixed lookahead on fold-1 validation and confirm on five test folds")
     sweep.add_argument("--student-cv", type=Path, required=True, help="Selected step-2 all-exercise CV directory")
@@ -63,6 +64,7 @@ def main(argv=None):
     distill.add_argument("--lookahead-ms", type=int, default=0, help="Fixed streaming student lookahead from step 3.2")
     distill.add_argument("--rest-reviews", type=Path, help="Same reviewed rest file as the teacher")
     distill.add_argument("--initial-student", type=Path, help="Initialize the full-teacher pass from a student distilled with the two-second teacher")
+    distill.add_argument("--soft-target-pilot", action="store_true", help="Fit one student with both KL weights at 1 and no pseudo-labels")
     distill.add_argument("--validation-only", action="store_true", help="Select weights and defer testing while comparing teaching schedules")
     distill.add_argument("--output", type=Path, required=True)
     distill.add_argument("--device", default="cpu")
@@ -84,6 +86,7 @@ def main(argv=None):
     train.add_argument("--phase-only", action="store_true",
                        help="Train a repetition model on phase targets without an exercise classification head")
     cv.add_argument("--folds", type=int, default=5)
+    cv.add_argument("--subject-fold", type=int, help="Run one one-based test fold of the fixed subject split")
     cv.add_argument("--resume-completed", action="store_true",
                     help="Reuse verified completed folds in an existing output; incomplete folds must be moved aside")
     for command in (train, cv, ablation, loeo):

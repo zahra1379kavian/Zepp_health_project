@@ -85,12 +85,13 @@ class Targets:
 
 
 class FrozenTeacher:
-    def __init__(self, model, normalization, decoder, device, provenance):
+    def __init__(self, model, normalization, decoder, device, provenance, *, pseudo_labels=True):
         self.model = model.eval().requires_grad_(False)
         self.normalization = normalization
         self.decoder = decoder
         self.device = device
         self.provenance = provenance
+        self.pseudo_labels = pseudo_labels
         self.cache = {}
 
     @torch.no_grad()
@@ -121,7 +122,7 @@ class FrozenTeacher:
         rows = np.concatenate(indices) if indices else np.empty(0, int)
         scores = np.concatenate(choices) if choices else np.empty((0, START_HISTORY + 1), np.float32)
         use = labeled[rows]
-        accepted, mask, end, choice = masked_reps(arrays, references, detected)
+        accepted, mask, end, choice = masked_reps(arrays, references, detected if self.pseudo_labels else ())
         target = Targets(soft_end, rows[use], scores[use], mask, end, choice, accepted)
         if name is not None:
             self.cache[name] = target
@@ -184,13 +185,23 @@ def run(args):
             raise ValueError("Initialize the full-teacher pass from a matching two-second-teacher student")
         initial_state = prior_ckpt["model"]
         provenance["initial_student_sha256"] = digest(args.initial_student)
-    teacher = FrozenTeacher(model, ckpt["normalization"], decoder, args.device, provenance)
+    soft_target_pilot = getattr(args, "soft_target_pilot", False)
+    if soft_target_pilot:
+        provenance["pseudo_labels"] = False
+    teacher = FrozenTeacher(model, ckpt["normalization"], decoder, args.device, provenance,
+                            pseudo_labels=not soft_target_pilot)
     out = args.output
     out.mkdir(parents=True, exist_ok=True)
     # An interrupted grid can reuse completed candidates for exactly this fit.
     identity = {**provenance, "lookahead_ms": args.lookahead_ms, "manifest_sha256": ckpt["data_manifest_sha256"]}
+    # The pilot and the grid share the unit-weight folder. Check it before
+    # doing any work so changing modes cannot leave a mixed run directory.
+    unit_trial = out / "end_1_start_1/trial.json"
+    if unit_trial.is_file() and json.loads(unit_trial.read_text())["sources"] != identity:
+        raise ValueError(f"Saved unit-weight trial uses different settings: {unit_trial.parent}")
+    weights = [(1., 1.)] if soft_target_pilot else product(LAMBDA_GRID, repeat=2)
     trials = []
-    for end_weight, start_weight in product(LAMBDA_GRID, repeat=2):
+    for end_weight, start_weight in weights:
         folder = out / f"end_{end_weight:g}_start_{start_weight:g}"
         if not folder.exists():
             with TemporaryDirectory(dir=out) as tmp:

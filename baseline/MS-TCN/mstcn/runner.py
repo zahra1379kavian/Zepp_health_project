@@ -869,6 +869,7 @@ def completed_fold_report(args, fold, expected_manifest, tolerances):
             or checkpoint["config"].get("acausal", False) != getattr(args, "acausal", False)
             or checkpoint.get("synthetic_reps", False) != getattr(args, "synthetic_reps", False)
             or checkpoint.get("augmentation", False) != getattr(args, "augment", False)
+            or ("fit_settings" in checkpoint and checkpoint["fit_settings"] != fit_settings(args))
             or checkpoint.get("rest_reviews_sha256") != (digest(args.rest_reviews) if getattr(args, "rest_reviews", None) else None)
             or checkpoint["seed"] != args.seed or checkpoint["station_only"]
             or checkpoint["tolerance_ms"] != args.tolerance_ms
@@ -915,15 +916,19 @@ def cross_validate(args):
         raise ValueError("Reprepare as version 4 so cross-validation includes every requested wrist stream")
     tolerances = reporting_tolerances(getattr(args, "report_tolerances_ms", None), args.tolerance_ms)
     splits = subject_folds(manifest["sessions"], args.folds, args.seed)
+    subject_fold = getattr(args, "subject_fold", None)
+    if subject_fold is not None and not 1 <= subject_fold <= len(splits):
+        raise ValueError("subject fold must be between 1 and folds")
+    selected = enumerate(splits, 1) if subject_fold is None else [(subject_fold, splits[subject_fold - 1])]
     reports, records = [], []
     complete = (default_head(manifest) if args.repetition_head == "auto" else args.repetition_head) == "complete"
     mode = getattr(args, "rep_inputs", "original")
     named_stations = not complete and manifest.get("reference_mode") != "endpoints" and mode == "original"
-    for index, split in enumerate(splits):
-        fold = out / f"fold_{index + 1}"
+    for index, split in selected:
+        fold = out / f"fold_{index}"
         data = fold / "data"
         fold_manifest = {**manifest, "split": split, "seed": args.seed,
-                         "cross_validation": {"fold": index + 1, "folds": args.folds}}
+                         "cross_validation": {"fold": index, "folds": args.folds}}
         fold_manifest.update(training_statistics(root, split["train"], include_phase=named_stations or
                                                  (mode != "original" and not complete),
                                                  classes=manifest["classes"], rep_inputs=mode))
@@ -931,9 +936,9 @@ def cross_validate(args):
             if not resume_completed:
                 raise FileExistsError(fold)
             report = completed_fold_report(args, fold, fold_manifest, tolerances)
-            print(f"Fold {index + 1}/{args.folds}: reusing completed results", flush=True)
+            print(f"Fold {index}/{args.folds}: reusing completed results", flush=True)
         else:
-            print(f"Fold {index + 1}/{args.folds}: training from epoch 1", flush=True)
+            print(f"Fold {index}/{args.folds}: training from epoch 1", flush=True)
             data.mkdir(parents=True)
             # Immutable arrays are shared; normalization and fitting stay within this fold.
             for session in manifest["sessions"]:
@@ -945,7 +950,9 @@ def cross_validate(args):
             tune(Namespace(**params))
             params.update(decoder=fold / "decoder.json", split="test", output=fold / "test")
             report = evaluate(Namespace(**params))
-        reports.append({"fold": index + 1, "split": split,
+        if subject_fold is not None:
+            return report
+        reports.append({"fold": index, "split": split,
                         **{key: report[key] for key in ("repetitions", "segmentation", "by_tolerance", "per_side",
                                                        "streams", "subjects", "source_sessions") if key in report}})
         for name in split["test"]:

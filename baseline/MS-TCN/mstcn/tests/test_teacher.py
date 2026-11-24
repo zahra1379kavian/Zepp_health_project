@@ -82,10 +82,19 @@ class TeacherTests(unittest.TestCase):
                    "--stages", "2", "--layers", "1", "--channels", "3", "--threads", "1",
                    "--repetition-head", "complete", "--causal-similarity"]
             compare = ["compare-teacher"]
+            pilot_compare = ["compare-teacher", "--pilot"]
             for role in ("student", "teacher"):
                 options = [*fit, "--acausal"] if role == "teacher" else fit
                 cv = root / role
-                main(["cross-validate", *options, "--output", str(cv)])
+                cv_args = ["cross-validate", *options, "--output", str(cv)]
+                main([*cv_args, "--subject-fold", "1"])
+                self.assertTrue((cv / "fold_1/test/report.json").is_file())
+                self.assertFalse((cv / "fold_2").exists())
+                self.assertFalse((cv / "report.json").exists())
+                pilot_out = root / f"{role}_pilot_holdouts"
+                main(["leave-one-exercise-out", *options, "--exercises", "screen", "--output", str(pilot_out)])
+                pilot_compare.extend([f"--{role}-cv", str(cv), f"--{role}-holdouts", str(pilot_out / "report.json")])
+                main([*cv_args, "--resume-completed"])
                 compare.extend([f"--{role}-cv", str(cv), f"--{role}-holdouts"])
                 for fold in (1, 2):
                     out = root / f"{role}_holdouts_{fold}"
@@ -95,6 +104,12 @@ class TeacherTests(unittest.TestCase):
             fold_report = json.loads((root / "teacher/fold_1/test/report.json").read_text())
             self.assertTrue(fold_report["acausal"])
             self.assertEqual(fold_report["future_context_ms"], 2 * DT_MS)
+            main([*pilot_compare, "--output", str(root / "pilot.json")])
+            pilot = json.loads((root / "pilot.json").read_text())
+            self.assertEqual(pilot["study_scope"], "fold_1_pilot")
+            self.assertEqual(pilot["holdout_subject_folds"], [1])
+            self.assertIn("holdout_false_reps_per_rest_hour", pilot["teacher"])
+            self.assertFalse(pilot["proceed_to_step_3_3"])
             main([*compare, "--output", str(root / "decision.json")])
             decision = json.loads((root / "decision.json").read_text())
             self.assertEqual(decision["holdout_subject_folds"], [1, 2])
@@ -107,12 +122,20 @@ class TeacherTests(unittest.TestCase):
 
     def test_either_gain_at_the_threshold_qualifies(self):
         student = dict(first_rep_recall=.20, last_rep_recall=.60, f1_at_400=.50, mean_unseen_f1_at_400=.30)
+        signature = {"recipe": {}, "folds": {}, "manifests": {}}
         with tempfile.TemporaryDirectory() as tmp:
             for first, unseen, passes in ((.35, .30, True), (.20, .35, True), (.349, .349, False)):
                 teacher = {**student, "first_rep_recall": first, "mean_unseen_f1_at_400": unseen}
-                signature = {"recipe": {}, "folds": {}, "manifests": {}}
                 scores = [(s, {}, [1, 2], signature) for s in (student, teacher)]
                 args = SimpleNamespace(student_cv=None, student_holdouts=None, teacher_cv=None, teacher_holdouts=None,
                                        output=Path(tmp) / f"{first}-{unseen}.json")
                 with patch("baseline.mstcn.analyses.teacher.ceiling_scores", side_effect=scores):
                     self.assertEqual(compare_teacher(args)["proceed_to_step_3_3"], passes)
+            teacher = {**student, "first_rep_recall": .50}
+            scores = [(s, {}, [1], signature) for s in (student, teacher)]
+            args.pilot = True
+            args.output = Path(tmp) / "pilot.json"
+            with patch("baseline.mstcn.analyses.teacher.ceiling_scores", side_effect=scores):
+                pilot = compare_teacher(args)
+            self.assertTrue(pilot["passes_pilot_threshold"])
+            self.assertFalse(pilot["proceed_to_step_3_3"])
