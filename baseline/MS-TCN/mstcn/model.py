@@ -208,7 +208,7 @@ class DenseMSTCN(nn.Module):
             history += START_HISTORY
         return history + (START_HISTORY if self.config.repetition_head == "complete" else 0)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, *, return_stage1=False):
         mask = x.new_ones(x.shape[0], 1, x.shape[-1]) if mask is None else mask
         wrist = x
         results = []
@@ -216,8 +216,10 @@ class DenseMSTCN(nn.Module):
         for i, stage in enumerate(self.stages):
             station, boundary, hidden = stage(x, mask, similarities)
             results.append((station, boundary))
-            if i == 0 and self.similarity is not None:
-                similarities, projected, _ = self.similarity(hidden, mask)
+            if i == 0:
+                stage1 = hidden
+                if self.similarity is not None:
+                    similarities, projected, _ = self.similarity(hidden, mask)
             if i + 1 < len(self.stages):
                 x = self._refinement_input(wrist, station, boundary, projected) * mask
         # A causal output acquired at t+L predicts the target at t. Shift only
@@ -226,7 +228,7 @@ class DenseMSTCN(nn.Module):
         if lag:
             results = [(F.pad(p[:, :, lag:], (0, min(lag, p.shape[-1]))) if p is not None else None,
                         F.pad(q[:, :, lag:], (0, min(lag, q.shape[-1])))) for p, q in results]
-        return results
+        return (results, stage1) if return_stage1 else results
 
     @torch.no_grad()
     def stream(self, x, state=None):

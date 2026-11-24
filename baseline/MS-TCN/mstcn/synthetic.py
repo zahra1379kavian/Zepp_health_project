@@ -148,7 +148,8 @@ class SyntheticReps:
             else:
                 raise ValueError("Generated sequences have no targets left after the configured lookahead")
             for start in self.rng.permutation(np.arange(0, end, self.windows.width)):
-                yield self.windows.window(a, 0, start, min(start + self.windows.width, end), len(a["t"]), rotate=False)
+                yield self.windows.window(a, 0, start, min(start + self.windows.width, end), len(a["t"]),
+                                          rotate=False, synthetic=True)
 
     def mix(self, real):
         return default_collate([*real, *(next(self.samples) for _ in range(len(real)//3))])

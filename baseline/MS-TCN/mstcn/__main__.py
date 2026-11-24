@@ -157,6 +157,8 @@ def main(argv=None):
                              help="Complete rep head: fill one quarter of each training batch with synthetic wrist repetitions")
         command.add_argument("--causal-similarity", action="store_true",
                              help="Complete rep head: compare stage-1 motion embeddings over the past six seconds")
+        command.add_argument("--exercise-adversarial", action="store_true", default=argparse.SUPPRESS,
+                             help="Complete rep head: use a training-only exercise head with reversed encoder gradients")
         command.add_argument("--rest-reviews", type=Path, help="Complete mode: reviewed mine-rest JSON")
         command.add_argument("--rep-inputs", choices=["original", "gravity", "rotated"], default="original",
                              help="Existing sensors, six gravity features, or acc+gyro with uniform training rotations")

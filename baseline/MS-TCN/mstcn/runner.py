@@ -37,20 +37,24 @@ def digest(path):
 
 
 def fit_settings(args):
-    return {key: getattr(args, key) for key in ("batch_size", "window", "epochs", "learning_rate", "patience")} | {
+    settings = {key: getattr(args, key) for key in ("batch_size", "window", "epochs", "learning_rate", "patience")} | {
         "augment": getattr(args, "augment", False)}
+    if getattr(args, "exercise_adversarial", False):
+        settings["exercise_adversarial"] = True
+    return settings
 
 
 class Windows(Dataset):
     def __init__(self, root, sessions, norm, history, width, repetition_head="boundary",
                  lookahead=0, augmentation=False, features=None, reviews=(), rotate_training_windows=False,
-                 future_context=0, teacher=None):
+                 future_context=0, teacher=None, exercise_adversarial=False):
         if width < 1:
             raise ValueError("Window width must be positive")
         self.arrays = [load_arrays(Path(root) / name, include_phase=repetition_head == "phase") for name in sessions]
         self.rep_inputs = norm.get("rep_inputs", "original")
         self.rotate_training_windows = rotate_training_windows
         self.teacher = teacher
+        self.exercise_adversarial = exercise_adversarial
         for arrays in self.arrays:
             arrays["x"] = rep_values(arrays["x"], arrays["valid"], self.rep_inputs)
         if repetition_head == "complete":
@@ -81,7 +85,7 @@ class Windows(Dataset):
         session, run_start, start, end, run_end = self.windows[i]
         return self.window(self.arrays[session], run_start, start, end, run_end, rotate=self.rotate_training_windows)
 
-    def window(self, arrays, run_start, start, end, run_end, *, rotate):
+    def window(self, arrays, run_start, start, end, run_end, *, rotate, synthetic=False):
         left = max(run_start, start - self.history)
         length = self.history + self.width + self.lookahead + self.future_context
         offset = self.history - (start - left)
@@ -113,6 +117,13 @@ class Windows(Dataset):
             extra = ()
             if self.teacher is not None:
                 extra = arrays["teacher"].window(start, end, self.history, length, end_targets, choice, weight)
+            if self.exercise_adversarial:
+                exercise = np.full(length, -100, np.int64)
+                if not synthetic:
+                    labels = values["y"]
+                    eligible = target_mask[offset:stop] & values["coverage"] & (labels > 0)
+                    exercise[offset:stop] = np.where(eligible, labels - 1, -100)
+                extra += (exercise,)
             return tuple(torch.from_numpy(a.copy()) for a in
                          (x.T, mask, y, end_targets, target_mask, weight > 0, choice, weight, *extra))
         boundary = np.zeros((length, 2), np.float32)
@@ -171,6 +182,9 @@ def train(args, *, teacher=None, initial_state=None):
     if lookahead_ms < 0:
         raise ValueError("lookahead-ms must be nonnegative")
     complete = head == "complete"
+    adversarial = getattr(args, "exercise_adversarial", False)
+    if adversarial and (not complete or manifest["classes"] != CLASSES):
+        raise ValueError("Adversarial exercise training requires a complete rep head and named exercise labels")
     synthetic = getattr(args, "synthetic_reps", False)
     if synthetic and (not complete or manifest["features"] not in (FEATURES, FEATURES[:6])):
         raise ValueError("Synthetic repetition training requires a complete rep head and wrist sensor triads")
@@ -192,11 +206,17 @@ def train(args, *, teacher=None, initial_state=None):
     model = DenseMSTCN(config).to(args.device)
     if initial_state is not None:
         model.load_state_dict(initial_state)
+    exercise_head = None
+    if adversarial:
+        # Keep the encoder initialization and subsequent batch RNG matched to the control.
+        with torch.random.fork_rng(devices=[]):
+            exercise_head = torch.nn.Conv1d(config.channels, len(CLASSES) - 1, 1).to(args.device)
     datasets = {split: Windows(root, manifest["split"][split], manifest["normalization"],
                                model.history_samples, args.window, head, config.lookahead_samples,
                                split == "train" and getattr(args, "augment", False), manifest["features"],
                                reviews if split == "train" else (), rotate_training_windows=split == "train",
-                               future_context=model.future_samples, teacher=teacher if split == "train" else None)
+                               future_context=model.future_samples, teacher=teacher if split == "train" else None,
+                               exercise_adversarial=adversarial and split == "train")
                 for split in ("train", "validation")}
     if any(not len(d) for d in datasets.values()):
         raise ValueError("Training/validation partition has no eligible windows")
@@ -230,7 +250,10 @@ def train(args, *, teacher=None, initial_state=None):
     phase_weights = np.where(phase_counts > 0, 1 / np.sqrt(np.maximum(phase_counts, 1)), 0)
     phase_weights /= max(phase_weights[phase_weights > 0].mean() if phase_weights.any() else 0, 1e-12)
     phase_weights = torch.tensor(phase_weights, dtype=torch.float32, device=args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    parameters = list(model.parameters())
+    if exercise_head is not None:
+        parameters.extend(exercise_head.parameters())
+    optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate, weight_decay=1e-4)
     out.mkdir(parents=True)
     if synthetic:
         write_json(out / "synthetic_sources.json", {"seed": args.seed, "source_split": "train",
@@ -242,15 +265,26 @@ def train(args, *, teacher=None, initial_state=None):
     tolerance = getattr(args, "tolerance_ms", 400)
     for epoch in range(1, args.epochs + 1):
         record = {"epoch": epoch}
+        adversarial_weight = .1 * min(1., (epoch - 1) / max(1, min(4, args.epochs - 1)))
         for split, loader in loaders.items():
             model.train(split == "train")
             loss_sum, frames, batches = 0., 0, 0
             distilled = teacher is not None and split == "train"
+            use_exercise = exercise_head is not None and split == "train"
+            exercise_loss_sum, exercise_frames = 0., 0
             end_sum, start_sum, teacher_ends, pseudo_frames = 0., 0., 0, 0
             with torch.set_grad_enabled(split == "train"):
                 for batch in loader:
                     x, mask, y, boundary, valid, reference, *extra = [a.to(args.device) for a in batch]
-                    outputs = model(x, mask)
+                    if use_exercise:
+                        outputs, stage1 = model(x, mask, return_stage1=True)
+                        # The head learns to classify exercise; only the encoder gradient is reversed.
+                        logits = exercise_head(2 * stage1.detach() - stage1)
+                        labels = extra[-1]
+                        labeled = (labels >= 0).sum()
+                        exercise_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="sum")
+                    else:
+                        outputs = model(x, mask)
                     loss = dense_loss(outputs, y, boundary, valid, reference, weights, positive_weights,
                                       boundary_weight=0 if args.station_only else 1, phase_weights=phase_weights,
                                       repetition_valid=(valid | extra[4]) if distilled else valid,
@@ -258,12 +292,16 @@ def train(args, *, teacher=None, initial_state=None):
                     if distilled:
                         end_loss, start_loss = distillation_losses(outputs[-1][1], extra[2], extra[3])
                         loss = loss + args.lambda_end * end_loss + args.lambda_start * start_loss
+                    if use_exercise:
+                        loss = loss + adversarial_weight * exercise_loss / labeled.clamp_min(1)
+                        exercise_loss_sum += float(exercise_loss.detach())
+                        exercise_frames += int(labeled)
                     if not torch.isfinite(loss):
                         raise RuntimeError("Nonfinite training loss")
                     if split == "train":
                         optimizer.zero_grad()
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                        torch.nn.utils.clip_grad_norm_(parameters, 5.)
                         optimizer.step()
                     n = int((extra[2] >= 0).sum()) if distilled else int(valid.sum())
                     if distilled:
@@ -288,6 +326,9 @@ def train(args, *, teacher=None, initial_state=None):
             if synthetic and split == "train":
                 record["synthetic_training_windows"] = batches * (args.batch_size // 4)
                 record["real_training_windows"] = batches * (3 * args.batch_size // 4)
+            if use_exercise:
+                record.update(exercise_adversarial_weight=adversarial_weight, exercise_labeled_frames=exercise_frames,
+                              exercise_loss=exercise_loss_sum / max(exercise_frames, 1))
         if args.station_only:
             key = (-record["validation_loss"],)
         else:
@@ -834,6 +875,8 @@ def run_pipeline(args):
         common.append("--two-second-teacher")
     if getattr(args, "causal_similarity", False):
         common.append("--causal-similarity")
+    if getattr(args, "exercise_adversarial", False):
+        common.append("--exercise-adversarial")
     if getattr(args, "synthetic_reps", False):
         common.append("--synthetic-reps")
     if getattr(args, "rest_reviews", None):

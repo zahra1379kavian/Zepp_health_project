@@ -81,6 +81,32 @@ only. The study reads only the paired holdout reports.
   --output "$out/diagnostics/fold_1_biceps_thresholds.json"
 ```
 
+### Full five-fold study
+
+The full runner evaluates all six exercise pairs across all five subject folds.
+It compares the original, gravity, and rotated inputs with and without causal
+similarity, plus the gravity-similarity synthetic screen. It also tests synthetic
+training on the configuration selected after the similarity comparison. Use the
+CUDA interpreter that trained the existing CUDA fits to reuse them.
+
+```bash
+runs=baseline/MS-TCN/experiment_runs
+"$runs/step_2_mac_split/cuda-env/bin/python" -m \
+  baseline.mstcn.analyses.leave_one_exercise_out.full_study --output "$runs/step_2/five_fold"
+```
+
+After synthetic training is evaluated, the runner tests the optional
+exercise-adversarial head if mean seen F1 still exceeds mean unseen F1 by
+at least 0.05. This uses the same 0.05 F1 difference as the acceptance rule.
+The training-only head predicts exercise from stage-1 features using
+certified real exercise frames. Its reversed loss rises from 0 to 0.1 by
+epoch 5. The same acceptance criteria apply to this comparison.
+
+`progress.json` lists the verified fits and report paths. `selection.json`
+records the pooled scores and stage decisions. The final release-protocol
+comparison is in `phase_comparison/model_comparison.csv`. Repeating the same
+command reuses verified fits and preserves partial outputs before retrying.
+
 ## Step 2.2 causal motion similarity
 
 `--causal-similarity` enables both changes to the complete-rep model. Each

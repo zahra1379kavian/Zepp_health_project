@@ -46,6 +46,8 @@ def ceiling_scores(cv, holdouts, acausal, *, pilot=False):
                             synthetic_reps=ckpt.get("synthetic_reps", False), seed=ckpt["seed"],
                             stages=config["stages"], layers=config["layers"], channels=config["channels"],
                             max_steps=ckpt["partial_epoch_max_steps"]))
+        if ckpt.get("fit_settings", {}).get("exercise_adversarial", False):
+            recipes[-1]["exercise_adversarial"] = True
         manifests[fold] = (ckpt["data_manifest_sha256"], ckpt.get("rest_reviews_sha256"))
     recipe = recipes[0]
     if any(r != recipe for r in recipes):
